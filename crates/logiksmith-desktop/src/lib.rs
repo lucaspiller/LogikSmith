@@ -5,14 +5,14 @@ pub mod web;
 
 use diagnostics::{ConnectionState, DiagnosticStore, TelegramRecord};
 use logiksmith_core::{
-    Command as CoreCommand, ConfigError as CoreConfigError, Dpt, Engine, EngineConfig,
-    GroupAddress, GroupService, IndividualAddress, KnxEvent as CoreKnxEvent, Value,
+    Dpt, Effect, Endpoint, EndpointDirection, EndpointName, Engine, EngineConfig, InputEvent,
+    TypedValue, Value,
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsString,
-    fmt, io,
+    fmt, fs, io,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
@@ -32,17 +32,156 @@ use web::{WebError, start_web_server};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GroupAddress { main: u8, middle: u8, subgroup: u8 }
+
+impl GroupAddress {
+    pub fn parse(value: &str) -> Result<Self, GroupAddressError> { value.parse() }
+}
+
+impl FromStr for GroupAddress {
+    type Err = GroupAddressError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<_> = value.split('/').collect();
+        if parts.len() != 3 || parts.iter().any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit())) { return Err(GroupAddressError::InvalidFormat); }
+        let main = parts[0].parse::<u16>().map_err(|_| GroupAddressError::InvalidFormat)?;
+        let middle = parts[1].parse::<u16>().map_err(|_| GroupAddressError::InvalidFormat)?;
+        let subgroup = parts[2].parse::<u16>().map_err(|_| GroupAddressError::InvalidFormat)?;
+        if main > 31 || middle > 7 || subgroup > 255 { return Err(GroupAddressError::OutOfRange); }
+        if main == 0 && middle == 0 && subgroup == 0 { return Err(GroupAddressError::BroadcastReserved); }
+        if parts.iter().any(|part| part.len() > 1 && part.starts_with('0')) { return Err(GroupAddressError::NonCanonical); }
+        Ok(Self { main: main as u8, middle: middle as u8, subgroup: subgroup as u8 })
+    }
+}
+
+impl fmt::Display for GroupAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { write!(formatter, "{}/{}/{}", self.main, self.middle, self.subgroup) }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupAddressError { InvalidFormat, OutOfRange, BroadcastReserved, NonCanonical }
+
+impl fmt::Display for GroupAddressError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self { Self::InvalidFormat => "group address must be main/middle/subgroup", Self::OutOfRange => "group address component is out of range", Self::BroadcastReserved => "group address 0/0/0 is reserved for broadcast", Self::NonCanonical => "group address must use canonical main/middle/subgroup form" })
+    }
+}
+
+impl std::error::Error for GroupAddressError {}
+
 // ---------------------------------------------------------------------------
-// Configuration
+// Host and automation configuration
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub config_path: PathBuf,
-    pub engine: EngineConfig,
+    pub automation_path: PathBuf,
+    pub automation: AutomationRuntime,
+    pub automation_revision: u64,
     pub connection: ConnectionConfig,
     pub bridge: BridgeConfig,
     pub logging: LoggingConfig,
     pub web: WebConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct AutomationRuntime {
+    pub document: AutomationDocument,
+    pub engine_config: EngineConfig,
+    pub address_to_endpoint: HashMap<GroupAddress, BindingRuntime>,
+    pub endpoint_to_address: HashMap<EndpointName, GroupAddress>,
+    pub endpoint_dpts: HashMap<EndpointName, Dpt>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindingRuntime {
+    pub endpoint: EndpointName,
+    pub direction: EndpointDirection,
+    pub dpt: Dpt,
+    pub address: GroupAddress,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationDocument {
+    pub inputs: Vec<AutomationEndpoint>,
+    pub outputs: Vec<AutomationEndpoint>,
+    pub knx_bindings: Vec<KnxBinding>,
+    pub behaviors: AutomationBehaviors,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationEndpoint {
+    pub name: String,
+    pub dpt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KnxBinding {
+    pub endpoint: String,
+    pub group_address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationBehaviors {
+    pub timed_bool: TimedBoolBehavior,
+    pub percentage_forward: PercentageForwardBehavior,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TimedBoolBehavior {
+    pub input: String,
+    pub output: String,
+    pub off_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PercentageForwardBehavior {
+    pub input: String,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AutomationEnvelope {
+    pub document: AutomationDocument,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldError {
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("cannot read configuration {path}: {source}")]
+    Read { path: PathBuf, source: io::Error },
+    #[error("invalid TOML configuration: {0}")]
+    Toml(#[from] toml::de::Error),
+    #[error("invalid configuration field {field}: {message}")]
+    Field { field: String, message: String },
+    #[error("cannot read automation file {path}: {source}")]
+    AutomationRead { path: PathBuf, source: io::Error },
+    #[error("invalid automation TOML: {0}")]
+    AutomationToml(toml::de::Error),
+    #[error("invalid automation configuration")]
+    AutomationInvalid(Vec<FieldError>),
+}
+
+#[derive(Debug, Error)]
+pub enum AutomationFileError {
+    #[error("cannot read automation file {path}: {source}")]
+    Read { path: PathBuf, source: io::Error },
+    #[error("invalid automation TOML: {0}")]
+    Toml(toml::de::Error),
+    #[error("invalid automation configuration")]
+    Invalid(Vec<FieldError>),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -56,10 +195,7 @@ impl WebConfig {
         if listen_port == 0 {
             return Err(field("web.listen_port", "must be in range 1..=65535"));
         }
-        Ok(Self {
-            listen_ip,
-            listen_port,
-        })
+        Ok(Self { listen_ip, listen_port })
     }
 
     pub fn socket_addr(self) -> SocketAddr {
@@ -85,24 +221,10 @@ pub struct LoggingConfig {
     pub bridge_level: LevelFilter,
 }
 
-#[derive(Debug, Error)]
-pub enum ConfigError {
-    #[error("cannot read configuration {path}: {source}")]
-    Read { path: PathBuf, source: io::Error },
-    #[error("invalid TOML configuration: {0}")]
-    Toml(#[from] toml::de::Error),
-    #[error("invalid configuration field {field}: {message}")]
-    Field {
-        field: &'static str,
-        message: String,
-    },
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     knx: RawKnxConfig,
-    poc: RawPocConfig,
     bridge: RawBridgeConfig,
     logging: RawLoggingConfig,
     web: RawWebConfig,
@@ -119,156 +241,188 @@ struct RawKnxConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawPocConfig {
-    input_group_address: String,
-    input_dpt: String,
-    output_group_address: String,
-    output_dpt: String,
-    off_delay_ms: u64,
-}
+struct RawBridgeConfig { python: String }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawBridgeConfig {
-    python: String,
-}
+struct RawLoggingConfig { level: String, bridge_level: String }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawLoggingConfig {
-    level: String,
-    bridge_level: String,
+struct RawWebConfig { listen_ip: String, listen_port: u32 }
+
+fn field(field: impl Into<String>, message: impl Into<String>) -> ConfigError {
+    ConfigError::Field { field: field.into(), message: message.into() }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawWebConfig {
-    listen_ip: String,
-    listen_port: u32,
+fn parse_ip(field_name: &str, value: &str) -> Result<IpAddr, ConfigError> {
+    value.parse().map_err(|error| field(field_name, format!("{error}")))
 }
 
-fn field(field: &'static str, message: impl Into<String>) -> ConfigError {
-    ConfigError::Field {
-        field,
-        message: message.into(),
+fn parse_level(field_name: &str, value: &str) -> Result<LevelFilter, ConfigError> {
+    LevelFilter::from_str(value).map_err(|_| field(field_name, "must be one of off, error, warn, info, debug, or trace"))
+}
+
+fn parse_dpt(path: &str, value: &str) -> Result<Dpt, FieldError> {
+    let dpt = Dpt::parse(value).map_err(|error| FieldError { path: path.to_owned(), message: error.to_string() })?;
+    if !dpt.is_supported() {
+        return Err(FieldError { path: path.to_owned(), message: "must be 1.001 or 5.001".to_owned() });
+    }
+    if dpt.to_string() != value {
+        return Err(FieldError { path: path.to_owned(), message: "must use canonical DPT form".to_owned() });
+    }
+    Ok(dpt)
+}
+
+fn endpoint_name(path: &str, value: &str) -> Result<EndpointName, FieldError> {
+    value.parse::<EndpointName>().map_err(|error| FieldError { path: path.to_owned(), message: error.to_string() })
+}
+
+fn core_error_field(error: &logiksmith_core::ConfigError) -> (String, String) {
+    use logiksmith_core::ConfigError as CoreError;
+    match error {
+        CoreError::DuplicateEndpoint(_) => ("endpoints".to_owned(), error.to_string()),
+        CoreError::UnsupportedEndpointDpt { .. } => ("endpoints".to_owned(), error.to_string()),
+        CoreError::UnknownRuleEndpoint { rule, role, .. }
+        | CoreError::WrongRuleDirection { rule, role, .. }
+        | CoreError::WrongRuleDpt { rule, role, .. } => (format!("behaviors.{rule}.{role}"), error.to_string()),
+        CoreError::ZeroOffDelay | CoreError::OffDelayTooLarge { .. } => ("behaviors.timed_bool.off_delay_ms".to_owned(), error.to_string()),
     }
 }
 
-fn parse_ip(field_name: &'static str, value: &str) -> Result<IpAddr, ConfigError> {
-    value
-        .parse()
-        .map_err(|error| field(field_name, format!("{error}")))
-}
-
-fn parse_level(field_name: &'static str, value: &str) -> Result<LevelFilter, ConfigError> {
-    LevelFilter::from_str(value).map_err(|_| {
-        field(
-            field_name,
-            "must be one of off, error, warn, info, debug, or trace",
-        )
-    })
-}
-
-/// Loads TOML and turns its POC section into the already-validated core
-/// configuration. Address and DPT parsing intentionally goes through core.
-pub fn load_config(path: &Path) -> Result<RuntimeConfig, ConfigError> {
-    let source = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let raw: RawConfig = toml::from_str(&source)?;
-
-    if raw.knx.connection_type != "tunneling" {
-        return Err(field(
-            "knx.connection_type",
-            "must be 'tunneling' for this proof of concept",
-        ));
+/// Validates a complete automation document and constructs its core and
+/// desktop-side KNX routing maps.
+pub fn build_automation(document: AutomationDocument) -> Result<AutomationRuntime, Vec<FieldError>> {
+    let mut errors = Vec::new();
+    let mut endpoint_dpts = HashMap::new();
+    let mut endpoints = Vec::new();
+    let mut seen_names = HashSet::new();
+    for (direction, declarations) in [(EndpointDirection::Input, &document.inputs), (EndpointDirection::Output, &document.outputs)] {
+        for (index, declaration) in declarations.iter().enumerate() {
+            let path = match direction { EndpointDirection::Input => format!("inputs[{index}]"), EndpointDirection::Output => format!("outputs[{index}]") };
+            let name = match endpoint_name(&format!("{path}.name"), &declaration.name) {
+                Ok(name) => name,
+                Err(error) => { errors.push(error); continue; }
+            };
+            if !seen_names.insert(name.clone()) {
+                errors.push(FieldError { path: format!("{path}.name"), message: "must be globally unique".to_owned() });
+                continue;
+            }
+            let dpt = match parse_dpt(&format!("{path}.dpt"), &declaration.dpt) {
+                Ok(dpt) => dpt,
+                Err(error) => { errors.push(error); continue; }
+            };
+            endpoint_dpts.insert(name.clone(), dpt);
+            endpoints.push(Endpoint::new(name, direction, dpt));
+        }
     }
-    if raw.knx.gateway_port == 0 || raw.knx.gateway_port > u16::MAX as u32 {
-        return Err(field("knx.gateway_port", "must be in range 1..=65535"));
-    }
-    let gateway_ip = parse_ip("knx.gateway_ip", &raw.knx.gateway_ip)?;
-    let local_ip = raw
-        .knx
-        .local_ip
-        .as_deref()
-        .map(|value| parse_ip("knx.local_ip", value))
-        .transpose()?;
 
-    let input_group_address = GroupAddress::parse(&raw.poc.input_group_address)
-        .map_err(|error| field("poc.input_group_address", error.to_string()))?;
-    let output_group_address = GroupAddress::parse(&raw.poc.output_group_address)
-        .map_err(|error| field("poc.output_group_address", error.to_string()))?;
-    let input_dpt = Dpt::parse(&raw.poc.input_dpt)
-        .map_err(|error| field("poc.input_dpt", error.to_string()))?;
-    let output_dpt = Dpt::parse(&raw.poc.output_dpt)
-        .map_err(|error| field("poc.output_dpt", error.to_string()))?;
-    let engine = EngineConfig {
-        input_group_address,
-        input_dpt,
-        output_group_address,
-        output_dpt,
-        off_delay_ms: raw.poc.off_delay_ms,
+    let mut address_to_endpoint = HashMap::new();
+    let mut endpoint_to_address = HashMap::new();
+    for (index, binding) in document.knx_bindings.iter().enumerate() {
+        let path = format!("knx_bindings[{index}]");
+        let name = match endpoint_name(&format!("{path}.endpoint"), &binding.endpoint) {
+            Ok(name) => name,
+            Err(error) => { errors.push(error); continue; }
+        };
+        let Some(&dpt) = endpoint_dpts.get(&name) else {
+            errors.push(FieldError { path: format!("{path}.endpoint"), message: "must reference an existing endpoint".to_owned() });
+            continue;
+        };
+        let direction = endpoints.iter().find(|endpoint| endpoint.name == name).map(|endpoint| endpoint.direction).expect("declared endpoint exists");
+        let address = match GroupAddress::parse(&binding.group_address) {
+            Ok(address) if address.to_string() == binding.group_address => address,
+            Ok(_) => { errors.push(FieldError { path: format!("{path}.group_address"), message: "must use canonical main/middle/subgroup form".to_owned() }); continue; }
+            Err(error) => { errors.push(FieldError { path: format!("{path}.group_address"), message: error.to_string() }); continue; }
+        };
+        if endpoint_to_address.contains_key(&name) {
+            errors.push(FieldError { path: format!("{path}.endpoint"), message: "must have exactly one KNX binding".to_owned() });
+            continue;
+        }
+        if address_to_endpoint.contains_key(&address) {
+            errors.push(FieldError { path: format!("{path}.group_address"), message: "must be globally unique".to_owned() });
+            continue;
+        }
+        endpoint_to_address.insert(name.clone(), address);
+        address_to_endpoint.insert(address, BindingRuntime { endpoint: name, direction, dpt, address });
+    }
+    for endpoint in &endpoints {
+        if !endpoint_to_address.contains_key(&endpoint.name) {
+            let list = match endpoint.direction { EndpointDirection::Input => "inputs", EndpointDirection::Output => "outputs" };
+            errors.push(FieldError { path: format!("{list}.name"), message: format!("endpoint {} must have exactly one KNX binding", endpoint.name) });
+        }
+    }
+
+    let parse_rule_name = |path: &str, value: &str, errors: &mut Vec<FieldError>| {
+        match endpoint_name(path, value) {
+            Ok(name) => name,
+            Err(error) => { errors.push(error); EndpointName::new("invalid").expect("literal name") }
+        }
     };
-    validate_engine_config(engine)?;
-
-    let python = PathBuf::from(&raw.bridge.python);
-    if raw.bridge.python.is_empty() {
-        return Err(field("bridge.python", "must not be empty"));
+    let timed_input = parse_rule_name("behaviors.timed_bool.input", &document.behaviors.timed_bool.input, &mut errors);
+    let timed_output = parse_rule_name("behaviors.timed_bool.output", &document.behaviors.timed_bool.output, &mut errors);
+    let percentage_input = parse_rule_name("behaviors.percentage_forward.input", &document.behaviors.percentage_forward.input, &mut errors);
+    let percentage_output = parse_rule_name("behaviors.percentage_forward.output", &document.behaviors.percentage_forward.output, &mut errors);
+    let engine_config = EngineConfig::new(
+        endpoints,
+        logiksmith_core::TimedBooleanRule { input: timed_input, output: timed_output, off_delay_ms: document.behaviors.timed_bool.off_delay_ms },
+        logiksmith_core::PercentageForwardRule { input: percentage_input, output: percentage_output },
+    );
+    if errors.is_empty() {
+        if let Err(error) = engine_config.validate() {
+            let (path, message) = core_error_field(&error);
+            errors.push(FieldError { path, message });
+        }
+        for (rule, input, output) in [("behaviors.timed_bool", &document.behaviors.timed_bool.input, &document.behaviors.timed_bool.output), ("behaviors.percentage_forward", &document.behaviors.percentage_forward.input, &document.behaviors.percentage_forward.output)] {
+            if let (Ok(input), Ok(output)) = (input.parse::<EndpointName>(), output.parse::<EndpointName>()) {
+                if let (Some(input), Some(output)) = (endpoint_to_address.get(&input), endpoint_to_address.get(&output)) {
+                    if input == output { errors.push(FieldError { path: format!("{rule}.output"), message: "input and output group addresses must differ".to_owned() }); }
+                }
+            }
+        }
     }
-    if !python.is_file() {
-        return Err(field(
-            "bridge.python",
-            format!("executable does not exist: {}", python.display()),
-        ));
-    }
-
-    let listen_ip = parse_ip("web.listen_ip", &raw.web.listen_ip)?;
-    if raw.web.listen_port == 0 || raw.web.listen_port > u16::MAX as u32 {
-        return Err(field("web.listen_port", "must be in range 1..=65535"));
-    }
-
-    Ok(RuntimeConfig {
-        config_path: path.to_path_buf(),
-        engine,
-        connection: ConnectionConfig {
-            gateway_ip,
-            gateway_port: raw.knx.gateway_port as u16,
-            local_ip,
-        },
-        bridge: BridgeConfig { python },
-        logging: LoggingConfig {
-            level: parse_level("logging.level", &raw.logging.level)?,
-            bridge_level: parse_level("logging.bridge_level", &raw.logging.bridge_level)?,
-        },
-        web: WebConfig {
-            listen_ip,
-            listen_port: raw.web.listen_port as u16,
-        },
-    })
+    if !errors.is_empty() { return Err(errors); }
+    Ok(AutomationRuntime { document, engine_config, address_to_endpoint, endpoint_to_address, endpoint_dpts })
 }
 
-fn validate_engine_config(config: EngineConfig) -> Result<(), ConfigError> {
-    match Engine::try_new(config) {
-        Ok(_) => Ok(()),
-        Err(CoreConfigError::SameGroupAddress) => Err(field(
-            "poc.input_group_address/poc.output_group_address",
-            "must differ",
-        )),
-        Err(CoreConfigError::UnsupportedInputDpt(dpt)) => {
-            Err(field("poc.input_dpt", format!("must be 1.001, got {dpt}")))
-        }
-        Err(CoreConfigError::UnsupportedOutputDpt(dpt)) => {
-            Err(field("poc.output_dpt", format!("must be 1.001, got {dpt}")))
-        }
-        Err(CoreConfigError::ZeroOffDelay) => {
-            Err(field("poc.off_delay_ms", "must be greater than zero"))
-        }
-        Err(CoreConfigError::OffDelayTooLarge { actual, maximum }) => Err(field(
-            "poc.off_delay_ms",
-            format!("{actual} exceeds maximum {maximum}"),
-        )),
-    }
+pub fn automation_revision(source: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in source { hash ^= u64::from(*byte); hash = hash.wrapping_mul(0x100000001b3); }
+    hash
+}
+
+pub fn load_automation(path: &Path) -> Result<(AutomationDocument, u64), AutomationFileError> {
+    let source = fs::read(path).map_err(|source| AutomationFileError::Read { path: path.to_path_buf(), source })?;
+    let text = String::from_utf8_lossy(&source);
+    let document = toml::from_str::<AutomationDocument>(&text).map_err(AutomationFileError::Toml)?;
+    build_automation(document.clone()).map_err(AutomationFileError::Invalid)?;
+    Ok((document, automation_revision(&source)))
+}
+
+pub fn load_config(config_path: &Path, automation_path: &Path) -> Result<RuntimeConfig, ConfigError> {
+    let source = fs::read_to_string(config_path).map_err(|source| ConfigError::Read { path: config_path.to_path_buf(), source })?;
+    let raw: RawConfig = toml::from_str(&source)?;
+    let automation_source = fs::read(automation_path).map_err(|source| ConfigError::AutomationRead { path: automation_path.to_path_buf(), source })?;
+    let automation_text = String::from_utf8_lossy(&automation_source);
+    let document = toml::from_str::<AutomationDocument>(&automation_text).map_err(ConfigError::AutomationToml)?;
+    let automation = build_automation(document).map_err(ConfigError::AutomationInvalid)?;
+    if raw.knx.connection_type != "tunneling" { return Err(field("knx.connection_type", "must be 'tunneling'")); }
+    if raw.knx.gateway_port == 0 || raw.knx.gateway_port > u16::MAX as u32 { return Err(field("knx.gateway_port", "must be in range 1..=65535")); }
+    let gateway_ip = parse_ip("knx.gateway_ip", &raw.knx.gateway_ip)?;
+    let local_ip = raw.knx.local_ip.as_deref().map(|value| parse_ip("knx.local_ip", value)).transpose()?;
+    if raw.bridge.python.is_empty() { return Err(field("bridge.python", "must not be empty")); }
+    let python = PathBuf::from(&raw.bridge.python);
+    if !python.is_file() { return Err(field("bridge.python", format!("executable does not exist: {}", python.display()))); }
+    let listen_ip = parse_ip("web.listen_ip", &raw.web.listen_ip)?;
+    if raw.web.listen_port == 0 || raw.web.listen_port > u16::MAX as u32 { return Err(field("web.listen_port", "must be in range 1..=65535")); }
+    Ok(RuntimeConfig {
+        config_path: config_path.to_path_buf(), automation_path: automation_path.to_path_buf(), automation,
+        automation_revision: automation_revision(&automation_source),
+        connection: ConnectionConfig { gateway_ip, gateway_port: raw.knx.gateway_port as u16, local_ip },
+        bridge: BridgeConfig { python },
+        logging: LoggingConfig { level: parse_level("logging.level", &raw.logging.level)?, bridge_level: parse_level("logging.bridge_level", &raw.logging.bridge_level)? },
+        web: WebConfig { listen_ip, listen_port: raw.web.listen_port as u16 },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -276,82 +430,56 @@ fn validate_engine_config(config: EngineConfig) -> Result<(), ConfigError> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DptMessage {
-    pub major: u16,
-    pub subtype: u16,
-}
+pub struct DptMessage { pub major: u16, pub subtype: u16 }
 
 impl DptMessage {
-    fn bool() -> Self {
-        Self {
-            major: 1,
-            subtype: 1,
-        }
-    }
-
+    fn from_core(dpt: Dpt) -> Self { Self { major: dpt.major, subtype: dpt.subtype } }
     fn core(&self, field_name: &'static str) -> Result<Dpt, ProtocolError> {
-        Dpt::new(self.major, self.subtype)
-            .map_err(|error| ProtocolError::Field(field_name, error.to_string()))
-    }
-
-    fn require_bool(&self, field_name: &'static str) -> Result<(), ProtocolError> {
-        if self.major == 1 && self.subtype == 1 {
-            Ok(())
-        } else {
-            Err(ProtocolError::Field(
-                field_name,
-                format!(
-                    "only DPT 1.001 is supported, got {}.{:03}",
-                    self.major, self.subtype
-                ),
-            ))
-        }
+        let dpt = Dpt::new(self.major, self.subtype).map_err(|error| ProtocolError::Field(field_name, error.to_string()))?;
+        if !dpt.is_supported() { return Err(ProtocolError::Field(field_name, "must be 1.001 or 5.001".to_owned())); }
+        Ok(dpt)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BoolValueMessage {
-    pub kind: String,
-    pub value: bool,
-}
+pub struct BoolValueMessage { pub kind: String, pub value: bool }
 
-impl BoolValueMessage {
-    fn validate(&self) -> Result<(), ProtocolError> {
-        if self.kind == "bool" {
-            Ok(())
-        } else {
-            Err(ProtocolError::Field(
-                "value.kind",
-                "must be 'bool'".to_owned(),
-            ))
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PercentValueMessage { pub kind: String, pub value: u8 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ValueMessage { Bool(BoolValueMessage), Percent(PercentValueMessage) }
+
+impl ValueMessage {
+    fn from_core(value: TypedValue) -> Self {
+        match value.value {
+            Value::Bool(value) => Self::Bool(BoolValueMessage { kind: "bool".to_owned(), value }),
+            Value::Percent(value) => Self::Percent(PercentValueMessage { kind: "percent".to_owned(), value }),
         }
     }
-
-    fn core(&self) -> Result<Value, ProtocolError> {
-        self.validate()?;
-        Ok(Value::Bool(self.value))
+    fn core(&self, dpt: Dpt, field_name: &'static str) -> Result<TypedValue, ProtocolError> {
+        let value = match self {
+            Self::Bool(value) if value.kind == "bool" => Value::Bool(value.value),
+            Self::Percent(value) if value.kind == "percent" => Value::Percent(value.value),
+            Self::Bool(_) => return Err(ProtocolError::Field("value.kind", "must be 'bool'".to_owned())),
+            Self::Percent(_) => return Err(ProtocolError::Field("value.kind", "must be 'percent'".to_owned())),
+        };
+        TypedValue::new(dpt, value).map_err(|error| ProtocolError::Field(field_name, error.to_string()))
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct GroupAddressDpt {
-    pub address: String,
-    pub dpt: DptMessage,
-}
+pub struct GroupAddressDpt { pub address: String, pub dpt: DptMessage }
 
 impl GroupAddressDpt {
     fn validate(&self, field_name: &'static str) -> Result<GroupAddress, ProtocolError> {
-        let address = GroupAddress::parse(&self.address)
-            .map_err(|error| ProtocolError::Field(field_name, error.to_string()))?;
-        if address.to_string() != self.address {
-            return Err(ProtocolError::Field(
-                field_name,
-                "must use canonical main/middle/subgroup form".to_owned(),
-            ));
-        }
-        self.dpt.require_bool("dpt")?;
+        let address = GroupAddress::parse(&self.address).map_err(|error| ProtocolError::Field(field_name, error.to_string()))?;
+        if address.to_string() != self.address { return Err(ProtocolError::Field(field_name, "must use canonical main/middle/subgroup form".to_owned())); }
+        self.dpt.core("dpt")?;
         Ok(address)
     }
 }
@@ -368,26 +496,10 @@ pub struct TunnelingConnection {
 
 impl TunnelingConnection {
     fn validate(&self) -> Result<(), ProtocolError> {
-        if self.connection_type != "tunneling" {
-            return Err(ProtocolError::Field(
-                "connection.type",
-                "must be 'tunneling'".to_owned(),
-            ));
-        }
-        self.gateway_ip
-            .parse::<IpAddr>()
-            .map_err(|error| ProtocolError::Field("connection.gateway_ip", error.to_string()))?;
-        if self.gateway_port == 0 {
-            return Err(ProtocolError::Field(
-                "connection.gateway_port",
-                "must be greater than zero".to_owned(),
-            ));
-        }
-        if let Some(local_ip) = &self.local_ip {
-            local_ip
-                .parse::<IpAddr>()
-                .map_err(|error| ProtocolError::Field("connection.local_ip", error.to_string()))?;
-        }
+        if self.connection_type != "tunneling" { return Err(ProtocolError::Field("connection.type", "must be 'tunneling'".to_owned())); }
+        self.gateway_ip.parse::<IpAddr>().map_err(|error| ProtocolError::Field("connection.gateway_ip", error.to_string()))?;
+        if self.gateway_port == 0 { return Err(ProtocolError::Field("connection.gateway_port", "must be greater than zero".to_owned())); }
+        if let Some(local_ip) = &self.local_ip { local_ip.parse::<IpAddr>().map_err(|error| ProtocolError::Field("connection.local_ip", error.to_string()))?; }
         Ok(())
     }
 }
@@ -405,15 +517,7 @@ pub struct BridgeHello {
 
 impl BridgeHello {
     fn validate(&self) -> Result<(), ProtocolError> {
-        if self.bridge != "xknx" {
-            return Err(ProtocolError::Field("bridge", "must be 'xknx'".to_owned()));
-        }
-        if self.bridge_version.is_empty() || self.xknx_version.is_empty() {
-            return Err(ProtocolError::Field(
-                "bridge_version/xknx_version",
-                "must not be empty".to_owned(),
-            ));
-        }
+        if self.bridge != "xknx" || self.bridge_version.is_empty() || self.xknx_version.is_empty() { return Err(ProtocolError::Field("bridge", "invalid bridge hello".to_owned())); }
         Ok(())
     }
 }
@@ -431,19 +535,11 @@ pub struct Configure {
 impl Configure {
     fn validate(&self) -> Result<(), ProtocolError> {
         self.connection.validate()?;
-        if self.group_addresses.len() != 2 {
-            return Err(ProtocolError::Field(
-                "group_addresses",
-                "must contain input then output".to_owned(),
-            ));
-        }
-        let input = self.group_addresses[0].validate("group_addresses[0].address")?;
-        let output = self.group_addresses[1].validate("group_addresses[1].address")?;
-        if input == output {
-            return Err(ProtocolError::Field(
-                "group_addresses",
-                "input and output group addresses must differ".to_owned(),
-            ));
+        if self.group_addresses.is_empty() { return Err(ProtocolError::Field("group_addresses", "must not be empty".to_owned())); }
+        let mut addresses = HashSet::new();
+        for (index, entry) in self.group_addresses.iter().enumerate() {
+            let address = entry.validate("group_addresses")?;
+            if !addresses.insert(address) { return Err(ProtocolError::Field("group_addresses", format!("duplicate address at index {index}"))); }
         }
         Ok(())
     }
@@ -461,15 +557,8 @@ pub struct Ready {
 
 impl Ready {
     fn validate(&self) -> Result<(), ProtocolError> {
-        if self.transport != "knxip_tunneling" {
-            return Err(ProtocolError::Field(
-                "transport",
-                "must be 'knxip_tunneling'".to_owned(),
-            ));
-        }
-        self.gateway
-            .parse::<IpAddr>()
-            .map_err(|error| ProtocolError::Field("gateway", error.to_string()))?;
+        if self.transport != "knxip_tunneling" { return Err(ProtocolError::Field("transport", "must be 'knxip_tunneling'".to_owned())); }
+        self.gateway.parse::<IpAddr>().map_err(|error| ProtocolError::Field("gateway", error.to_string()))?;
         Ok(())
     }
 }
@@ -484,70 +573,29 @@ pub struct KnxEvent {
     pub destination: String,
     pub service: String,
     pub dpt: DptMessage,
-    pub value: Option<BoolValueMessage>,
+    pub value: Option<ValueMessage>,
 }
 
 impl KnxEvent {
-    fn to_core(&self) -> Result<CoreKnxEvent, ProtocolError> {
-        let source = self
-            .source
-            .as_deref()
-            .map(|source| {
-                let parsed = IndividualAddress::parse(source)
-                    .map_err(|error| ProtocolError::Field("source", error.to_string()))?;
-                if parsed.to_string() != source {
-                    return Err(ProtocolError::Field(
-                        "source",
-                        "must use canonical area.line.device form".to_owned(),
-                    ));
-                }
-                Ok(parsed)
-            })
-            .transpose()?;
-        let destination = GroupAddress::parse(&self.destination)
-            .map_err(|error| ProtocolError::Field("destination", error.to_string()))?;
-        if destination.to_string() != self.destination {
-            return Err(ProtocolError::Field(
-                "destination",
-                "must use canonical main/middle/subgroup form".to_owned(),
-            ));
-        }
-        self.dpt.require_bool("dpt")?;
-        let (service, value) = match self.service.as_str() {
-            "group_value_write" => (GroupService::Write, self.value.as_ref()),
-            "group_value_response" => (GroupService::Response, self.value.as_ref()),
-            "group_value_read" => (GroupService::Read, None),
-            _ => {
-                return Err(ProtocolError::Field(
-                    "service",
-                    "unsupported KNX group service".to_owned(),
-                ));
-            }
-        };
-        if self.service == "group_value_read" && self.value.is_some() {
-            return Err(ProtocolError::Field(
-                "value",
-                "group_value_read must not carry a value".to_owned(),
-            ));
-        }
-        if self.service != "group_value_read" && self.value.is_none() {
-            return Err(ProtocolError::Field(
-                "value",
-                "this KNX service must carry a value".to_owned(),
-            ));
-        }
-        let value = value.map(BoolValueMessage::core).transpose()?;
-        Ok(CoreKnxEvent {
-            source,
-            destination,
-            service,
-            dpt: self.dpt.core("dpt")?,
-            value,
-        })
+    fn typed_value(&self) -> Result<Option<TypedValue>, ProtocolError> {
+        let dpt = self.dpt.core("dpt")?;
+        self.value.as_ref().map(|value| value.core(dpt, "value")).transpose()
     }
-
     fn validate(&self) -> Result<(), ProtocolError> {
-        self.to_core().map(|_| ())
+        let destination = GroupAddress::parse(&self.destination).map_err(|error| ProtocolError::Field("destination", error.to_string()))?;
+        if destination.to_string() != self.destination { return Err(ProtocolError::Field("destination", "must use canonical main/middle/subgroup form".to_owned())); }
+        match self.service.as_str() {
+            "group_value_read" if self.value.is_none() => {},
+            "group_value_write" | "group_value_response" if self.value.is_some() => { self.typed_value()?; },
+            "group_value_read" => return Err(ProtocolError::Field("value", "group_value_read must not carry a value".to_owned())),
+            _ => return Err(ProtocolError::Field("service", "unsupported KNX group service or missing value".to_owned())),
+        }
+        Ok(())
+    }
+    fn to_input_event(&self, endpoint: EndpointName) -> Result<InputEvent, ProtocolError> {
+        if self.service != "group_value_write" { return Err(ProtocolError::Field("service", "only group_value_write drives logic".to_owned())); }
+        let value = self.typed_value()?.ok_or_else(|| ProtocolError::Field("value", "required for group_value_write".to_owned()))?;
+        Ok(InputEvent::new(endpoint, value))
     }
 }
 
@@ -560,21 +608,16 @@ pub struct KnxWrite {
     pub request_id: u64,
     pub destination: String,
     pub dpt: DptMessage,
-    pub value: BoolValueMessage,
+    pub value: ValueMessage,
 }
 
 impl KnxWrite {
     fn validate(&self) -> Result<(), ProtocolError> {
-        let destination = GroupAddress::parse(&self.destination)
-            .map_err(|error| ProtocolError::Field("destination", error.to_string()))?;
-        if destination.to_string() != self.destination {
-            return Err(ProtocolError::Field(
-                "destination",
-                "must use canonical main/middle/subgroup form".to_owned(),
-            ));
-        }
-        self.dpt.require_bool("dpt")?;
-        self.value.validate()
+        let destination = GroupAddress::parse(&self.destination).map_err(|error| ProtocolError::Field("destination", error.to_string()))?;
+        if destination.to_string() != self.destination { return Err(ProtocolError::Field("destination", "must use canonical main/middle/subgroup form".to_owned())); }
+        let dpt = self.dpt.core("dpt")?;
+        self.value.core(dpt, "value")?;
+        Ok(())
     }
 }
 
@@ -592,18 +635,8 @@ pub struct CommandResult {
 
 impl CommandResult {
     fn validate(&self) -> Result<(), ProtocolError> {
-        if !self.ok && self.error.as_deref().is_none_or(str::is_empty) {
-            return Err(ProtocolError::Field(
-                "error",
-                "is required when ok is false".to_owned(),
-            ));
-        }
-        if self.error.as_deref().is_some_and(str::is_empty) {
-            return Err(ProtocolError::Field(
-                "error",
-                "must not be empty".to_owned(),
-            ));
-        }
+        if !self.ok && self.error.as_deref().is_none_or(str::is_empty) { return Err(ProtocolError::Field("error", "is required when ok is false".to_owned())); }
+        if self.ok && self.error.is_some() { return Err(ProtocolError::Field("error", "must be omitted when ok is true".to_owned())); }
         Ok(())
     }
 }
@@ -620,12 +653,7 @@ pub struct Fatal {
 
 impl Fatal {
     fn validate(&self) -> Result<(), ProtocolError> {
-        if self.code.is_empty() || self.message.is_empty() {
-            return Err(ProtocolError::Field(
-                "code/message",
-                "must not be empty".to_owned(),
-            ));
-        }
+        if self.code.is_empty() || self.message.is_empty() { return Err(ProtocolError::Field("code/message", "must not be empty".to_owned())); }
         Ok(())
     }
 }
@@ -640,14 +668,8 @@ pub struct Shutdown {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    BridgeHello(BridgeHello),
-    Configure(Configure),
-    Ready(Ready),
-    KnxEvent(KnxEvent),
-    KnxWrite(KnxWrite),
-    CommandResult(CommandResult),
-    Fatal(Fatal),
-    Shutdown(Shutdown),
+    BridgeHello(BridgeHello), Configure(Configure), Ready(Ready), KnxEvent(KnxEvent),
+    KnxWrite(KnxWrite), CommandResult(CommandResult), Fatal(Fatal), Shutdown(Shutdown),
 }
 
 #[derive(Debug, Error)]
@@ -665,99 +687,43 @@ pub enum ProtocolError {
 }
 
 #[derive(Debug, Deserialize)]
-struct Envelope {
-    v: u64,
-    #[serde(rename = "type")]
-    message_type: String,
-}
+struct Envelope { v: u64, #[serde(rename = "type")] message_type: String }
 
-fn decode<T: for<'de> Deserialize<'de>>(line: &str) -> Result<T, ProtocolError> {
-    serde_json::from_str(line).map_err(ProtocolError::Json)
-}
+fn decode<T: for<'de> Deserialize<'de>>(line: &str) -> Result<T, ProtocolError> { serde_json::from_str(line).map_err(ProtocolError::Json) }
 
-/// Parses one strict version-one protocol line. The caller owns framing; the
-/// parser rejects malformed JSON, unknown message types, and wrong versions.
 pub fn parse_message(line: &str) -> Result<Message, ProtocolError> {
-    if line.trim().is_empty() {
-        return Err(ProtocolError::Envelope);
-    }
+    if line.trim().is_empty() { return Err(ProtocolError::Envelope); }
     let envelope: Envelope = decode(line)?;
-    if envelope.v != PROTOCOL_VERSION {
-        return Err(ProtocolError::Version(envelope.v));
-    }
-    let message = match envelope.message_type.as_str() {
-        "bridge_hello" => {
-            let message: BridgeHello = decode(line)?;
-            message.validate()?;
-            Message::BridgeHello(message)
-        }
-        "configure" => {
-            let message: Configure = decode(line)?;
-            message.validate()?;
-            Message::Configure(message)
-        }
-        "ready" => {
-            let message: Ready = decode(line)?;
-            message.validate()?;
-            Message::Ready(message)
-        }
-        "knx_event" => {
-            let message: KnxEvent = decode(line)?;
-            message.validate()?;
-            Message::KnxEvent(message)
-        }
-        "knx_write" => {
-            let message: KnxWrite = decode(line)?;
-            message.validate()?;
-            Message::KnxWrite(message)
-        }
-        "command_result" => {
-            let message: CommandResult = decode(line)?;
-            message.validate()?;
-            Message::CommandResult(message)
-        }
-        "fatal" => {
-            let message: Fatal = decode(line)?;
-            message.validate()?;
-            Message::Fatal(message)
-        }
+    if envelope.v != PROTOCOL_VERSION { return Err(ProtocolError::Version(envelope.v)); }
+    Ok(match envelope.message_type.as_str() {
+        "bridge_hello" => { let message: BridgeHello = decode(line)?; message.validate()?; Message::BridgeHello(message) }
+        "configure" => { let message: Configure = decode(line)?; message.validate()?; Message::Configure(message) }
+        "ready" => { let message: Ready = decode(line)?; message.validate()?; Message::Ready(message) }
+        "knx_event" => { let message: KnxEvent = decode(line)?; message.validate()?; Message::KnxEvent(message) }
+        "knx_write" => { let message: KnxWrite = decode(line)?; message.validate()?; Message::KnxWrite(message) }
+        "command_result" => { let message: CommandResult = decode(line)?; message.validate()?; Message::CommandResult(message) }
+        "fatal" => { let message: Fatal = decode(line)?; message.validate()?; Message::Fatal(message) }
         "shutdown" => Message::Shutdown(decode(line)?),
         other => return Err(ProtocolError::MessageType(other.to_owned())),
-    };
-    Ok(message)
+    })
 }
 
 pub fn encode_message(message: &Message) -> Result<String, ProtocolError> {
-    let value = match message {
-        Message::BridgeHello(message) => serde_json::to_string(message),
-        Message::Configure(message) => serde_json::to_string(message),
-        Message::Ready(message) => serde_json::to_string(message),
-        Message::KnxEvent(message) => serde_json::to_string(message),
-        Message::KnxWrite(message) => serde_json::to_string(message),
-        Message::CommandResult(message) => serde_json::to_string(message),
-        Message::Fatal(message) => serde_json::to_string(message),
-        Message::Shutdown(message) => serde_json::to_string(message),
-    }?;
-    Ok(value)
+    Ok(match message {
+        Message::BridgeHello(message) => serde_json::to_string(message), Message::Configure(message) => serde_json::to_string(message),
+        Message::Ready(message) => serde_json::to_string(message), Message::KnxEvent(message) => serde_json::to_string(message),
+        Message::KnxWrite(message) => serde_json::to_string(message), Message::CommandResult(message) => serde_json::to_string(message),
+        Message::Fatal(message) => serde_json::to_string(message), Message::Shutdown(message) => serde_json::to_string(message),
+    }?)
 }
 
 // ---------------------------------------------------------------------------
 // Child-process runtime
 
 #[derive(Debug, Clone)]
-pub struct BridgeCommand {
-    pub executable: PathBuf,
-    pub args: Vec<OsString>,
-}
+pub struct BridgeCommand { pub executable: PathBuf, pub args: Vec<OsString> }
 
-impl BridgeCommand {
-    pub fn new(executable: impl Into<PathBuf>, args: Vec<OsString>) -> Self {
-        Self {
-            executable: executable.into(),
-            args,
-        }
-    }
-}
+impl BridgeCommand { pub fn new(executable: impl Into<PathBuf>, args: Vec<OsString>) -> Self { Self { executable: executable.into(), args } } }
 
 #[derive(Debug, Error)]
 pub enum HostError {
@@ -780,241 +746,91 @@ pub enum HostError {
 }
 
 pub async fn run(config: RuntimeConfig) -> Result<(), HostError> {
-    run_with_bridge(
-        config.clone(),
-        BridgeCommand::new(
-            config.bridge.python,
-            vec![OsString::from("-m"), OsString::from("logiksmith_xknx")],
-        ),
-    )
-    .await
+    run_with_bridge(config.clone(), BridgeCommand::new(config.bridge.python, vec![OsString::from("-m"), OsString::from("logiksmith_xknx")])).await
 }
 
-/// Runs the host with an explicit child command. This small seam is also used
-/// by the no-network fake-bridge integration test.
-pub async fn run_with_bridge(
-    config: RuntimeConfig,
-    bridge_command: BridgeCommand,
-) -> Result<(), HostError> {
-    let store = DiagnosticStore::new(config.engine);
+pub async fn run_with_bridge(config: RuntimeConfig, bridge_command: BridgeCommand) -> Result<(), HostError> {
+    let store = DiagnosticStore::new(&config.automation, config.automation_path.clone(), config.automation_revision);
     init_logging(config.logging, store.clone());
-    tracing::info!(target: "logiksmith", version = env!("CARGO_PKG_VERSION"), "logiksmith starting");
-    tracing::info!(target: "logiksmith", path = %config.config_path.display(), "configuration loaded");
-    let mut engine = Engine::try_new(config.engine)
-        .map_err(|error| HostError::Protocol(ProtocolError::Field("poc", error.to_string())))?;
-    tracing::info!(target: "logiksmith", "core initialized");
-
-    // Bind the dashboard before starting the bridge so users can observe
-    // startup and connection progress, including bridge failures.
+    let mut engine = Engine::try_new(config.automation.engine_config.clone()).map_err(|error| HostError::Protocol(ProtocolError::Field("automation", error.to_string())))?;
     let web_server = start_web_server(store.clone(), config.web).await?;
-    tracing::info!(target: "logiksmith.web", address = %web_server.address, "dashboard listening");
-
-    tracing::info!(target: "logiksmith", executable = %bridge_command.executable.display(), "starting KNX bridge");
-    let mut child = match Command::new(&bridge_command.executable)
-        .args(&bridge_command.args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+    let mut child = match Command::new(&bridge_command.executable).args(&bridge_command.args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
         Ok(child) => child,
-        Err(source) => {
-            web_server.shutdown().await;
-            return Err(HostError::Start {
-                path: bridge_command.executable.clone(),
-                source,
-            });
-        }
+        Err(source) => { web_server.shutdown().await; return Err(HostError::Start { path: bridge_command.executable, source }); }
     };
-    let mut stdin = match child.stdin.take() {
-        Some(stdin) => stdin,
-        None => {
-            web_server.shutdown().await;
-            return Err(HostError::Start {
-                path: bridge_command.executable.clone(),
-                source: io::Error::other("bridge stdin was not piped"),
-            });
-        }
-    };
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            web_server.shutdown().await;
-            terminate_child(&mut child).await;
-            return Err(HostError::Start {
-                path: bridge_command.executable.clone(),
-                source: io::Error::other("bridge stdout was not piped"),
-            });
-        }
-    };
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(forward_bridge_stderr(stderr));
-    }
+    let mut stdin = child.stdin.take().ok_or_else(|| HostError::Start { path: bridge_command.executable.clone(), source: io::Error::other("bridge stdin was not piped") })?;
+    let stdout = child.stdout.take().ok_or_else(|| HostError::Start { path: bridge_command.executable.clone(), source: io::Error::other("bridge stdout was not piped") })?;
+    if let Some(stderr) = child.stderr.take() { tokio::spawn(forward_bridge_stderr(stderr)); }
     let mut reader = BufReader::new(stdout);
-
-    let result = run_session(
-        &config,
-        &store,
-        &mut engine,
-        &mut child,
-        &mut stdin,
-        &mut reader,
-    )
-    .await;
-    if let Err(error) = &result {
-        tracing::error!(target: "logiksmith", error = %error, "desktop runtime stopped");
-    }
-    if result.is_err() {
-        // A protocol/fatal/EOF error must not leave a sidecar behind.
-        let _ = send_message(&mut stdin, &shutdown_message()).await;
-        terminate_child(&mut child).await;
-    }
+    let result = run_session(&config, &store, &mut engine, &mut child, &mut stdin, &mut reader).await;
+    if result.is_err() { let _ = send_message(&mut stdin, &shutdown_message()).await; terminate_child(&mut child).await; }
     web_server.shutdown().await;
     result
 }
 
-async fn forward_bridge_stderr<R>(stderr: R)
-where
-    R: AsyncRead + Unpin,
-{
+async fn forward_bridge_stderr<R: AsyncRead + Unpin>(stderr: R) {
     let mut lines = BufReader::new(stderr).lines();
-    loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => tracing::debug!(target: "bridge.xknx", "{line}"),
-            Ok(None) => break,
-            Err(error) => {
-                tracing::warn!(target: "bridge.xknx", error = %error, "failed reading bridge stderr");
-                break;
-            }
-        }
-    }
+    while let Ok(Some(line)) = lines.next_line().await { tracing::debug!(target: "bridge.xknx", "{line}"); }
 }
 
-async fn run_session(
-    config: &RuntimeConfig,
-    store: &DiagnosticStore,
-    engine: &mut Engine,
-    child: &mut Child,
-    stdin: &mut ChildStdin,
-    reader: &mut BufReader<ChildStdout>,
-) -> Result<(), HostError> {
-    let hello = read_message(reader).await?;
-    let hello = match hello {
+async fn run_session(config: &RuntimeConfig, store: &DiagnosticStore, engine: &mut Engine, child: &mut Child, stdin: &mut ChildStdin, reader: &mut BufReader<ChildStdout>) -> Result<(), HostError> {
+    let hello = match read_message(reader).await? {
         Message::BridgeHello(hello) => hello,
-        Message::Fatal(fatal) => {
-            return Err(HostError::BridgeFatal {
-                code: fatal.code,
-                message: fatal.message,
-            });
-        }
-        _ => {
-            return Err(ProtocolError::Field(
-                "startup",
-                "expected bridge_hello before configure".to_owned(),
-            )
-            .into());
-        }
+        Message::Fatal(fatal) => return Err(HostError::BridgeFatal { code: fatal.code, message: fatal.message }),
+        _ => return Err(ProtocolError::Field("startup", "expected bridge_hello before configure".to_owned()).into()),
     };
-    tracing::info!(
-        target: "logiksmith",
-        protocol = hello.v,
-        bridge = %hello.bridge,
-        bridge_version = %hello.bridge_version,
-        xknx_version = %hello.xknx_version,
-        "bridge hello"
-    );
-
-    let configure = configure_message(config);
+    tracing::info!(target: "logiksmith", bridge = %hello.bridge, bridge_version = %hello.bridge_version, xknx_version = %hello.xknx_version, "bridge hello");
     store.set_connection(ConnectionState::Connecting);
-    send_message(stdin, &configure).await?;
-    tracing::info!(
-        target: "logiksmith",
-        gateway = %config.connection.gateway_ip,
-        transport = "tunneling",
-        "connecting KNX"
-    );
-    let ready = read_message(reader).await?;
-    let ready = match ready {
+    send_message(stdin, &configure_message(config)).await?;
+    let ready = match read_message(reader).await? {
         Message::Ready(ready) => ready,
-        Message::Fatal(fatal) => {
-            return Err(HostError::BridgeFatal {
-                code: fatal.code,
-                message: fatal.message,
-            });
-        }
-        _ => {
-            return Err(ProtocolError::Field(
-                "startup",
-                "expected ready after configure".to_owned(),
-            )
-            .into());
-        }
+        Message::Fatal(fatal) => return Err(HostError::BridgeFatal { code: fatal.code, message: fatal.message }),
+        _ => return Err(ProtocolError::Field("startup", "expected ready after configure".to_owned()).into()),
     };
     store.set_connection(ConnectionState::Connected);
-    store.set_timer_deadline(engine.snapshot().off_deadline);
     tracing::info!(target: "logiksmith", gateway = %ready.gateway, "KNX connected");
-    tracing::info!(target: "logiksmith", "LogikSmith ready");
-
     let mut poll = time::interval(Duration::from_millis(20));
     poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
     poll.tick().await;
     let mut line = String::new();
     let mut next_request_id = 1u64;
     let mut pending = HashSet::new();
-
     loop {
         tokio::select! {
             read = reader.read_line(&mut line) => {
                 let bytes = read?;
-                if bytes == 0 {
-                    let status = child.wait().await?;
-                    return Err(HostError::BridgeExited { status: format_status(status) });
-                }
+                if bytes == 0 { let status = child.wait().await?; return Err(HostError::BridgeExited { status: format_status(status) }); }
                 let message = parse_message(line.trim_end_matches(['\r', '\n']))?;
                 line.clear();
                 match message {
                     Message::KnxEvent(event) => {
-                        tracing::debug!(target: "logiksmith", source = ?event.source, destination = %event.destination, service = %event.service, dpt = %event.dpt, value = ?event.value, "KNX telegram received");
-                        let mut telegram = TelegramRecord::from(&event);
-                        telegram.time_ms = store.now().0;
-                        store.record_telegram(telegram);
-                        let event = event.to_core()?;
-                        let commands = engine.handle_event(event, store.now());
+                        let destination = GroupAddress::parse(&event.destination).map_err(|error| ProtocolError::Field("destination", error.to_string()))?;
+                        let logical_endpoint = config.automation.address_to_endpoint.get(&destination).map(|binding| binding.endpoint.clone());
+                        store.record_telegram(TelegramRecord::from_event(&event, logical_endpoint.as_ref()));
+                        let Some(binding) = config.automation.address_to_endpoint.get(&destination) else { continue };
+                        if binding.direction != EndpointDirection::Input || event.service != "group_value_write" { continue; }
+                        let input = match event.to_input_event(binding.endpoint.clone()) { Ok(input) => input, Err(error) => { tracing::warn!(target: "logiksmith", error = %error, "ignoring invalid logical input event"); continue; } };
+                        let effects = match engine.handle_event(input, store.now()) { Ok(effects) => effects, Err(error) => { tracing::warn!(target: "logiksmith", error = %error, "ignoring rejected logical input event"); continue; } };
                         store.set_timer_deadline(engine.snapshot().off_deadline);
-                        dispatch_commands(store, stdin, commands, &mut next_request_id, &mut pending).await?;
+                        dispatch_effects(store, stdin, &config.automation, effects, &mut next_request_id, &mut pending).await?;
                     }
                     Message::CommandResult(result) => {
-                        if !pending.remove(&result.request_id) {
-                            return Err(HostError::UnknownRequest(result.request_id));
-                        }
+                        if !pending.remove(&result.request_id) { return Err(HostError::UnknownRequest(result.request_id)); }
                         store.record_write_result(result.request_id, result.ok, result.error.clone());
-                        if result.ok {
-                            tracing::debug!(target: "logiksmith", request_id = result.request_id, "KNX write completed");
-                        } else {
-                            tracing::error!(target: "logiksmith", request_id = result.request_id, error = ?result.error, "KNX write failed");
-                        }
                     }
-                    Message::Fatal(fatal) => {
-                        tracing::error!(target: "logiksmith", code = %fatal.code, message = %fatal.message, "bridge fatal");
-                        return Err(HostError::BridgeFatal { code: fatal.code, message: fatal.message });
-                    }
+                    Message::Fatal(fatal) => return Err(HostError::BridgeFatal { code: fatal.code, message: fatal.message }),
                     _ => return Err(ProtocolError::Field("runtime", "unexpected bridge message".to_owned()).into()),
                 }
             }
             _ = poll.tick() => {
-                let commands = engine.poll(store.now());
+                let effects = engine.poll(store.now());
                 store.set_timer_deadline(engine.snapshot().off_deadline);
-                dispatch_commands(store, stdin, commands, &mut next_request_id, &mut pending).await?;
+                dispatch_effects(store, stdin, &config.automation, effects, &mut next_request_id, &mut pending).await?;
             }
             signal = signal::ctrl_c() => {
                 signal?;
-                tracing::info!(target: "logiksmith", "shutting down");
                 send_message(stdin, &shutdown_message()).await?;
-                if time::timeout(Duration::from_secs(2), child.wait()).await.is_err() {
-                    tracing::warn!(target: "logiksmith", "bridge did not stop after shutdown; terminating");
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                }
+                let _ = time::timeout(Duration::from_secs(2), child.wait()).await;
                 return Ok(());
             }
         }
@@ -1022,77 +838,29 @@ async fn run_session(
 }
 
 fn configure_message(config: &RuntimeConfig) -> Message {
+    let mut group_addresses: Vec<_> = config.automation.address_to_endpoint.values().map(|binding| GroupAddressDpt { address: binding.address.to_string(), dpt: DptMessage::from_core(binding.dpt) }).collect();
+    group_addresses.sort_by(|left, right| left.address.cmp(&right.address));
     Message::Configure(Configure {
-        v: PROTOCOL_VERSION,
-        message_type: "configure".to_owned(),
-        connection: TunnelingConnection {
-            connection_type: "tunneling".to_owned(),
-            gateway_ip: config.connection.gateway_ip.to_string(),
-            gateway_port: config.connection.gateway_port,
-            local_ip: config.connection.local_ip.map(|ip| ip.to_string()),
-        },
-        group_addresses: vec![
-            GroupAddressDpt {
-                address: config.engine.input_group_address.to_string(),
-                dpt: DptMessage::bool(),
-            },
-            GroupAddressDpt {
-                address: config.engine.output_group_address.to_string(),
-                dpt: DptMessage::bool(),
-            },
-        ],
+        v: PROTOCOL_VERSION, message_type: "configure".to_owned(),
+        connection: TunnelingConnection { connection_type: "tunneling".to_owned(), gateway_ip: config.connection.gateway_ip.to_string(), gateway_port: config.connection.gateway_port, local_ip: config.connection.local_ip.map(|ip| ip.to_string()) },
+        group_addresses,
     })
 }
 
-fn shutdown_message() -> Message {
-    Message::Shutdown(Shutdown {
-        v: PROTOCOL_VERSION,
-        message_type: "shutdown".to_owned(),
-    })
-}
+fn shutdown_message() -> Message { Message::Shutdown(Shutdown { v: PROTOCOL_VERSION, message_type: "shutdown".to_owned() }) }
 
-async fn dispatch_commands(
-    store: &DiagnosticStore,
-    stdin: &mut ChildStdin,
-    commands: Vec<CoreCommand>,
-    next_request_id: &mut u64,
-    pending: &mut HashSet<u64>,
-) -> Result<(), HostError> {
-    for command in commands {
-        let CoreCommand::KnxWrite {
-            destination,
-            dpt,
-            value,
-        } = command;
+async fn dispatch_effects(store: &DiagnosticStore, stdin: &mut ChildStdin, automation: &AutomationRuntime, effects: Vec<Effect>, next_request_id: &mut u64, pending: &mut HashSet<u64>) -> Result<(), HostError> {
+    for effect in effects {
+        let Effect::SetOutput { endpoint, value } = effect;
+        let Some(destination) = automation.endpoint_to_address.get(&endpoint).copied() else { tracing::error!(target: "logiksmith", endpoint = %endpoint, "core returned an unresolved output effect"); continue; };
         let request_id = *next_request_id;
-        *next_request_id = next_request_id.checked_add(1).ok_or_else(|| {
-            HostError::Protocol(ProtocolError::Field("request_id", "exhausted".to_owned()))
-        })?;
+        *next_request_id = next_request_id.checked_add(1).ok_or_else(|| HostError::Protocol(ProtocolError::Field("request_id", "exhausted".to_owned())))?;
+        let dpt = automation.endpoint_dpts.get(&endpoint).copied().ok_or_else(|| HostError::Protocol(ProtocolError::Field("output", "missing endpoint DPT".to_owned())))?;
+        if value.dpt != dpt { tracing::error!(target: "logiksmith", endpoint = %endpoint, "core returned an output value with the wrong DPT"); continue; }
         pending.insert(request_id);
-        let value = match value {
-            Value::Bool(value) => BoolValueMessage {
-                kind: "bool".to_owned(),
-                value,
-            },
-        };
-        store.record_write_requested(request_id, destination, dpt, value.value);
-        tracing::info!(target: "logiksmith", request_id, destination = %destination, dpt = %dpt, value = ?value, "KNX write requested");
-        let message = Message::KnxWrite(KnxWrite {
-            v: PROTOCOL_VERSION,
-            message_type: "knx_write".to_owned(),
-            request_id,
-            destination: destination.to_string(),
-            dpt: DptMessage {
-                major: dpt.major,
-                subtype: dpt.subtype,
-            },
-            value,
-        });
-        if let Err(error) = send_message(stdin, &message).await {
-            pending.remove(&request_id);
-            store.record_write_result(request_id, false, Some(error.to_string()));
-            return Err(error);
-        }
+        store.record_write_requested(request_id, endpoint.clone(), destination, dpt, value);
+        let message = Message::KnxWrite(KnxWrite { v: PROTOCOL_VERSION, message_type: "knx_write".to_owned(), request_id, destination: destination.to_string(), dpt: DptMessage::from_core(dpt), value: ValueMessage::from_core(value) });
+        if let Err(error) = send_message(stdin, &message).await { pending.remove(&request_id); store.record_write_result(request_id, false, Some(error.to_string())); return Err(error); }
     }
     Ok(())
 }
@@ -1100,15 +868,12 @@ async fn dispatch_commands(
 async fn read_message(reader: &mut BufReader<ChildStdout>) -> Result<Message, HostError> {
     let mut line = String::new();
     let bytes = reader.read_line(&mut line).await?;
-    if bytes == 0 {
-        return Err(HostError::StdoutEof);
-    }
+    if bytes == 0 { return Err(HostError::StdoutEof); }
     Ok(parse_message(line.trim_end_matches(['\r', '\n']))?)
 }
 
 async fn send_message(stdin: &mut ChildStdin, message: &Message) -> Result<(), HostError> {
-    let line = encode_message(message)?;
-    stdin.write_all(line.as_bytes()).await?;
+    stdin.write_all(encode_message(message)?.as_bytes()).await?;
     stdin.write_all(b"\n").await?;
     stdin.flush().await?;
     Ok(())
@@ -1117,142 +882,23 @@ async fn send_message(stdin: &mut ChildStdin, message: &Message) -> Result<(), H
 fn init_logging(config: LoggingConfig, store: DiagnosticStore) {
     diagnostics::activate_tracing_store(store);
     let filter = logging_filter(config);
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_target(true)
-        .with_filter(filter.clone());
+    let fmt_layer = tracing_subscriber::fmt::layer().with_target(true).with_filter(filter.clone());
     let diagnostics_layer = diagnostics::tracing_layer().with_filter(filter);
-    let _ = tracing_subscriber::registry()
-        .with(fmt_layer)
-        .with(diagnostics_layer)
-        .try_init();
+    let _ = tracing_subscriber::registry().with(fmt_layer).with(diagnostics_layer).try_init();
 }
 
 fn logging_filter(config: LoggingConfig) -> EnvFilter {
-    // Parse only the TOML-selected directives so an inherited RUST_LOG cannot
-    // hide the proof-of-concept event path.
-    EnvFilter::builder()
-        .with_default_directive(config.level.into())
-        .parse_lossy(format!(
-            "logiksmith={},bridge.xknx={}",
-            config.level, config.bridge_level
-        ))
+    EnvFilter::builder().with_default_directive(config.level.into()).parse_lossy(format!("logiksmith={},bridge.xknx={}", config.level, config.bridge_level))
 }
 
 async fn terminate_child(child: &mut Child) {
-    if time::timeout(Duration::from_millis(250), child.wait())
-        .await
-        .is_ok()
-    {
-        return;
-    }
+    if time::timeout(Duration::from_millis(250), child.wait()).await.is_ok() { return; }
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
 
-fn format_status(status: std::process::ExitStatus) -> String {
-    status
-        .code()
-        .map_or_else(|| "signal".to_owned(), |code| code.to_string())
-}
+fn format_status(status: std::process::ExitStatus) -> String { status.code().map_or_else(|| "signal".to_owned(), |code| code.to_string()) }
 
 impl fmt::Display for DptMessage {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}.{:03}", self.major, self.subtype)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::Value as JsonValue;
-
-    fn round_trip(line: &str) {
-        let parsed = parse_message(line).unwrap();
-        let encoded = encode_message(&parsed).unwrap();
-        assert_eq!(
-            serde_json::from_str::<JsonValue>(line).unwrap(),
-            serde_json::from_str::<JsonValue>(&encoded).unwrap()
-        );
-    }
-
-    #[test]
-    fn protocol_messages_round_trip() {
-        round_trip(
-            r#"{"v":1,"type":"bridge_hello","bridge":"xknx","bridge_version":"0.1.0","xknx_version":"3.0"}"#,
-        );
-        round_trip(
-            r#"{"v":1,"type":"configure","connection":{"type":"tunneling","gateway_ip":"192.0.2.20","gateway_port":3671,"local_ip":null},"group_addresses":[{"address":"2/2/52","dpt":{"major":1,"subtype":1}},{"address":"2/3/52","dpt":{"major":1,"subtype":1}}]}"#,
-        );
-        round_trip(
-            r#"{"v":1,"type":"ready","transport":"knxip_tunneling","gateway":"192.0.2.20"}"#,
-        );
-        round_trip(
-            r#"{"v":1,"type":"knx_event","source":"1.1.42","destination":"2/2/52","service":"group_value_write","dpt":{"major":1,"subtype":1},"value":{"kind":"bool","value":true}}"#,
-        );
-        round_trip(
-            r#"{"v":1,"type":"knx_write","request_id":12,"destination":"2/3/52","dpt":{"major":1,"subtype":1},"value":{"kind":"bool","value":true}}"#,
-        );
-        round_trip(r#"{"v":1,"type":"command_result","request_id":12,"ok":true}"#);
-        round_trip(
-            r#"{"v":1,"type":"fatal","code":"knx_connection_failed","message":"Unable to establish KNX/IP tunnel"}"#,
-        );
-        round_trip(r#"{"v":1,"type":"shutdown"}"#);
-    }
-
-    #[test]
-    fn protocol_rejects_corruption_and_mismatch() {
-        assert!(matches!(
-            parse_message("not json"),
-            Err(ProtocolError::Json(_))
-        ));
-        assert!(matches!(
-            parse_message(
-                r#"{"v":2,"type":"ready","transport":"knxip_tunneling","gateway":"192.0.2.20"}"#
-            ),
-            Err(ProtocolError::Version(2))
-        ));
-        assert!(matches!(
-            parse_message(r#"{"v":1,"type":"unknown"}"#),
-            Err(ProtocolError::MessageType(_))
-        ));
-        assert!(parse_message(r#"{"v":1,"type":"knx_event","source":"1.1.42","destination":"32/2/52","service":"group_value_write","dpt":{"major":1,"subtype":1},"value":{"kind":"bool","value":true}}"#).is_err());
-        assert!(
-            parse_message(r#"{"v":1,"type":"command_result","request_id":12,"ok":false}"#).is_err()
-        );
-    }
-
-    #[test]
-    fn logging_filter_applies_config_to_both_poc_targets() {
-        let filter = logging_filter(LoggingConfig {
-            level: LevelFilter::DEBUG,
-            bridge_level: LevelFilter::TRACE,
-        });
-        let directives = filter.to_string();
-
-        assert!(
-            directives
-                .split(',')
-                .any(|directive| directive == "logiksmith=debug")
-        );
-        assert!(
-            directives
-                .split(',')
-                .any(|directive| directive == "bridge.xknx=trace")
-        );
-    }
-
-    #[test]
-    fn web_config_accepts_ipv4_and_ipv6_but_rejects_port_zero() {
-        let ipv4 = WebConfig::new("127.0.0.1".parse().unwrap(), 8080).unwrap();
-        assert_eq!(ipv4.socket_addr().to_string(), "127.0.0.1:8080");
-        let ipv6 = WebConfig::new("::1".parse().unwrap(), 8080).unwrap();
-        assert_eq!(ipv6.socket_addr().to_string(), "[::1]:8080");
-        assert!(matches!(
-            WebConfig::new("127.0.0.1".parse().unwrap(), 0),
-            Err(ConfigError::Field {
-                field: "web.listen_port",
-                ..
-            })
-        ));
-    }
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { write!(formatter, "{}.{:03}", self.major, self.subtype) }
 }

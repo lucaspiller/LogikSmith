@@ -1,0 +1,43 @@
+# Copy this file to config/automation.toml and replace every KNX placeholder.
+# Use only harmless visible actuators for manual tests.
+
+[[inputs]]
+name = "wall_switch"
+dpt = "1.001"
+
+[[inputs]]
+name = "dimmer_level"
+dpt = "5.001"
+
+[[outputs]]
+name = "test_light"
+dpt = "1.001"
+
+[[outputs]]
+name = "dimmer_output"
+dpt = "5.001"
+
+[[knx_bindings]]
+endpoint = "wall_switch"
+group_address = "REPLACE_WITH_INPUT_GROUP_ADDRESS"
+
+[[knx_bindings]]
+endpoint = "dimmer_level"
+group_address = "REPLACE_WITH_PERCENT_INPUT_GROUP_ADDRESS"
+
+[[knx_bindings]]
+endpoint = "test_light"
+group_address = "REPLACE_WITH_SAFE_OUTPUT_GROUP_ADDRESS"
+
+[[knx_bindings]]
+endpoint = "dimmer_output"
+group_address = "REPLACE_WITH_SAFE_PERCENT_OUTPUT_GROUP_ADDRESS"
+
+[behaviors.timed_bool]
+input = "wall_switch"
+output = "test_light"
+off_delay_ms = 5000
+
+[behaviors.percentage_forward]
+input = "dimmer_level"
+output = "dimmer_output"

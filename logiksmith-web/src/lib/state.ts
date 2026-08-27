@@ -4,8 +4,27 @@ export type StreamStatus = 'connecting' | 'connected' | 'stale' | 'error';
 export type WriteStatus = 'idle' | 'pending' | 'succeeded' | 'failed';
 
 export interface DisplayEndpoint {
+  name?: string;
   address: string;
   dpt: string;
+  direction?: 'input' | 'output';
+  observed?: boolean | number | null;
+  requested?: boolean | number | null;
+}
+
+export interface DisplayBinding {
+  endpoint: string;
+  groupAddress: string;
+}
+
+export interface DisplayAutomation {
+  inputs: DisplayEndpoint[];
+  outputs: DisplayEndpoint[];
+  bindings: DisplayBinding[];
+  behaviors: {
+    timedBool: { input: string; output: string; offDelayMs: number };
+    percentageForward: { input: string; output: string };
+  };
 }
 
 export interface DisplayTelegram {
@@ -14,7 +33,7 @@ export interface DisplayTelegram {
   destination: string;
   service: string;
   dpt: string;
-  value: boolean | null;
+  value: boolean | number | null;
 }
 
 export interface DisplayLog {
@@ -35,7 +54,7 @@ export interface DisplayTimer {
 export interface DisplayWrite {
   status: WriteStatus;
   requestId: number | null;
-  value: boolean | null;
+  value: boolean | number | null;
   error: string | null;
 }
 
@@ -48,9 +67,12 @@ export interface DisplaySnapshot {
     offDelayMs: number;
   };
   values: {
-    input: { observed: boolean | null };
-    output: { observed: boolean | null; requested: boolean | null };
+    input: { observed: boolean | number | null };
+    output: { observed: boolean | number | null; requested: boolean | number | null };
   };
+  automation?: DisplayAutomation;
+  activeAutomationRevision?: number | null;
+  savedAutomationRevision?: number | null;
   write: DisplayWrite;
   timer: DisplayTimer;
   telegrams: DisplayTelegram[];
@@ -172,6 +194,10 @@ export function formatCountdown(milliseconds: number | null): string {
   return `${(value / 1_000).toFixed(1)} s`;
 }
 
-export function formatValue(value: boolean | null): string {
+export function formatValue(value: boolean | number | null): string {
   return value === null ? 'unknown' : String(value);
+}
+
+export function hasPendingRestart(activeRevision: number | null, savedRevision: number | null, restartRequired = false): boolean {
+  return restartRequired || (activeRevision !== null && savedRevision !== null && activeRevision !== savedRevision);
 }

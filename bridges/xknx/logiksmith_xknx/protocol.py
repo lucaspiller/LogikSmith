@@ -132,6 +132,17 @@ class Dpt:
 
 
 DPT_1_001 = Dpt(1, 1)
+DPT_5_001 = Dpt(5, 1)
+
+_SUPPORTED_DPTS = frozenset({DPT_1_001, DPT_5_001})
+
+
+def validate_supported_dpt(dpt: Dpt, field: str = "dpt") -> Dpt:
+    if not isinstance(dpt, Dpt):
+        raise ProtocolError(f"{field} must be a DPT record")
+    if dpt not in _SUPPORTED_DPTS:
+        raise ValidationError(f"{field} must be 1.001 or 5.001")
+    return dpt
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +169,48 @@ class BoolValue:
 
 
 @dataclass(frozen=True, slots=True)
+class PercentValue:
+    kind: str
+    value: int
+
+    def __post_init__(self) -> None:
+        if self.kind != "percent":
+            raise ValidationError("value.kind must be 'percent'")
+        _integer(self.value, "value.value", minimum=0, maximum=100)
+
+    @classmethod
+    def from_obj(cls, value: Any) -> PercentValue:
+        obj = _require_object(value, "value")
+        _require_keys(obj, {"kind", "value"})
+        return cls(
+            _string(obj["kind"], "value.kind"),
+            _integer(obj["value"], "value.value", minimum=0, maximum=100),
+        )
+
+    def to_obj(self) -> dict[str, str | int]:
+        return {"kind": self.kind, "value": self.value}
+
+
+TypedValue: TypeAlias = BoolValue | PercentValue
+
+
+def value_from_obj(value: Any, dpt: Dpt) -> TypedValue:
+    validate_supported_dpt(dpt)
+    if dpt == DPT_1_001:
+        return BoolValue.from_obj(value)
+    return PercentValue.from_obj(value)
+
+
+def validate_value_for_dpt(value: Any, dpt: Dpt, field: str = "value") -> TypedValue:
+    validate_supported_dpt(dpt)
+    expected = BoolValue if dpt == DPT_1_001 else PercentValue
+    if not isinstance(value, expected):
+        expected_kind = "bool" if dpt == DPT_1_001 else "percent"
+        raise ValidationError(f"{field}.kind must match dpt {dpt} ('{expected_kind}')")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
 class GroupAddressDpt:
     address: str
     dpt: Dpt
@@ -166,6 +219,7 @@ class GroupAddressDpt:
         canonical = validate_group_address(self.address, "group address")
         if canonical != self.address:
             raise ValidationError("group address must be canonical")
+        validate_supported_dpt(self.dpt, "group address dpt")
 
     @classmethod
     def from_obj(cls, value: Any) -> GroupAddressDpt:
@@ -257,22 +311,17 @@ class Configure:
     type: ClassVar[str] = "configure"
 
     def __post_init__(self) -> None:
-        if len(self.group_addresses) != 2:
-            raise ValidationError("group_addresses must contain input then output")
-        if self.group_addresses[0].dpt != DPT_1_001:
-            raise ValidationError("group_addresses[0].dpt must be 1.001")
-        if self.group_addresses[1].dpt != DPT_1_001:
-            raise ValidationError("group_addresses[1].dpt must be 1.001")
-        if self.input_address == self.output_address:
-            raise ValidationError("input and output group addresses must differ")
-
-    @property
-    def input_address(self) -> str:
-        return self.group_addresses[0].address
-
-    @property
-    def output_address(self) -> str:
-        return self.group_addresses[1].address
+        if not isinstance(self.group_addresses, (tuple, list)):
+            raise ProtocolError("group_addresses must be an array")
+        if not self.group_addresses:
+            raise ValidationError("group_addresses must not be empty")
+        addresses = []
+        for entry in self.group_addresses:
+            if not isinstance(entry, GroupAddressDpt):
+                raise ProtocolError("group_addresses entries must be address/DPT records")
+            addresses.append(entry.address)
+        if len(set(addresses)) != len(addresses):
+            raise ValidationError("group_addresses must contain unique addresses")
 
     @classmethod
     def from_obj(cls, value: Any) -> Configure:
@@ -331,7 +380,7 @@ class KnxEvent:
     destination: str
     service: str
     dpt: Dpt
-    value: BoolValue | None
+    value: TypedValue | None
 
     type: ClassVar[str] = "knx_event"
 
@@ -345,12 +394,13 @@ class KnxEvent:
             raise ValidationError("destination must be canonical")
         if self.service not in _EVENT_SERVICES:
             raise ValidationError("unsupported KNX service")
-        if self.dpt != DPT_1_001:
-            raise ValidationError("only DPT 1.001 is supported")
+        validate_supported_dpt(self.dpt)
         if self.service == "group_value_read" and self.value is not None:
             raise ValidationError("group_value_read must not carry a value")
         if self.service != "group_value_read" and self.value is None:
             raise ValidationError(f"{self.service} must carry a value")
+        if self.value is not None:
+            validate_value_for_dpt(self.value, self.dpt)
 
     @classmethod
     def from_obj(cls, value: Any) -> KnxEvent:
@@ -359,12 +409,13 @@ class KnxEvent:
         source = obj["source"]
         if source is not None:
             source = validate_individual_address(source)
-        event_value = None if obj["value"] is None else BoolValue.from_obj(obj["value"])
+        dpt = Dpt.from_obj(obj["dpt"])
+        event_value = None if obj["value"] is None else value_from_obj(obj["value"], dpt)
         return cls(
             source,
             validate_group_address(obj["destination"], "destination"),
             _string(obj["service"], "service"),
-            Dpt.from_obj(obj["dpt"]),
+            dpt,
             event_value,
         )
 
@@ -385,7 +436,7 @@ class KnxWrite:
     request_id: int
     destination: str
     dpt: Dpt
-    value: BoolValue
+    value: TypedValue
 
     type: ClassVar[str] = "knx_write"
 
@@ -394,18 +445,18 @@ class KnxWrite:
         destination = validate_group_address(self.destination, "destination")
         if destination != self.destination:
             raise ValidationError("destination must be canonical")
-        if self.dpt != DPT_1_001:
-            raise ValidationError("only DPT 1.001 is supported")
+        validate_value_for_dpt(self.value, self.dpt)
 
     @classmethod
     def from_obj(cls, value: Any) -> KnxWrite:
         obj = _require_object(value, "knx_write")
         _require_keys(obj, {"v", "type", "request_id", "destination", "dpt", "value"})
+        dpt = Dpt.from_obj(obj["dpt"])
         return cls(
             _integer(obj["request_id"], "request_id", minimum=0),
             validate_group_address(obj["destination"], "destination"),
-            Dpt.from_obj(obj["dpt"]),
-            BoolValue.from_obj(obj["value"]),
+            dpt,
+            value_from_obj(obj["value"], dpt),
         )
 
     def to_obj(self) -> dict[str, Any]:

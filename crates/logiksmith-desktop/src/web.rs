@@ -1,14 +1,16 @@
 //! Internal HTTP/SSE dashboard API and static asset server.
 
 use crate::{
-    WebConfig,
+    AutomationDocument, AutomationEnvelope, FieldError, WebConfig, build_automation,
     diagnostics::{DiagnosticStore, DiagnosticUpdate, Replay, Snapshot},
+    load_automation,
 };
 use axum::{
     Router,
     extract::{Query, State},
+    http::StatusCode,
     response::{
-        IntoResponse, Json,
+        IntoResponse, Json, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::get,
@@ -18,8 +20,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     convert::Infallible,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -43,6 +48,7 @@ pub enum WebError {
 #[derive(Clone)]
 struct AppState {
     store: DiagnosticStore,
+    automation_lock: Arc<Mutex<()>>,
 }
 
 pub struct WebServer {
@@ -107,9 +113,13 @@ pub async fn start_web_server_with_assets(
         .map_err(|source| WebError::Bind { address, source })?;
     let router = Router::new()
         .route("/api/snapshot", get(snapshot))
+        .route("/api/automation", get(get_automation).put(put_automation))
         .route("/api/events", get(events))
         .fallback_service(ServeDir::new(&root).not_found_service(ServeFile::new(index)))
-        .with_state(AppState { store });
+        .with_state(AppState {
+            store,
+            automation_lock: Arc::new(Mutex::new(())),
+        });
     let (sender, receiver) = oneshot::channel();
     let task = tokio::spawn(async move {
         let result = axum::serve(listener, router)
@@ -130,6 +140,121 @@ pub async fn start_web_server_with_assets(
 
 async fn snapshot(State(state): State<AppState>) -> Json<Snapshot> {
     Json(state.store.snapshot())
+}
+
+async fn get_automation(State(state): State<AppState>) -> Response {
+    match load_automation(&state.store.automation_path()) {
+        Ok((document, revision)) => {
+            (StatusCode::OK, Json(AutomationEnvelope { document, revision })).into_response()
+        }
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveAutomationRequest {
+    document: AutomationDocument,
+    revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SaveAutomationResponse {
+    revision: u64,
+    restart_required: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FieldErrorsResponse {
+    errors: Vec<FieldError>,
+}
+
+async fn put_automation(
+    State(state): State<AppState>,
+    Json(request): Json<SaveAutomationRequest>,
+) -> Response {
+    let _guard = state
+        .automation_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = state.store.automation_path();
+    let (current, current_revision) = match load_automation(&path) {
+        Ok(value) => value,
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    };
+    if request.revision != current_revision {
+        return (
+            StatusCode::CONFLICT,
+            Json(AutomationEnvelope {
+                document: current,
+                revision: current_revision,
+            }),
+        )
+            .into_response();
+    }
+    if let Err(errors) = build_automation(request.document.clone()) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(FieldErrorsResponse { errors }),
+        )
+            .into_response();
+    }
+    match atomic_save(&path, &request.document) {
+        Ok(revision) => {
+            state.store.set_saved_automation_revision(revision);
+            (
+                StatusCode::OK,
+                Json(SaveAutomationResponse {
+                    revision,
+                    restart_required: true,
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+fn json_error(status: StatusCode, error: String) -> Response {
+    (status, Json(ErrorResponse { error })).into_response()
+}
+
+fn atomic_save(path: &Path, document: &AutomationDocument) -> Result<u64, String> {
+    let bytes = toml::to_string_pretty(document)
+        .map_err(|error| error.to_string())?
+        .into_bytes();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "automation path has no file name".to_owned())?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{file_name}.{stamp}-{}.tmp",
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+        Ok::<_, String>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map(|_| crate::automation_revision(&bytes))
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,18 +340,31 @@ fn resync_event(revision: u64) -> Event {
 mod tests {
     use super::*;
     use crate::diagnostics::JOURNAL_CAPACITY;
-    use logiksmith_core::{Dpt, EngineConfig};
     use std::{fs, net::IpAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn store() -> DiagnosticStore {
-        DiagnosticStore::new(EngineConfig {
-            input_group_address: "2/2/52".parse().unwrap(),
-            input_dpt: Dpt::BOOL,
-            output_group_address: "2/3/52".parse().unwrap(),
-            output_dpt: Dpt::BOOL,
-            off_delay_ms: 5_000,
-        })
+        let runtime = crate::build_automation(crate::AutomationDocument {
+            inputs: vec![
+                crate::AutomationEndpoint { name: "wall_switch".to_owned(), dpt: "1.001".to_owned() },
+                crate::AutomationEndpoint { name: "dimmer_level".to_owned(), dpt: "5.001".to_owned() },
+            ],
+            outputs: vec![
+                crate::AutomationEndpoint { name: "test_light".to_owned(), dpt: "1.001".to_owned() },
+                crate::AutomationEndpoint { name: "dimmer_output".to_owned(), dpt: "5.001".to_owned() },
+            ],
+            knx_bindings: vec![
+                crate::KnxBinding { endpoint: "wall_switch".to_owned(), group_address: "2/2/52".to_owned() },
+                crate::KnxBinding { endpoint: "dimmer_level".to_owned(), group_address: "2/2/53".to_owned() },
+                crate::KnxBinding { endpoint: "test_light".to_owned(), group_address: "2/3/52".to_owned() },
+                crate::KnxBinding { endpoint: "dimmer_output".to_owned(), group_address: "2/3/53".to_owned() },
+            ],
+            behaviors: crate::AutomationBehaviors {
+                timed_bool: crate::TimedBoolBehavior { input: "wall_switch".to_owned(), output: "test_light".to_owned(), off_delay_ms: 5_000 },
+                percentage_forward: crate::PercentageForwardBehavior { input: "dimmer_level".to_owned(), output: "dimmer_output".to_owned() },
+            },
+        }).unwrap();
+        DiagnosticStore::new(&runtime, std::env::temp_dir().join("logiksmith-web-test-automation.toml"), 1)
     }
 
     #[tokio::test]

@@ -1,255 +1,132 @@
-//! Platform-independent KNX event processing for LogikSmith.
+//! Platform-independent event processing for LogikSmith.
 //!
-//! The core has no I/O or clock access. Hosts provide events and monotonic
-//! timestamps, then execute the commands returned by [`Engine`].
+//! The core deals in named, typed endpoints. Hosts provide input events and
+//! monotonic timestamps, then execute the logical effects returned by
+//! [`Engine`]. Transport details such as KNX group addresses stay outside this
+//! crate.
 
 use std::{error::Error, fmt, str::FromStr};
 
-/// A validated three-level KNX group address (`main/middle/subgroup`).
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct GroupAddress {
-    main: u8,
-    middle: u8,
-    subgroup: u8,
-}
+/// A validated logical endpoint name.
+///
+/// Names start with a lowercase ASCII letter and may then contain lowercase
+/// ASCII letters, digits, `_`, `-`, or `.`.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EndpointName(String);
 
-impl GroupAddress {
-    /// Creates an address with KNX three-level ranges: 0..=31, 0..=7, and
-    /// 0..=255 respectively. The all-zero address is reserved for broadcast.
-    pub fn new(main: u16, middle: u16, subgroup: u16) -> Result<Self, GroupAddressError> {
-        if main > 31 {
-            return Err(GroupAddressError::ComponentOutOfRange {
-                component: "main",
-                value: main,
-                max: 31,
-            });
-        }
-        if middle > 7 {
-            return Err(GroupAddressError::ComponentOutOfRange {
-                component: "middle",
-                value: middle,
-                max: 7,
-            });
-        }
-        if subgroup > 255 {
-            return Err(GroupAddressError::ComponentOutOfRange {
-                component: "subgroup",
-                value: subgroup,
-                max: 255,
-            });
-        }
-        if main == 0 && middle == 0 && subgroup == 0 {
-            return Err(GroupAddressError::BroadcastReserved);
-        }
-
-        Ok(Self {
-            main: main as u8,
-            middle: middle as u8,
-            subgroup: subgroup as u8,
-        })
+impl EndpointName {
+    pub fn new(value: impl Into<String>) -> Result<Self, EndpointNameError> {
+        let value = value.into();
+        validate_endpoint_name(&value)?;
+        Ok(Self(value))
     }
 
-    /// Parses the canonical `main/middle/subgroup` representation.
-    pub fn parse(value: &str) -> Result<Self, GroupAddressError> {
+    pub fn parse(value: &str) -> Result<Self, EndpointNameError> {
         value.parse()
     }
 
-    pub const fn main(self) -> u8 {
-        self.main
-    }
-
-    pub const fn middle(self) -> u8 {
-        self.middle
-    }
-
-    pub const fn subgroup(self) -> u8 {
-        self.subgroup
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-impl FromStr for GroupAddress {
-    type Err = GroupAddressError;
+fn validate_endpoint_name(value: &str) -> Result<(), EndpointNameError> {
+    let mut chars = value.chars();
+    let first = chars.next().ok_or(EndpointNameError::Empty)?;
+    if !first.is_ascii_lowercase() {
+        return Err(EndpointNameError::InvalidStart(first));
+    }
+    for character in chars {
+        if !(character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '_' | '-' | '.'))
+        {
+            return Err(EndpointNameError::InvalidCharacter(character));
+        }
+    }
+    Ok(())
+}
+
+impl FromStr for EndpointName {
+    type Err = EndpointNameError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let mut components = value.split('/');
-        let main = components
-            .next()
-            .ok_or(GroupAddressError::InvalidFormat)?
-            .parse::<u16>()
-            .map_err(|_| GroupAddressError::InvalidFormat)?;
-        let middle = components
-            .next()
-            .ok_or(GroupAddressError::InvalidFormat)?
-            .parse::<u16>()
-            .map_err(|_| GroupAddressError::InvalidFormat)?;
-        let subgroup = components
-            .next()
-            .ok_or(GroupAddressError::InvalidFormat)?
-            .parse::<u16>()
-            .map_err(|_| GroupAddressError::InvalidFormat)?;
-        if components.next().is_some() {
-            return Err(GroupAddressError::InvalidFormat);
-        }
-        Self::new(main, middle, subgroup)
+        Self::new(value)
     }
 }
 
-impl fmt::Display for GroupAddress {
+impl fmt::Display for EndpointName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}/{}/{}", self.main, self.middle, self.subgroup)
+        formatter.write_str(&self.0)
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GroupAddressError {
-    InvalidFormat,
-    BroadcastReserved,
-    ComponentOutOfRange {
-        component: &'static str,
-        value: u16,
-        max: u16,
-    },
+pub enum EndpointNameError {
+    Empty,
+    InvalidStart(char),
+    InvalidCharacter(char),
 }
 
-impl fmt::Display for GroupAddressError {
+impl fmt::Display for EndpointNameError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidFormat => write!(formatter, "group address must be main/middle/subgroup"),
-            Self::BroadcastReserved => {
-                write!(formatter, "group address 0/0/0 is reserved for broadcast")
-            }
-            Self::ComponentOutOfRange {
-                component,
-                value,
-                max,
-            } => write!(
+            Self::Empty => formatter.write_str("endpoint name must not be empty"),
+            Self::InvalidStart(character) => write!(
                 formatter,
-                "group address {component} component {value} exceeds {max}"
+                "endpoint name must start with a lowercase ASCII letter, got {character:?}"
+            ),
+            Self::InvalidCharacter(character) => write!(
+                formatter,
+                "endpoint name contains invalid character {character:?}"
             ),
         }
     }
 }
 
-impl Error for GroupAddressError {}
+impl Error for EndpointNameError {}
 
-/// A validated three-level KNX individual (physical) address (`area.line.device`).
+/// The direction in which an endpoint participates in the automation model.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct IndividualAddress {
-    area: u8,
-    line: u8,
-    device: u8,
+pub enum EndpointDirection {
+    Input,
+    Output,
 }
 
-impl IndividualAddress {
-    /// Creates an address with KNX ranges: 0..=15, 0..=15, and 0..=255.
-    pub fn new(area: u16, line: u16, device: u16) -> Result<Self, IndividualAddressError> {
-        if area > 15 {
-            return Err(IndividualAddressError::ComponentOutOfRange {
-                component: "area",
-                value: area,
-                max: 15,
-            });
-        }
-        if line > 15 {
-            return Err(IndividualAddressError::ComponentOutOfRange {
-                component: "line",
-                value: line,
-                max: 15,
-            });
-        }
-        if device > 255 {
-            return Err(IndividualAddressError::ComponentOutOfRange {
-                component: "device",
-                value: device,
-                max: 255,
-            });
-        }
-
-        Ok(Self {
-            area: area as u8,
-            line: line as u8,
-            device: device as u8,
+impl fmt::Display for EndpointDirection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Input => "input",
+            Self::Output => "output",
         })
     }
-
-    /// Parses the canonical `area.line.device` representation.
-    pub fn parse(value: &str) -> Result<Self, IndividualAddressError> {
-        value.parse()
-    }
-
-    pub const fn area(self) -> u8 {
-        self.area
-    }
-
-    pub const fn line(self) -> u8 {
-        self.line
-    }
-
-    pub const fn device(self) -> u8 {
-        self.device
-    }
 }
 
-impl FromStr for IndividualAddress {
-    type Err = IndividualAddressError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let mut components = value.split('.');
-        let area = components
-            .next()
-            .ok_or(IndividualAddressError::InvalidFormat)?
-            .parse::<u16>()
-            .map_err(|_| IndividualAddressError::InvalidFormat)?;
-        let line = components
-            .next()
-            .ok_or(IndividualAddressError::InvalidFormat)?
-            .parse::<u16>()
-            .map_err(|_| IndividualAddressError::InvalidFormat)?;
-        let device = components
-            .next()
-            .ok_or(IndividualAddressError::InvalidFormat)?
-            .parse::<u16>()
-            .map_err(|_| IndividualAddressError::InvalidFormat)?;
-        if components.next().is_some() {
-            return Err(IndividualAddressError::InvalidFormat);
-        }
-        Self::new(area, line, device)
-    }
+/// A declared logical endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Endpoint {
+    pub name: EndpointName,
+    pub direction: EndpointDirection,
+    pub dpt: Dpt,
 }
 
-impl fmt::Display for IndividualAddress {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}.{}.{}", self.area, self.line, self.device)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IndividualAddressError {
-    InvalidFormat,
-    ComponentOutOfRange {
-        component: &'static str,
-        value: u16,
-        max: u16,
-    },
-}
-
-impl fmt::Display for IndividualAddressError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidFormat => write!(formatter, "individual address must be area.line.device"),
-            Self::ComponentOutOfRange {
-                component,
-                value,
-                max,
-            } => write!(
-                formatter,
-                "individual address {component} component {value} exceeds {max}"
-            ),
+impl Endpoint {
+    pub fn new(name: EndpointName, direction: EndpointDirection, dpt: Dpt) -> Self {
+        Self {
+            name,
+            direction,
+            dpt,
         }
     }
-}
 
-impl Error for IndividualAddressError {}
+    pub fn input(name: EndpointName, dpt: Dpt) -> Self {
+        Self::new(name, EndpointDirection::Input, dpt)
+    }
+
+    pub fn output(name: EndpointName, dpt: Dpt) -> Self {
+        Self::new(name, EndpointDirection::Output, dpt)
+    }
+}
 
 /// A structured KNX datapoint type identifier.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -259,13 +136,23 @@ pub struct Dpt {
 }
 
 impl Dpt {
-    /// The only datapoint type supported by this proof of concept.
+    /// DPT 1.001 switch.
     pub const BOOL: Self = Self {
         major: 1,
         subtype: 1,
     };
 
-    /// Creates a DPT identifier. KNX textual subtypes are three decimal digits.
+    /// DPT 5.001 percentage.
+    pub const PERCENT: Self = Self {
+        major: 5,
+        subtype: 1,
+    };
+
+    /// Alias for callers that spell out the value's semantic name.
+    pub const PERCENTAGE: Self = Self::PERCENT;
+
+    /// Creates a DPT identifier. Supported endpoint declarations are checked
+    /// separately by [`EngineConfig::validate`].
     pub fn new(major: u16, subtype: u16) -> Result<Self, DptError> {
         if major == 0 {
             return Err(DptError::MajorOutOfRange(major));
@@ -276,14 +163,20 @@ impl Dpt {
         Ok(Self { major, subtype })
     }
 
-    /// Parses the canonical `major.subtype` representation, where subtype has
-    /// exactly three decimal digits (for example, `1.001`).
     pub fn parse(value: &str) -> Result<Self, DptError> {
         value.parse()
     }
 
     pub const fn is_bool(self) -> bool {
         self.major == Self::BOOL.major && self.subtype == Self::BOOL.subtype
+    }
+
+    pub const fn is_percent(self) -> bool {
+        self.major == Self::PERCENT.major && self.subtype == Self::PERCENT.subtype
+    }
+
+    pub const fn is_supported(self) -> bool {
+        self.is_bool() || self.is_percent()
     }
 }
 
@@ -322,10 +215,8 @@ pub enum DptError {
 impl fmt::Display for DptError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidFormat => write!(
-                formatter,
-                "DPT must be formatted as major.subtype with a three-digit subtype"
-            ),
+            Self::InvalidFormat => formatter
+                .write_str("DPT must be formatted as major.subtype with a three-digit subtype"),
             Self::MajorOutOfRange(value) => {
                 write!(formatter, "DPT major {value} must be greater than zero")
             }
@@ -338,39 +229,360 @@ impl fmt::Display for DptError {
 
 impl Error for DptError {}
 
-/// A typed value carried by a KNX group telegram.
+/// The semantic payload of a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Value {
     Bool(bool),
+    Percent(u8),
 }
 
-/// KNX group services relevant to this proof of concept.
+/// A value with its DPT identity attached.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GroupService {
-    Write,
-    Response,
-    Read,
-}
-
-/// An incoming KNX event supplied by a host or adapter.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KnxEvent {
-    pub source: Option<IndividualAddress>,
-    pub destination: GroupAddress,
-    pub service: GroupService,
+pub struct TypedValue {
     pub dpt: Dpt,
-    pub value: Option<Value>,
+    pub value: Value,
 }
 
-/// A command for the host/transport adapter to execute.
+impl TypedValue {
+    pub fn new(dpt: Dpt, value: Value) -> Result<Self, ValueError> {
+        let typed = Self { dpt, value };
+        typed.validate()?;
+        Ok(typed)
+    }
+
+    pub const fn bool(value: bool) -> Self {
+        Self {
+            dpt: Dpt::BOOL,
+            value: Value::Bool(value),
+        }
+    }
+
+    pub fn percent(value: u8) -> Result<Self, ValueError> {
+        Self::new(Dpt::PERCENT, Value::Percent(value))
+    }
+
+    pub fn validate(self) -> Result<(), ValueError> {
+        match (self.dpt, self.value) {
+            (dpt, Value::Bool(_)) if dpt.is_bool() => Ok(()),
+            (dpt, Value::Percent(value)) if dpt.is_percent() && value <= 100 => Ok(()),
+            (dpt, Value::Percent(value)) if dpt.is_percent() => {
+                Err(ValueError::PercentOutOfRange(value))
+            }
+            (dpt, _) if !dpt.is_supported() => Err(ValueError::UnsupportedDpt(dpt)),
+            (dpt, value) => Err(ValueError::DptValueMismatch { dpt, value }),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Command {
-    KnxWrite {
-        destination: GroupAddress,
-        dpt: Dpt,
-        value: Value,
+pub enum ValueError {
+    UnsupportedDpt(Dpt),
+    DptValueMismatch { dpt: Dpt, value: Value },
+    PercentOutOfRange(u8),
+}
+
+impl fmt::Display for ValueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedDpt(dpt) => write!(formatter, "unsupported DPT {dpt}"),
+            Self::DptValueMismatch { dpt, value } => {
+                write!(formatter, "value {value:?} does not match DPT {dpt}")
+            }
+            Self::PercentOutOfRange(value) => {
+                write!(
+                    formatter,
+                    "percentage value {value} must be in range 0..=100"
+                )
+            }
+        }
+    }
+}
+
+impl Error for ValueError {}
+
+/// An input event supplied by a host or adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InputEvent {
+    pub endpoint: EndpointName,
+    pub value: TypedValue,
+}
+
+impl InputEvent {
+    pub fn new(endpoint: EndpointName, value: TypedValue) -> Self {
+        Self { endpoint, value }
+    }
+}
+
+/// A logical output effect for the host to execute.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Effect {
+    SetOutput {
+        endpoint: EndpointName,
+        value: TypedValue,
     },
 }
+
+/// The selected timed boolean behaviour.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimedBooleanRule {
+    pub input: EndpointName,
+    pub output: EndpointName,
+    pub off_delay_ms: u64,
+}
+
+/// Compatibility spelling for the rule name used by the TOML section.
+pub type TimedBoolRule = TimedBooleanRule;
+
+/// The selected percentage forwarding behaviour.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PercentageForwardRule {
+    pub input: EndpointName,
+    pub output: EndpointName,
+}
+
+/// Configuration for the portable endpoint engine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineConfig {
+    pub endpoints: Vec<Endpoint>,
+    pub timed_bool: TimedBooleanRule,
+    pub percentage_forward: PercentageForwardRule,
+}
+
+impl EngineConfig {
+    pub fn new(
+        endpoints: Vec<Endpoint>,
+        timed_bool: TimedBooleanRule,
+        percentage_forward: PercentageForwardRule,
+    ) -> Self {
+        Self {
+            endpoints,
+            timed_bool,
+            percentage_forward,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            if self
+                .endpoints
+                .iter()
+                .take(index)
+                .any(|other| other.name == endpoint.name)
+            {
+                return Err(ConfigError::DuplicateEndpoint(endpoint.name.clone()));
+            }
+            if !endpoint.dpt.is_supported() {
+                return Err(ConfigError::UnsupportedEndpointDpt {
+                    endpoint: endpoint.name.clone(),
+                    dpt: endpoint.dpt,
+                });
+            }
+        }
+
+        validate_rule_endpoint(
+            &self.endpoints,
+            "timed_bool",
+            "input",
+            &self.timed_bool.input,
+            EndpointDirection::Input,
+            Dpt::BOOL,
+        )?;
+        validate_rule_endpoint(
+            &self.endpoints,
+            "timed_bool",
+            "output",
+            &self.timed_bool.output,
+            EndpointDirection::Output,
+            Dpt::BOOL,
+        )?;
+        if self.timed_bool.off_delay_ms == 0 {
+            return Err(ConfigError::ZeroOffDelay);
+        }
+        if self.timed_bool.off_delay_ms > MAX_OFF_DELAY_MS {
+            return Err(ConfigError::OffDelayTooLarge {
+                actual: self.timed_bool.off_delay_ms,
+                maximum: MAX_OFF_DELAY_MS,
+            });
+        }
+
+        validate_rule_endpoint(
+            &self.endpoints,
+            "percentage_forward",
+            "input",
+            &self.percentage_forward.input,
+            EndpointDirection::Input,
+            Dpt::PERCENT,
+        )?;
+        validate_rule_endpoint(
+            &self.endpoints,
+            "percentage_forward",
+            "output",
+            &self.percentage_forward.output,
+            EndpointDirection::Output,
+            Dpt::PERCENT,
+        )?;
+        Ok(())
+    }
+}
+
+fn validate_rule_endpoint(
+    endpoints: &[Endpoint],
+    rule: &'static str,
+    role: &'static str,
+    name: &EndpointName,
+    expected_direction: EndpointDirection,
+    expected_dpt: Dpt,
+) -> Result<(), ConfigError> {
+    let endpoint = endpoints
+        .iter()
+        .find(|endpoint| endpoint.name == *name)
+        .ok_or_else(|| ConfigError::UnknownRuleEndpoint {
+            rule,
+            role,
+            endpoint: name.clone(),
+        })?;
+    if endpoint.direction != expected_direction {
+        return Err(ConfigError::WrongRuleDirection {
+            rule,
+            role,
+            endpoint: name.clone(),
+            expected: expected_direction,
+            actual: endpoint.direction,
+        });
+    }
+    if endpoint.dpt != expected_dpt {
+        return Err(ConfigError::WrongRuleDpt {
+            rule,
+            role,
+            endpoint: name.clone(),
+            expected: expected_dpt,
+            actual: endpoint.dpt,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigError {
+    DuplicateEndpoint(EndpointName),
+    UnsupportedEndpointDpt {
+        endpoint: EndpointName,
+        dpt: Dpt,
+    },
+    UnknownRuleEndpoint {
+        rule: &'static str,
+        role: &'static str,
+        endpoint: EndpointName,
+    },
+    WrongRuleDirection {
+        rule: &'static str,
+        role: &'static str,
+        endpoint: EndpointName,
+        expected: EndpointDirection,
+        actual: EndpointDirection,
+    },
+    WrongRuleDpt {
+        rule: &'static str,
+        role: &'static str,
+        endpoint: EndpointName,
+        expected: Dpt,
+        actual: Dpt,
+    },
+    ZeroOffDelay,
+    OffDelayTooLarge {
+        actual: u64,
+        maximum: u64,
+    },
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateEndpoint(endpoint) => {
+                write!(formatter, "duplicate endpoint name {endpoint}")
+            }
+            Self::UnsupportedEndpointDpt { endpoint, dpt } => {
+                write!(formatter, "endpoint {endpoint} uses unsupported DPT {dpt}")
+            }
+            Self::UnknownRuleEndpoint {
+                rule,
+                role,
+                endpoint,
+            } => write!(
+                formatter,
+                "{rule}.{role} references unknown endpoint {endpoint}"
+            ),
+            Self::WrongRuleDirection {
+                rule,
+                role,
+                endpoint,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{rule}.{role} endpoint {endpoint} must be {expected}, got {actual}"
+            ),
+            Self::WrongRuleDpt {
+                rule,
+                role,
+                endpoint,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{rule}.{role} endpoint {endpoint} must use DPT {expected}, got {actual}"
+            ),
+            Self::ZeroOffDelay => {
+                formatter.write_str("timed_bool.off_delay_ms must be greater than zero")
+            }
+            Self::OffDelayTooLarge { actual, maximum } => write!(
+                formatter,
+                "timed_bool.off_delay_ms {actual} exceeds maximum {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for ConfigError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EventError {
+    UnknownEndpoint(EndpointName),
+    EndpointNotInput {
+        endpoint: EndpointName,
+        actual: EndpointDirection,
+    },
+    DptMismatch {
+        endpoint: EndpointName,
+        expected: Dpt,
+        actual: Dpt,
+    },
+    InvalidValue(ValueError),
+}
+
+impl fmt::Display for EventError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownEndpoint(endpoint) => {
+                write!(formatter, "unknown input endpoint {endpoint}")
+            }
+            Self::EndpointNotInput { endpoint, actual } => {
+                write!(formatter, "endpoint {endpoint} is {actual}, not an input")
+            }
+            Self::DptMismatch {
+                endpoint,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "input endpoint {endpoint} expects DPT {expected}, got {actual}"
+            ),
+            Self::InvalidValue(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for EventError {}
 
 /// A host-provided monotonic timestamp in milliseconds.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
@@ -382,86 +594,20 @@ impl MonotonicMs {
     }
 }
 
-/// Maximum accepted delay for this POC (24 hours).
+/// Maximum accepted delay for the timed behaviour (24 hours).
 pub const MAX_OFF_DELAY_MS: u64 = 86_400_000;
 
-/// Configuration for the hard-coded POC behavior.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EngineConfig {
-    pub input_group_address: GroupAddress,
-    pub input_dpt: Dpt,
-    pub output_group_address: GroupAddress,
-    pub output_dpt: Dpt,
-    pub off_delay_ms: u64,
-}
-
-impl EngineConfig {
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.input_group_address == self.output_group_address {
-            return Err(ConfigError::SameGroupAddress);
-        }
-        if self.input_dpt != Dpt::BOOL {
-            return Err(ConfigError::UnsupportedInputDpt(self.input_dpt));
-        }
-        if self.output_dpt != Dpt::BOOL {
-            return Err(ConfigError::UnsupportedOutputDpt(self.output_dpt));
-        }
-        if self.off_delay_ms == 0 {
-            return Err(ConfigError::ZeroOffDelay);
-        }
-        if self.off_delay_ms > MAX_OFF_DELAY_MS {
-            return Err(ConfigError::OffDelayTooLarge {
-                actual: self.off_delay_ms,
-                maximum: MAX_OFF_DELAY_MS,
-            });
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConfigError {
-    SameGroupAddress,
-    UnsupportedInputDpt(Dpt),
-    UnsupportedOutputDpt(Dpt),
-    ZeroOffDelay,
-    OffDelayTooLarge { actual: u64, maximum: u64 },
-}
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SameGroupAddress => write!(
-                formatter,
-                "input_group_address and output_group_address must differ"
-            ),
-            Self::UnsupportedInputDpt(dpt) => {
-                write!(formatter, "input_dpt must be 1.001, got {dpt}")
-            }
-            Self::UnsupportedOutputDpt(dpt) => {
-                write!(formatter, "output_dpt must be 1.001, got {dpt}")
-            }
-            Self::ZeroOffDelay => write!(formatter, "off_delay_ms must be greater than zero"),
-            Self::OffDelayTooLarge { actual, maximum } => {
-                write!(formatter, "off_delay_ms {actual} exceeds maximum {maximum}")
-            }
-        }
-    }
-}
-
-impl Error for ConfigError {}
-
-/// Deterministic POC event-to-command engine.
-#[derive(Clone, Copy, Debug)]
-pub struct Engine {
-    config: EngineConfig,
-    off_deadline: Option<MonotonicMs>,
-}
-
-/// Read-only view of the engine's current timer state.
+/// Read-only view of the engine's timer state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EngineSnapshot {
     pub off_deadline: Option<MonotonicMs>,
+}
+
+/// Deterministic endpoint event-to-effect engine.
+#[derive(Clone, Debug)]
+pub struct Engine {
+    config: EngineConfig,
+    off_deadline: Option<MonotonicMs>,
 }
 
 impl Engine {
@@ -485,30 +631,57 @@ impl Engine {
         }
     }
 
-    pub fn handle_event(&mut self, event: KnxEvent, now: MonotonicMs) -> Vec<Command> {
-        if event.destination != self.config.input_group_address
-            || event.service != GroupService::Write
-            || event.dpt != self.config.input_dpt
-            || event.value != Some(Value::Bool(true))
-        {
-            return Vec::new();
+    pub fn handle_event(
+        &mut self,
+        event: InputEvent,
+        now: MonotonicMs,
+    ) -> Result<Vec<Effect>, EventError> {
+        event.value.validate().map_err(EventError::InvalidValue)?;
+        let endpoint = self
+            .config
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.name == event.endpoint)
+            .ok_or_else(|| EventError::UnknownEndpoint(event.endpoint.clone()))?;
+        if endpoint.direction != EndpointDirection::Input {
+            return Err(EventError::EndpointNotInput {
+                endpoint: event.endpoint,
+                actual: endpoint.direction,
+            });
+        }
+        if endpoint.dpt != event.value.dpt {
+            return Err(EventError::DptMismatch {
+                endpoint: event.endpoint,
+                expected: endpoint.dpt,
+                actual: event.value.dpt,
+            });
         }
 
-        self.off_deadline = Some(now.saturating_add(self.config.off_delay_ms));
-        vec![Command::KnxWrite {
-            destination: self.config.output_group_address,
-            dpt: self.config.output_dpt,
-            value: Value::Bool(true),
-        }]
+        if event.endpoint == self.config.timed_bool.input && event.value.value == Value::Bool(true)
+        {
+            self.off_deadline = Some(now.saturating_add(self.config.timed_bool.off_delay_ms));
+            return Ok(vec![Effect::SetOutput {
+                endpoint: self.config.timed_bool.output.clone(),
+                value: TypedValue::bool(true),
+            }]);
+        }
+
+        if event.endpoint == self.config.percentage_forward.input {
+            return Ok(vec![Effect::SetOutput {
+                endpoint: self.config.percentage_forward.output.clone(),
+                value: event.value,
+            }]);
+        }
+
+        Ok(Vec::new())
     }
 
-    pub fn poll(&mut self, now: MonotonicMs) -> Vec<Command> {
+    pub fn poll(&mut self, now: MonotonicMs) -> Vec<Effect> {
         if self.off_deadline.is_some_and(|deadline| now >= deadline) {
             self.off_deadline = None;
-            return vec![Command::KnxWrite {
-                destination: self.config.output_group_address,
-                dpt: self.config.output_dpt,
-                value: Value::Bool(false),
+            return vec![Effect::SetOutput {
+                endpoint: self.config.timed_bool.output.clone(),
+                value: TypedValue::bool(false),
             }];
         }
         Vec::new()
@@ -519,386 +692,269 @@ impl Engine {
 mod tests {
     use super::*;
 
-    fn address(value: &str) -> GroupAddress {
+    fn name(value: &str) -> EndpointName {
         value.parse().unwrap()
     }
 
-    fn event(destination: &str, service: GroupService, dpt: Dpt, value: Option<Value>) -> KnxEvent {
-        KnxEvent {
-            source: None,
-            destination: address(destination),
-            service,
-            dpt,
-            value,
-        }
+    fn endpoint(value: &str, direction: EndpointDirection, dpt: Dpt) -> Endpoint {
+        Endpoint::new(name(value), direction, dpt)
     }
 
     fn config() -> EngineConfig {
-        EngineConfig {
-            input_group_address: address("2/2/52"),
-            input_dpt: Dpt::BOOL,
-            output_group_address: address("2/3/52"),
-            output_dpt: Dpt::BOOL,
-            off_delay_ms: 5_000,
+        EngineConfig::new(
+            vec![
+                endpoint("wall_switch", EndpointDirection::Input, Dpt::BOOL),
+                endpoint("dimmer_level", EndpointDirection::Input, Dpt::PERCENT),
+                endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
+                endpoint("dimmer_output", EndpointDirection::Output, Dpt::PERCENT),
+                endpoint("unused_input", EndpointDirection::Input, Dpt::BOOL),
+            ],
+            TimedBooleanRule {
+                input: name("wall_switch"),
+                output: name("test_light"),
+                off_delay_ms: 5_000,
+            },
+            PercentageForwardRule {
+                input: name("dimmer_level"),
+                output: name("dimmer_output"),
+            },
+        )
+    }
+
+    fn timed_event(value: bool) -> InputEvent {
+        InputEvent::new(name("wall_switch"), TypedValue::bool(value))
+    }
+
+    fn percent_event(value: u8) -> InputEvent {
+        InputEvent::new(name("dimmer_level"), TypedValue::percent(value).unwrap())
+    }
+
+    fn timed_effect(value: bool) -> Effect {
+        Effect::SetOutput {
+            endpoint: name("test_light"),
+            value: TypedValue::bool(value),
         }
     }
 
-    fn on_command() -> Command {
-        Command::KnxWrite {
-            destination: address("2/3/52"),
-            dpt: Dpt::BOOL,
-            value: Value::Bool(true),
-        }
-    }
-
-    fn off_command() -> Command {
-        Command::KnxWrite {
-            destination: address("2/3/52"),
-            dpt: Dpt::BOOL,
-            value: Value::Bool(false),
+    fn percent_effect(value: u8) -> Effect {
+        Effect::SetOutput {
+            endpoint: name("dimmer_output"),
+            value: TypedValue::percent(value).unwrap(),
         }
     }
 
     #[test]
-    fn snapshot_is_idle_before_trigger() {
-        let engine = Engine::new(config());
-
-        assert_eq!(engine.snapshot(), EngineSnapshot { off_deadline: None });
+    fn endpoint_names_are_validated() {
+        assert!("wall_switch".parse::<EndpointName>().is_ok());
+        assert!("a.b-2".parse::<EndpointName>().is_ok());
+        assert!("".parse::<EndpointName>().is_err());
+        assert!("Wall_switch".parse::<EndpointName>().is_err());
+        assert!("1st_input".parse::<EndpointName>().is_err());
+        assert!("wall/switch".parse::<EndpointName>().is_err());
     }
 
     #[test]
-    fn snapshot_reports_deadline_after_trigger() {
-        let mut engine = Engine::new(config());
-        engine.handle_event(
-            event(
-                "2/2/52",
-                GroupService::Write,
-                Dpt::BOOL,
-                Some(Value::Bool(true)),
-            ),
-            MonotonicMs(1_000),
-        );
-
+    fn dpts_and_values_are_typed() {
+        assert_eq!(Dpt::BOOL.to_string(), "1.001");
+        assert_eq!(Dpt::PERCENT.to_string(), "5.001");
         assert_eq!(
-            engine.snapshot(),
-            EngineSnapshot {
-                off_deadline: Some(MonotonicMs(6_000)),
-            }
+            TypedValue::new(Dpt::BOOL, Value::Bool(true)).unwrap(),
+            TypedValue::bool(true)
         );
-    }
-
-    #[test]
-    fn snapshot_reports_retriggered_deadline() {
-        let mut engine = Engine::new(config());
-        engine.handle_event(
-            event(
-                "2/2/52",
-                GroupService::Write,
-                Dpt::BOOL,
-                Some(Value::Bool(true)),
-            ),
-            MonotonicMs(1_000),
-        );
-        engine.handle_event(
-            event(
-                "2/2/52",
-                GroupService::Write,
-                Dpt::BOOL,
-                Some(Value::Bool(true)),
-            ),
-            MonotonicMs(4_000),
-        );
-
-        assert_eq!(
-            engine.snapshot(),
-            EngineSnapshot {
-                off_deadline: Some(MonotonicMs(9_000)),
-            }
-        );
-    }
-
-    #[test]
-    fn snapshot_clears_after_expiry() {
-        let mut engine = Engine::new(config());
-        engine.handle_event(
-            event(
-                "2/2/52",
-                GroupService::Write,
-                Dpt::BOOL,
-                Some(Value::Bool(true)),
-            ),
-            MonotonicMs(1_000),
-        );
-
-        assert_eq!(engine.poll(MonotonicMs(6_000)), vec![off_command()]);
-        assert_eq!(engine.snapshot(), EngineSnapshot { off_deadline: None });
-    }
-
-    #[test]
-    fn trigger_produces_on() {
-        let mut engine = Engine::new(config());
-        assert_eq!(
-            engine.handle_event(
-                event(
-                    "2/2/52",
-                    GroupService::Write,
-                    Dpt::BOOL,
-                    Some(Value::Bool(true))
-                ),
-                MonotonicMs(1_000)
-            ),
-            vec![on_command()]
-        );
-    }
-
-    #[test]
-    fn timer_does_not_fire_early() {
-        let mut engine = Engine::new(config());
-        engine.handle_event(
-            event(
-                "2/2/52",
-                GroupService::Write,
-                Dpt::BOOL,
-                Some(Value::Bool(true)),
-            ),
-            MonotonicMs(1_000),
-        );
-        assert!(engine.poll(MonotonicMs(5_999)).is_empty());
-    }
-
-    #[test]
-    fn timer_fires_at_deadline() {
-        let mut engine = Engine::new(config());
-        engine.handle_event(
-            event(
-                "2/2/52",
-                GroupService::Write,
-                Dpt::BOOL,
-                Some(Value::Bool(true)),
-            ),
-            MonotonicMs(1_000),
-        );
-        assert_eq!(engine.poll(MonotonicMs(6_000)), vec![off_command()]);
-        assert!(engine.poll(MonotonicMs(6_001)).is_empty());
-    }
-
-    #[test]
-    fn false_does_not_trigger() {
-        let mut engine = Engine::new(config());
+        assert_eq!(TypedValue::percent(42).unwrap().value, Value::Percent(42));
+        assert!(TypedValue::new(Dpt::BOOL, Value::Percent(42)).is_err());
+        assert!(TypedValue::new(Dpt::PERCENT, Value::Bool(true)).is_err());
+        assert!(TypedValue::new(Dpt::PERCENT, Value::Percent(101)).is_err());
         assert!(
-            engine
-                .handle_event(
-                    event(
-                        "2/2/52",
-                        GroupService::Write,
-                        Dpt::BOOL,
-                        Some(Value::Bool(false))
-                    ),
-                    MonotonicMs(1_000)
-                )
-                .is_empty()
-        );
-        assert!(engine.poll(MonotonicMs(6_000)).is_empty());
-    }
-
-    #[test]
-    fn wrong_address_does_not_trigger() {
-        let mut engine = Engine::new(config());
-        assert!(
-            engine
-                .handle_event(
-                    event(
-                        "2/2/53",
-                        GroupService::Write,
-                        Dpt::BOOL,
-                        Some(Value::Bool(true))
-                    ),
-                    MonotonicMs(1_000)
-                )
-                .is_empty()
+            TypedValue::new(
+                Dpt {
+                    major: 9,
+                    subtype: 1
+                },
+                Value::Bool(true)
+            )
+            .is_err()
         );
     }
 
     #[test]
-    fn group_value_response_does_not_trigger() {
-        let mut engine = Engine::new(config());
-        assert!(
-            engine
-                .handle_event(
-                    event(
-                        "2/2/52",
-                        GroupService::Response,
-                        Dpt::BOOL,
-                        Some(Value::Bool(true))
-                    ),
-                    MonotonicMs(1_000)
-                )
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn retrigger_resets_deadline() {
-        let mut engine = Engine::new(config());
-        assert_eq!(
-            engine.handle_event(
-                event(
-                    "2/2/52",
-                    GroupService::Write,
-                    Dpt::BOOL,
-                    Some(Value::Bool(true))
-                ),
-                MonotonicMs(1_000)
-            ),
-            vec![on_command()]
-        );
-        assert_eq!(
-            engine.handle_event(
-                event(
-                    "2/2/52",
-                    GroupService::Write,
-                    Dpt::BOOL,
-                    Some(Value::Bool(true))
-                ),
-                MonotonicMs(4_000)
-            ),
-            vec![on_command()]
-        );
-        assert!(engine.poll(MonotonicMs(6_000)).is_empty());
-        assert_eq!(engine.poll(MonotonicMs(9_000)), vec![off_command()]);
-    }
-
-    #[test]
-    fn old_timer_cannot_switch_light_off() {
-        let mut engine = Engine::new(config());
-        engine.handle_event(
-            event(
-                "2/2/52",
-                GroupService::Write,
-                Dpt::BOOL,
-                Some(Value::Bool(true)),
-            ),
-            MonotonicMs(1_000),
-        );
-        engine.handle_event(
-            event(
-                "2/2/52",
-                GroupService::Write,
-                Dpt::BOOL,
-                Some(Value::Bool(true)),
-            ),
-            MonotonicMs(4_000),
-        );
-        assert!(engine.poll(MonotonicMs(5_999)).is_empty());
-        assert_eq!(engine.poll(MonotonicMs(6_000)), Vec::<Command>::new());
-    }
-
-    #[test]
-    fn unsupported_value_and_dpt_do_not_trigger() {
-        let mut engine = Engine::new(config());
-        assert!(
-            engine
-                .handle_event(
-                    event(
-                        "2/2/52",
-                        GroupService::Write,
-                        Dpt {
-                            major: 5,
-                            subtype: 1
-                        },
-                        Some(Value::Bool(true))
-                    ),
-                    MonotonicMs(1_000)
-                )
-                .is_empty()
-        );
-        assert!(
-            engine
-                .handle_event(
-                    event("2/2/52", GroupService::Write, Dpt::BOOL, None),
-                    MonotonicMs(1_000)
-                )
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn read_does_not_trigger() {
-        let mut engine = Engine::new(config());
-        assert!(
-            engine
-                .handle_event(
-                    event("2/2/52", GroupService::Read, Dpt::BOOL, None),
-                    MonotonicMs(1_000)
-                )
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn addresses_parse_and_format() {
-        assert_eq!(address("2/3/52").to_string(), "2/3/52");
-        assert_eq!(address("31/7/255").to_string(), "31/7/255");
-        assert!("32/0/0".parse::<GroupAddress>().is_err());
-        assert!("0/8/0".parse::<GroupAddress>().is_err());
-        assert!("0/0/0".parse::<GroupAddress>().is_err());
-        assert!("2/3".parse::<GroupAddress>().is_err());
-        assert!("2/3/x".parse::<GroupAddress>().is_err());
-        assert_eq!(
-            "1.2.3".parse::<IndividualAddress>().unwrap().to_string(),
-            "1.2.3"
-        );
-        assert!("16.0.0".parse::<IndividualAddress>().is_err());
-        assert!("1.2".parse::<IndividualAddress>().is_err());
-    }
-
-    #[test]
-    fn dpt_parses_and_formats() {
-        assert_eq!("1.001".parse::<Dpt>().unwrap(), Dpt::BOOL);
-        assert_eq!("232.600".parse::<Dpt>().unwrap().to_string(), "232.600");
-        assert!("1.1".parse::<Dpt>().is_err());
-        assert!("0.001".parse::<Dpt>().is_err());
-        assert!("1.1000".parse::<Dpt>().is_err());
-    }
-
-    #[test]
-    fn configuration_boundaries_are_validated() {
+    fn configuration_rejects_duplicates_unsupported_dpts_and_bad_rules() {
         let mut invalid = config();
-        invalid.input_group_address = invalid.output_group_address;
-        assert_eq!(invalid.validate(), Err(ConfigError::SameGroupAddress));
+        invalid.endpoints.push(endpoint(
+            "wall_switch",
+            EndpointDirection::Output,
+            Dpt::BOOL,
+        ));
+        assert!(matches!(
+            invalid.validate(),
+            Err(ConfigError::DuplicateEndpoint(endpoint)) if endpoint == name("wall_switch")
+        ));
 
         let mut invalid = config();
-        invalid.input_dpt = Dpt {
-            major: 5,
+        invalid.endpoints[0].dpt = Dpt {
+            major: 9,
             subtype: 1,
         };
-        assert_eq!(
+        assert!(matches!(
             invalid.validate(),
-            Err(ConfigError::UnsupportedInputDpt(invalid.input_dpt))
-        );
+            Err(ConfigError::UnsupportedEndpointDpt { endpoint, .. }) if endpoint == name("wall_switch")
+        ));
 
         let mut invalid = config();
-        invalid.output_dpt = Dpt {
-            major: 5,
-            subtype: 1,
-        };
-        assert_eq!(
+        invalid.timed_bool.input = name("missing");
+        assert!(matches!(
             invalid.validate(),
-            Err(ConfigError::UnsupportedOutputDpt(invalid.output_dpt))
-        );
-
-        let mut invalid = config();
-        invalid.off_delay_ms = 0;
-        assert_eq!(invalid.validate(), Err(ConfigError::ZeroOffDelay));
-
-        let mut invalid = config();
-        invalid.off_delay_ms = MAX_OFF_DELAY_MS + 1;
-        assert_eq!(
-            invalid.validate(),
-            Err(ConfigError::OffDelayTooLarge {
-                actual: MAX_OFF_DELAY_MS + 1,
-                maximum: MAX_OFF_DELAY_MS
+            Err(ConfigError::UnknownRuleEndpoint {
+                rule: "timed_bool",
+                role: "input",
+                ..
             })
+        ));
+
+        let mut invalid = config();
+        invalid.timed_bool.input = name("test_light");
+        assert!(matches!(
+            invalid.validate(),
+            Err(ConfigError::WrongRuleDirection {
+                rule: "timed_bool",
+                role: "input",
+                ..
+            })
+        ));
+
+        let mut invalid = config();
+        invalid.timed_bool.input = name("dimmer_level");
+        assert!(matches!(
+            invalid.validate(),
+            Err(ConfigError::WrongRuleDpt {
+                rule: "timed_bool",
+                role: "input",
+                ..
+            })
+        ));
+
+        let mut invalid = config();
+        invalid.timed_bool.off_delay_ms = 0;
+        assert_eq!(invalid.validate(), Err(ConfigError::ZeroOffDelay));
+        invalid.timed_bool.off_delay_ms = MAX_OFF_DELAY_MS + 1;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ConfigError::OffDelayTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn timed_boolean_triggers_retriggers_and_expires() {
+        let mut engine = Engine::new(config());
+        assert_eq!(engine.snapshot(), EngineSnapshot { off_deadline: None });
+
+        assert_eq!(
+            engine.handle_event(timed_event(true), MonotonicMs(1_000)),
+            Ok(vec![timed_effect(true)])
         );
+        assert_eq!(
+            engine.snapshot(),
+            EngineSnapshot {
+                off_deadline: Some(MonotonicMs(6_000))
+            }
+        );
+        assert!(engine.poll(MonotonicMs(5_999)).is_empty());
+
+        assert_eq!(
+            engine.handle_event(timed_event(true), MonotonicMs(4_000)),
+            Ok(vec![timed_effect(true)])
+        );
+        assert_eq!(
+            engine.snapshot(),
+            EngineSnapshot {
+                off_deadline: Some(MonotonicMs(9_000))
+            }
+        );
+        assert!(engine.poll(MonotonicMs(6_000)).is_empty());
+        assert_eq!(engine.poll(MonotonicMs(9_000)), vec![timed_effect(false)]);
+        assert_eq!(engine.snapshot(), EngineSnapshot { off_deadline: None });
+        assert!(engine.poll(MonotonicMs(9_001)).is_empty());
+    }
+
+    #[test]
+    fn timed_false_does_not_trigger_or_cancel_timer() {
+        let mut engine = Engine::new(config());
+        engine
+            .handle_event(timed_event(true), MonotonicMs(1_000))
+            .unwrap();
+        assert!(
+            engine
+                .handle_event(timed_event(false), MonotonicMs(2_000))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            engine.snapshot(),
+            EngineSnapshot {
+                off_deadline: Some(MonotonicMs(6_000))
+            }
+        );
+    }
+
+    #[test]
+    fn percentage_forwards_zero_intermediate_and_maximum() {
+        let mut engine = Engine::new(config());
+        for value in [0, 42, 100] {
+            assert_eq!(
+                engine.handle_event(percent_event(value), MonotonicMs(1_000)),
+                Ok(vec![percent_effect(value)])
+            );
+            assert_eq!(engine.snapshot(), EngineSnapshot { off_deadline: None });
+        }
+    }
+
+    #[test]
+    fn unused_inputs_produce_no_effects() {
+        let mut engine = Engine::new(config());
+        assert_eq!(
+            engine.handle_event(
+                InputEvent::new(name("unused_input"), TypedValue::bool(true)),
+                MonotonicMs(1_000)
+            ),
+            Ok(Vec::new())
+        );
+        assert_eq!(engine.snapshot(), EngineSnapshot { off_deadline: None });
+    }
+
+    #[test]
+    fn events_reject_unknown_output_wrong_dpt_and_invalid_value() {
+        let mut engine = Engine::new(config());
+        assert!(matches!(
+            engine.handle_event(
+                InputEvent::new(name("test_light"), TypedValue::bool(true)),
+                MonotonicMs(0)
+            ),
+            Err(EventError::EndpointNotInput { .. })
+        ));
+        assert!(matches!(
+            engine.handle_event(
+                InputEvent::new(name("wall_switch"), TypedValue::percent(42).unwrap()),
+                MonotonicMs(0)
+            ),
+            Err(EventError::DptMismatch { .. })
+        ));
+        let invalid_value = TypedValue {
+            dpt: Dpt::PERCENT,
+            value: Value::Percent(101),
+        };
+        assert!(matches!(
+            engine.handle_event(
+                InputEvent::new(name("dimmer_level"), invalid_value),
+                MonotonicMs(0)
+            ),
+            Err(EventError::InvalidValue(ValueError::PercentOutOfRange(101)))
+        ));
+        assert!(matches!(
+            engine.handle_event(
+                InputEvent::new(name("missing"), TypedValue::bool(true)),
+                MonotonicMs(0)
+            ),
+            Err(EventError::UnknownEndpoint(endpoint)) if endpoint == name("missing")
+        ));
     }
 }

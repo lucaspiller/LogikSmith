@@ -1,6 +1,9 @@
 import type {
   ConnectionState,
   DashboardEvent,
+  DisplayAutomation,
+  DisplayBinding,
+  DisplayEndpoint,
   DisplayLog,
   DisplaySnapshot,
   DisplayTelegram,
@@ -110,9 +113,26 @@ function connection(value: unknown): { state: ConnectionState } {
   return { state: state as ConnectionState };
 }
 
-function valueFrom(value: unknown, path: string, name: string): boolean | null {
-  if (isObject(value)) return nullableBoolean(field(value, path, name, 'value'), `${path}.${name}`);
-  return nullableBoolean(value, path);
+function displayValue(value: unknown, path: string): boolean | number | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (isObject(value)) {
+    const kind = field(value, path, 'kind');
+    const raw = field(value, path, 'value', 'data');
+    if (kind === 'bool') return nullableBoolean(raw, `${path}.value`);
+    if (kind === 'percent') {
+      const percentage = nonNegativeNumber(raw, `${path}.value`);
+      if (percentage > 100) throw new ApiDecodeError(`${path}.value`, 'percentage must be between 0 and 100');
+      return percentage;
+    }
+  }
+  throw new ApiDecodeError(path, 'expected a boolean, percentage, or null');
+}
+
+function valueFrom(value: unknown, path: string, name: string): boolean | number | null {
+  if (isObject(value)) return displayValue(field(value, path, name, 'value'), `${path}.${name}`);
+  return displayValue(value, path);
 }
 
 function timer(value: unknown, receivedAtMs: number): DisplayTimer {
@@ -176,7 +196,7 @@ function write(value: unknown): DisplayWrite {
   return {
     status,
     requestId,
-    value: nullableBoolean(field(record, 'write', 'value'), 'write.value'),
+    value: displayValue(field(record, 'write', 'value'), 'write.value'),
     error: optionalString(field(record, 'write', 'error'), 'write.error')
   };
 }
@@ -186,33 +206,148 @@ function array(value: unknown, path: string): unknown[] {
   return value;
 }
 
+function optionalRevision(value: unknown, path: string): number | null {
+  return value === undefined || value === null ? null : revision(value, path);
+}
+
+function displayEndpoint(value: unknown, path: string, direction: 'input' | 'output', bindings: Map<string, string>, values: Map<string, { observed: boolean | number | null; requested: boolean | number | null }>): DisplayEndpoint {
+  const source = object(value, path);
+  const nameRaw = field(source, path, 'name', 'endpoint');
+  const name = nameRaw === undefined || nameRaw === null ? undefined : stringValue(nameRaw, `${path}.name`);
+  const bindingRaw = field(source, path, 'binding');
+  const binding = isObject(bindingRaw) ? object(bindingRaw, `${path}.binding`) : null;
+  const addressRaw = field(source, path, 'address', 'group_address', 'groupAddress') ?? (typeof bindingRaw === 'string' ? bindingRaw : binding ? field(binding, `${path}.binding`, 'address', 'group_address', 'groupAddress') : undefined);
+  const mappedValue = name ? values.get(name) : undefined;
+  return {
+    ...(name ? { name } : {}),
+    address: addressRaw === undefined || addressRaw === null ? (name ? bindings.get(name) ?? '' : '') : stringValue(addressRaw, `${path}.address`),
+    dpt: dpt(required(field(source, path, 'dpt'), `${path}.dpt`), `${path}.dpt`),
+    direction,
+    observed: mappedValue?.observed ?? displayValue(field(source, path, 'observed'), `${path}.observed`),
+    requested: direction === 'output' ? mappedValue?.requested ?? displayValue(field(source, path, 'requested'), `${path}.requested`) : undefined
+  };
+}
+
+function endpointValues(values: JsonObject): Map<string, { observed: boolean | number | null; requested: boolean | number | null }> {
+  const result = new Map<string, { observed: boolean | number | null; requested: boolean | number | null }>();
+  const raw = field(values, 'values', 'endpoints', 'endpoint_values', 'endpointValues');
+  const groups: Array<[string, unknown]> = [['inputs', field(values, 'values', 'inputs')], ['outputs', field(values, 'values', 'outputs')]].filter((entry): entry is [string, unknown] => entry[1] !== undefined);
+  const add = (name: string, value: unknown, path: string): void => {
+    const source = isObject(value) ? value : { observed: value };
+    result.set(name, {
+      observed: displayValue(field(source, path, 'observed', 'value'), `${path}.observed`),
+      requested: displayValue(field(source, path, 'requested'), `${path}.requested`)
+    });
+  };
+  if (isObject(raw)) {
+    for (const [name, value] of Object.entries(raw)) {
+      add(name, value, `values.endpoints.${name}`);
+    }
+  } else if (Array.isArray(raw)) {
+    raw.forEach((value, index) => {
+      const source = object(value, `values.endpoints[${index}]`);
+      const name = stringValue(required(field(source, `values.endpoints[${index}]`, 'name'), `values.endpoints[${index}].name`), `values.endpoints[${index}].name`);
+      add(name, source, `values.endpoints[${index}]`);
+    });
+  }
+  groups.forEach(([groupName, group]) => {
+    if (isObject(group)) {
+      Object.entries(group).forEach(([name, value]) => add(name, value, `values.${groupName}.${name}`));
+    } else if (Array.isArray(group)) {
+      group.forEach((value, index) => {
+        const source = object(value, `values.${groupName}[${index}]`);
+        const name = stringValue(required(field(source, `values.${groupName}[${index}]`, 'name', 'endpoint'), `values.${groupName}[${index}].name`), `values.${groupName}[${index}].name`);
+        add(name, source, `values.${groupName}[${index}]`);
+      });
+    }
+  });
+  return result;
+}
+
+function decodeDisplayAutomation(root: JsonObject, config: JsonObject, values: JsonObject): DisplayAutomation | undefined {
+  const nested = isObject(field(root, 'snapshot', 'automation')) ? object(field(root, 'snapshot', 'automation'), 'automation') : null;
+  const active = isObject(field(config, 'config', 'active')) ? object(field(config, 'config', 'active'), 'config.active') : null;
+  const source = nested ?? active ?? config;
+  const inputsRaw = field(source, 'automation', 'inputs') ?? field(root, 'snapshot', 'active_inputs', 'activeInputs');
+  const outputsRaw = field(source, 'automation', 'outputs') ?? field(root, 'snapshot', 'active_outputs', 'activeOutputs');
+  if (inputsRaw === undefined && outputsRaw === undefined) return undefined;
+  const bindings = new Map<string, string>();
+  const bindingsRaw = field(source, 'automation', 'knx_bindings', 'bindings') ?? field(config, 'config', 'knx_bindings', 'bindings');
+  if (bindingsRaw !== undefined) {
+    array(bindingsRaw, 'automation.knx_bindings').forEach((item, index) => {
+      const binding = object(item, `automation.knx_bindings[${index}]`);
+      const name = stringValue(required(field(binding, `automation.knx_bindings[${index}]`, 'endpoint'), `automation.knx_bindings[${index}].endpoint`), `automation.knx_bindings[${index}].endpoint`);
+      const address = stringValue(required(field(binding, `automation.knx_bindings[${index}]`, 'group_address', 'groupAddress', 'address'), `automation.knx_bindings[${index}].group_address`), `automation.knx_bindings[${index}].group_address`);
+      bindings.set(name, address);
+    });
+  }
+  const valuesByName = endpointValues(values);
+  const inputs = array(inputsRaw ?? [], 'automation.inputs').map((item, index) => displayEndpoint(item, `automation.inputs[${index}]`, 'input', bindings, valuesByName));
+  const outputs = array(outputsRaw ?? [], 'automation.outputs').map((item, index) => displayEndpoint(item, `automation.outputs[${index}]`, 'output', bindings, valuesByName));
+  const behaviorSource = isObject(field(source, 'automation', 'behaviors')) ? object(field(source, 'automation', 'behaviors'), 'automation.behaviors') : {};
+  const timed = isObject(field(behaviorSource, 'automation.behaviors', 'timed_bool', 'timedBool')) ? object(field(behaviorSource, 'automation.behaviors', 'timed_bool', 'timedBool'), 'automation.behaviors.timed_bool') : {};
+  const percentage = isObject(field(behaviorSource, 'automation.behaviors', 'percentage_forward', 'percentageForward')) ? object(field(behaviorSource, 'automation.behaviors', 'percentage_forward', 'percentageForward'), 'automation.behaviors.percentage_forward') : {};
+  const text = (sourceValue: unknown, path: string): string => sourceValue === undefined || sourceValue === null ? '' : stringValue(sourceValue, path);
+  const number = (sourceValue: unknown, path: string): number => sourceValue === undefined || sourceValue === null ? 0 : nonNegativeNumber(sourceValue, path);
+  return {
+    inputs,
+    outputs,
+    bindings: [...bindings.entries()].map(([endpoint, groupAddress]) => ({ endpoint, groupAddress } as DisplayBinding)),
+    behaviors: {
+      timedBool: { input: text(field(timed, 'automation.behaviors.timed_bool', 'input'), 'automation.behaviors.timed_bool.input'), output: text(field(timed, 'automation.behaviors.timed_bool', 'output'), 'automation.behaviors.timed_bool.output'), offDelayMs: number(field(timed, 'automation.behaviors.timed_bool', 'off_delay_ms', 'offDelayMs'), 'automation.behaviors.timed_bool.off_delay_ms') },
+      percentageForward: { input: text(field(percentage, 'automation.behaviors.percentage_forward', 'input'), 'automation.behaviors.percentage_forward.input'), output: text(field(percentage, 'automation.behaviors.percentage_forward', 'output'), 'automation.behaviors.percentage_forward.output') }
+    }
+  };
+}
+
 /** Maps the internal wire DTO to the UI's small display model. */
 export function decodeSnapshot(input: unknown, receivedAtMs = Date.now()): DisplaySnapshot {
   const root = object(input, 'snapshot');
   const config = object(required(field(root, 'snapshot', 'config'), 'config'), 'config');
   const values = object(required(field(root, 'snapshot', 'values'), 'values'), 'values');
-  const inputValues = object(required(field(values, 'values', 'input'), 'values.input'), 'values.input');
-  const outputValues = object(required(field(values, 'values', 'output'), 'values.output'), 'values.output');
+  const endpointValuesByName = endpointValues(values);
+  const inputValuesRaw = field(values, 'values', 'input');
+  const outputValuesRaw = field(values, 'values', 'output');
+  const inputValues = inputValuesRaw === undefined ? {} : object(inputValuesRaw, 'values.input');
+  const outputValues = outputValuesRaw === undefined ? {} : object(outputValuesRaw, 'values.output');
   const telegrams = array(required(field(root, 'snapshot', 'telegrams'), 'telegrams'), 'telegrams').map(telegram);
   const logs = array(required(field(root, 'snapshot', 'logs'), 'logs'), 'logs').map(log);
-  const offDelayRaw = required(field(config, 'config', 'off_delay_ms', 'offDelayMs', 'off_delay'), 'config.off_delay_ms');
+  const automation = decodeDisplayAutomation(root, config, values);
+  const firstInput = automation?.inputs[0];
+  const firstOutput = automation?.outputs[0];
+  const inputRaw = field(config, 'config', 'input') ?? firstInput;
+  const outputRaw = field(config, 'config', 'output') ?? firstOutput;
+  const offDelayRaw = field(config, 'config', 'off_delay_ms', 'offDelayMs', 'off_delay') ?? automation?.behaviors.timedBool.offDelayMs;
+  if (inputRaw === undefined) throw new ApiDecodeError('config.input', 'required field is missing');
+  if (outputRaw === undefined) throw new ApiDecodeError('config.output', 'required field is missing');
+  if (offDelayRaw === undefined) throw new ApiDecodeError('config.off_delay_ms', 'required field is missing');
   const offDelayMs = nonNegativeNumber(offDelayRaw, 'config.off_delay_ms');
+  const inputEndpoint = field(config, 'config', 'input') === undefined && firstInput ? firstInput : endpoint(inputRaw, 'config.input');
+  const outputEndpoint = field(config, 'config', 'output') === undefined && firstOutput ? firstOutput : endpoint(outputRaw, 'config.output');
+  const activeRevisionRaw = field(root, 'snapshot', 'active_automation_revision', 'activeAutomationRevision') ?? field(config, 'config', 'active_automation_revision', 'activeAutomationRevision');
+  const savedRevisionRaw = field(root, 'snapshot', 'saved_automation_revision', 'savedAutomationRevision') ?? field(config, 'config', 'saved_automation_revision', 'savedAutomationRevision');
+  const inputObserved = inputValuesRaw === undefined && firstInput?.name ? endpointValuesByName.get(firstInput.name)?.observed ?? null : valueFrom(inputValues, 'values.input', 'observed');
+  const outputObserved = outputValuesRaw === undefined && firstOutput?.name ? endpointValuesByName.get(firstOutput.name)?.observed ?? null : valueFrom(outputValues, 'values.output', 'observed');
+  const outputRequested = outputValuesRaw === undefined && firstOutput?.name ? endpointValuesByName.get(firstOutput.name)?.requested ?? null : valueFrom(outputValues, 'values.output', 'requested');
 
   return {
     revision: revision(required(field(root, 'snapshot', 'revision'), 'revision'), 'revision'),
     connection: connection(required(field(root, 'snapshot', 'connection'), 'connection')),
     config: {
-      input: endpoint(required(field(config, 'config', 'input'), 'config.input'), 'config.input'),
-      output: endpoint(required(field(config, 'config', 'output'), 'config.output'), 'config.output'),
+      input: inputEndpoint,
+      output: outputEndpoint,
       offDelayMs
     },
     values: {
-      input: { observed: valueFrom(inputValues, 'values.input', 'observed') },
+      input: { observed: inputObserved },
       output: {
-        observed: valueFrom(outputValues, 'values.output', 'observed'),
-        requested: valueFrom(outputValues, 'values.output', 'requested')
+        observed: outputObserved,
+        requested: outputRequested
       }
     },
+    automation,
+    activeAutomationRevision: optionalRevision(activeRevisionRaw, 'active_automation_revision'),
+    savedAutomationRevision: optionalRevision(savedRevisionRaw, 'saved_automation_revision'),
     write: write(field(root, 'write', 'write_status', 'last_write')),
     timer: timer(required(field(root, 'snapshot', 'timer'), 'timer'), receivedAtMs),
     telegrams: telegrams as DisplayTelegram[],

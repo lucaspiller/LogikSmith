@@ -3,6 +3,7 @@
 from .protocol import (
     BRIDGE_VERSION,
     DPT_1_001,
+    DPT_5_001,
     PROTOCOL_VERSION,
     BoolValue,
     BridgeHello,
@@ -13,6 +14,7 @@ from .protocol import (
     GroupAddressDpt,
     KnxEvent,
     KnxWrite,
+    PercentValue,
     ProtocolError,
     Ready,
     Shutdown,
@@ -24,6 +26,7 @@ from .protocol import (
 __all__ = [
     "BRIDGE_VERSION",
     "DPT_1_001",
+    "DPT_5_001",
     "PROTOCOL_VERSION",
     "BoolValue",
     "BridgeHello",
@@ -34,6 +37,7 @@ __all__ = [
     "GroupAddressDpt",
     "KnxEvent",
     "KnxWrite",
+    "PercentValue",
     "ProtocolError",
     "Ready",
     "Shutdown",
