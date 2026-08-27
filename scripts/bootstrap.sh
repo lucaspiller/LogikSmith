@@ -33,6 +33,10 @@ echo "Installing the local bridge and its locked dependency..."
 .venv/bin/python -m pip install --requirement "$BRIDGE_REQUIREMENTS"
 .venv/bin/python -m pip install --no-deps --editable "$BRIDGE_DIR"
 
+echo "Installing and building the dashboard..."
+mise exec -- npm --prefix logiksmith-web ci
+mise exec -- npm --prefix logiksmith-web run build
+
 echo "Building the Rust workspace..."
 mise exec -- cargo build --workspace
 

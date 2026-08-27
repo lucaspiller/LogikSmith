@@ -26,3 +26,8 @@ python = ".venv/bin/python"
 [logging]
 level = "debug"
 bridge_level = "debug"
+
+[web]
+# The dashboard is intentionally local-only by default.
+listen_ip = "127.0.0.1"
+listen_port = 8080
