@@ -1,0 +1,16 @@
+# LogikSmith guide
+
+LogikSmith is a lightweight KNX automation engine with a portable Rust core. It runs on a desktop host first and may later run on OpenKNX-compatible hardware.
+
+## Working rules
+
+- Work on the active milestone only. Record later ideas in `docs/deferred.md` when that file exists.
+- Agree the milestone scope, architecture, and acceptance scenario before implementation.
+- Keep platform, transport, and operating-system concerns out of `logiksmith-core`.
+- Extend existing concepts and remove superseded temporary fields instead of creating two sources of truth.
+- Keep proof-of-concept code small. Add abstractions only when the active milestone needs them.
+- The lead agent owns architecture, integration, and the complete KNX event-to-actuator path.
+- Subagents may handle isolated tests, research, review, or leaf components when their interface and owner are explicit.
+- Automated tests must never access the physical KNX installation. Hardware verification is a deliberate manual acceptance step.
+
+Start with the active PRD, then consult `docs/architecture.md`, `docs/decisions.md`, `docs/deferred.md`, and `docs/issues/` as those records are added.
