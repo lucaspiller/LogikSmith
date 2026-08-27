@@ -1021,13 +1021,22 @@ async fn send_message(stdin: &mut ChildStdin, message: &Message) -> Result<(), H
 }
 
 fn init_logging(config: LoggingConfig) {
-    let filter = EnvFilter::builder()
-        .with_default_directive(config.level.into())
-        .parse_lossy(format!("bridge.xknx={}", config.bridge_level));
+    let filter = logging_filter(config);
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
         .try_init();
+}
+
+fn logging_filter(config: LoggingConfig) -> EnvFilter {
+    // Parse only the TOML-selected directives so an inherited RUST_LOG cannot
+    // hide the proof-of-concept event path.
+    EnvFilter::builder()
+        .with_default_directive(config.level.into())
+        .parse_lossy(format!(
+            "logiksmith={},bridge.xknx={}",
+            config.level, config.bridge_level
+        ))
 }
 
 async fn terminate_child(child: &mut Child) {
@@ -1110,6 +1119,26 @@ mod tests {
         assert!(parse_message(r#"{"v":1,"type":"knx_event","source":"1.1.42","destination":"32/2/52","service":"group_value_write","dpt":{"major":1,"subtype":1},"value":{"kind":"bool","value":true}}"#).is_err());
         assert!(
             parse_message(r#"{"v":1,"type":"command_result","request_id":12,"ok":false}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn logging_filter_applies_config_to_both_poc_targets() {
+        let filter = logging_filter(LoggingConfig {
+            level: LevelFilter::DEBUG,
+            bridge_level: LevelFilter::TRACE,
+        });
+        let directives = filter.to_string();
+
+        assert!(
+            directives
+                .split(',')
+                .any(|directive| directive == "logiksmith=debug")
+        );
+        assert!(
+            directives
+                .split(',')
+                .any(|directive| directive == "bridge.xknx=trace")
         );
     }
 }
