@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logiksmith-xknx"
+version = "0.1.0"
+description = "The LogikSmith XKNX KNXnet/IP sidecar bridge"
+requires-python = ">=3.11"
+dependencies = ["xknx==3.19.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["logiksmith_xknx*"]

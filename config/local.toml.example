@@ -1,0 +1,28 @@
+# Copy this file to config/local.toml and replace every KNX placeholder.
+# The untouched template is intentionally not a usable physical-bus config.
+
+[knx]
+connection_type = "tunneling"
+# TEST-NET address only; replace with the MDT interface address for a manual run.
+gateway_ip = "192.0.2.1"
+gateway_port = 3671
+
+[poc]
+# Replace with a DPT 1.001 group address that is safe to trigger manually.
+input_group_address = "REPLACE_WITH_INPUT_GROUP_ADDRESS"
+input_dpt = "1.001"
+
+# SAFETY: replace with a harmless, visible actuator (for example, a test light).
+# Never use a door lock, alarm, heating, mains, or other safety-critical output.
+# Confirm this address in ETS before starting; it must differ from the input GA.
+output_group_address = "REPLACE_WITH_SAFE_OUTPUT_GROUP_ADDRESS"
+output_dpt = "1.001"
+
+off_delay_ms = 5000
+
+[bridge]
+python = ".venv/bin/python"
+
+[logging]
+level = "debug"
+bridge_level = "debug"
