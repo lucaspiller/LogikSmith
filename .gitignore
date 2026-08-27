@@ -1,0 +1,10 @@
+/target/
+.venv/
+config/local.toml
+/docs/local/
+
+# Python and OS-generated files.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
