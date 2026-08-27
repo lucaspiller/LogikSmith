@@ -96,7 +96,7 @@ DPT 17.xxx → scene
 
 Lua can receive convenient values, and the core retains the DPT identity. That keeps `50` meaningful in a script, a binding, a log entry, a simulator, and an outgoing KNX telegram.
 
-Milestone 2 expands the current DPT 1.001 proof into an initial useful DPT set. DPT support should grow through the shared type model, one family at a time.
+Milestone 2 keeps the current DPT 1.001 proof focused on dashboard observability. DPT support should grow through the shared type model, one family at a time.
 
 ## Bindings make logic reusable
 

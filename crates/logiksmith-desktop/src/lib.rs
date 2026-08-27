@@ -1,18 +1,22 @@
 //! Tokio desktop host for the platform-independent LogikSmith engine.
 
+pub mod diagnostics;
+pub mod web;
+
+use diagnostics::{ConnectionState, DiagnosticStore, TelegramRecord};
 use logiksmith_core::{
     Command as CoreCommand, ConfigError as CoreConfigError, Dpt, Engine, EngineConfig,
-    GroupAddress, GroupService, IndividualAddress, KnxEvent as CoreKnxEvent, MonotonicMs, Value,
+    GroupAddress, GroupService, IndividualAddress, KnxEvent as CoreKnxEvent, Value,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     ffi::OsString,
     fmt, io,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use thiserror::Error;
 use tokio::{
@@ -21,7 +25,10 @@ use tokio::{
     signal,
     time::{self, MissedTickBehavior},
 };
-use tracing_subscriber::{EnvFilter, filter::LevelFilter};
+use tracing_subscriber::{
+    EnvFilter, Layer, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
+};
+use web::{WebError, start_web_server};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
@@ -35,6 +42,29 @@ pub struct RuntimeConfig {
     pub connection: ConnectionConfig,
     pub bridge: BridgeConfig,
     pub logging: LoggingConfig,
+    pub web: WebConfig,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct WebConfig {
+    pub listen_ip: IpAddr,
+    pub listen_port: u16,
+}
+
+impl WebConfig {
+    pub fn new(listen_ip: IpAddr, listen_port: u16) -> Result<Self, ConfigError> {
+        if listen_port == 0 {
+            return Err(field("web.listen_port", "must be in range 1..=65535"));
+        }
+        Ok(Self {
+            listen_ip,
+            listen_port,
+        })
+    }
+
+    pub fn socket_addr(self) -> SocketAddr {
+        SocketAddr::new(self.listen_ip, self.listen_port)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +105,7 @@ struct RawConfig {
     poc: RawPocConfig,
     bridge: RawBridgeConfig,
     logging: RawLoggingConfig,
+    web: RawWebConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +138,13 @@ struct RawBridgeConfig {
 struct RawLoggingConfig {
     level: String,
     bridge_level: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWebConfig {
+    listen_ip: String,
+    listen_port: u32,
 }
 
 fn field(field: &'static str, message: impl Into<String>) -> ConfigError {
@@ -185,6 +223,11 @@ pub fn load_config(path: &Path) -> Result<RuntimeConfig, ConfigError> {
         ));
     }
 
+    let listen_ip = parse_ip("web.listen_ip", &raw.web.listen_ip)?;
+    if raw.web.listen_port == 0 || raw.web.listen_port > u16::MAX as u32 {
+        return Err(field("web.listen_port", "must be in range 1..=65535"));
+    }
+
     Ok(RuntimeConfig {
         config_path: path.to_path_buf(),
         engine,
@@ -197,6 +240,10 @@ pub fn load_config(path: &Path) -> Result<RuntimeConfig, ConfigError> {
         logging: LoggingConfig {
             level: parse_level("logging.level", &raw.logging.level)?,
             bridge_level: parse_level("logging.bridge_level", &raw.logging.bridge_level)?,
+        },
+        web: WebConfig {
+            listen_ip,
+            listen_port: raw.web.listen_port as u16,
         },
     })
 }
@@ -728,6 +775,8 @@ pub enum HostError {
     Io(#[from] io::Error),
     #[error("bridge command result has unknown request_id={0}")]
     UnknownRequest(u64),
+    #[error("dashboard startup failed: {0}")]
+    Web(#[from] WebError),
 }
 
 pub async fn run(config: RuntimeConfig) -> Result<(), HostError> {
@@ -747,43 +796,80 @@ pub async fn run_with_bridge(
     config: RuntimeConfig,
     bridge_command: BridgeCommand,
 ) -> Result<(), HostError> {
-    init_logging(config.logging);
+    let store = DiagnosticStore::new(config.engine);
+    init_logging(config.logging, store.clone());
     tracing::info!(target: "logiksmith", version = env!("CARGO_PKG_VERSION"), "logiksmith starting");
     tracing::info!(target: "logiksmith", path = %config.config_path.display(), "configuration loaded");
     let mut engine = Engine::try_new(config.engine)
         .map_err(|error| HostError::Protocol(ProtocolError::Field("poc", error.to_string())))?;
     tracing::info!(target: "logiksmith", "core initialized");
 
+    // Bind the dashboard before starting the bridge so users can observe
+    // startup and connection progress, including bridge failures.
+    let web_server = start_web_server(store.clone(), config.web).await?;
+    tracing::info!(target: "logiksmith.web", address = %web_server.address, "dashboard listening");
+
     tracing::info!(target: "logiksmith", executable = %bridge_command.executable.display(), "starting KNX bridge");
-    let mut child = Command::new(&bridge_command.executable)
+    let mut child = match Command::new(&bridge_command.executable)
         .args(&bridge_command.args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|source| HostError::Start {
-            path: bridge_command.executable.clone(),
-            source,
-        })?;
-    let mut stdin = child.stdin.take().ok_or_else(|| HostError::Start {
-        path: bridge_command.executable.clone(),
-        source: io::Error::other("bridge stdin was not piped"),
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| HostError::Start {
-        path: bridge_command.executable.clone(),
-        source: io::Error::other("bridge stdout was not piped"),
-    })?;
+    {
+        Ok(child) => child,
+        Err(source) => {
+            web_server.shutdown().await;
+            return Err(HostError::Start {
+                path: bridge_command.executable.clone(),
+                source,
+            });
+        }
+    };
+    let mut stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            web_server.shutdown().await;
+            return Err(HostError::Start {
+                path: bridge_command.executable.clone(),
+                source: io::Error::other("bridge stdin was not piped"),
+            });
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            web_server.shutdown().await;
+            terminate_child(&mut child).await;
+            return Err(HostError::Start {
+                path: bridge_command.executable.clone(),
+                source: io::Error::other("bridge stdout was not piped"),
+            });
+        }
+    };
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(forward_bridge_stderr(stderr));
     }
     let mut reader = BufReader::new(stdout);
 
-    let result = run_session(&config, &mut engine, &mut child, &mut stdin, &mut reader).await;
+    let result = run_session(
+        &config,
+        &store,
+        &mut engine,
+        &mut child,
+        &mut stdin,
+        &mut reader,
+    )
+    .await;
+    if let Err(error) = &result {
+        tracing::error!(target: "logiksmith", error = %error, "desktop runtime stopped");
+    }
     if result.is_err() {
         // A protocol/fatal/EOF error must not leave a sidecar behind.
         let _ = send_message(&mut stdin, &shutdown_message()).await;
         terminate_child(&mut child).await;
     }
+    web_server.shutdown().await;
     result
 }
 
@@ -806,6 +892,7 @@ where
 
 async fn run_session(
     config: &RuntimeConfig,
+    store: &DiagnosticStore,
     engine: &mut Engine,
     child: &mut Child,
     stdin: &mut ChildStdin,
@@ -838,6 +925,7 @@ async fn run_session(
     );
 
     let configure = configure_message(config);
+    store.set_connection(ConnectionState::Connecting);
     send_message(stdin, &configure).await?;
     tracing::info!(
         target: "logiksmith",
@@ -862,10 +950,11 @@ async fn run_session(
             .into());
         }
     };
+    store.set_connection(ConnectionState::Connected);
+    store.set_timer_deadline(engine.snapshot().off_deadline);
     tracing::info!(target: "logiksmith", gateway = %ready.gateway, "KNX connected");
     tracing::info!(target: "logiksmith", "LogikSmith ready");
 
-    let origin = Instant::now();
     let mut poll = time::interval(Duration::from_millis(20));
     poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
     poll.tick().await;
@@ -886,14 +975,19 @@ async fn run_session(
                 match message {
                     Message::KnxEvent(event) => {
                         tracing::debug!(target: "logiksmith", source = ?event.source, destination = %event.destination, service = %event.service, dpt = %event.dpt, value = ?event.value, "KNX telegram received");
+                        let mut telegram = TelegramRecord::from(&event);
+                        telegram.time_ms = store.now().0;
+                        store.record_telegram(telegram);
                         let event = event.to_core()?;
-                        let commands = engine.handle_event(event, monotonic_now(origin));
-                        dispatch_commands(stdin, commands, &mut next_request_id, &mut pending).await?;
+                        let commands = engine.handle_event(event, store.now());
+                        store.set_timer_deadline(engine.snapshot().off_deadline);
+                        dispatch_commands(store, stdin, commands, &mut next_request_id, &mut pending).await?;
                     }
                     Message::CommandResult(result) => {
                         if !pending.remove(&result.request_id) {
                             return Err(HostError::UnknownRequest(result.request_id));
                         }
+                        store.record_write_result(result.request_id, result.ok, result.error.clone());
                         if result.ok {
                             tracing::debug!(target: "logiksmith", request_id = result.request_id, "KNX write completed");
                         } else {
@@ -908,8 +1002,9 @@ async fn run_session(
                 }
             }
             _ = poll.tick() => {
-                let commands = engine.poll(monotonic_now(origin));
-                dispatch_commands(stdin, commands, &mut next_request_id, &mut pending).await?;
+                let commands = engine.poll(store.now());
+                store.set_timer_deadline(engine.snapshot().off_deadline);
+                dispatch_commands(store, stdin, commands, &mut next_request_id, &mut pending).await?;
             }
             signal = signal::ctrl_c() => {
                 signal?;
@@ -924,10 +1019,6 @@ async fn run_session(
             }
         }
     }
-}
-
-fn monotonic_now(origin: Instant) -> MonotonicMs {
-    MonotonicMs(u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX))
 }
 
 fn configure_message(config: &RuntimeConfig) -> Message {
@@ -961,6 +1052,7 @@ fn shutdown_message() -> Message {
 }
 
 async fn dispatch_commands(
+    store: &DiagnosticStore,
     stdin: &mut ChildStdin,
     commands: Vec<CoreCommand>,
     next_request_id: &mut u64,
@@ -983,6 +1075,7 @@ async fn dispatch_commands(
                 value,
             },
         };
+        store.record_write_requested(request_id, destination, dpt, value.value);
         tracing::info!(target: "logiksmith", request_id, destination = %destination, dpt = %dpt, value = ?value, "KNX write requested");
         let message = Message::KnxWrite(KnxWrite {
             v: PROTOCOL_VERSION,
@@ -997,6 +1090,7 @@ async fn dispatch_commands(
         });
         if let Err(error) = send_message(stdin, &message).await {
             pending.remove(&request_id);
+            store.record_write_result(request_id, false, Some(error.to_string()));
             return Err(error);
         }
     }
@@ -1020,11 +1114,16 @@ async fn send_message(stdin: &mut ChildStdin, message: &Message) -> Result<(), H
     Ok(())
 }
 
-fn init_logging(config: LoggingConfig) {
+fn init_logging(config: LoggingConfig, store: DiagnosticStore) {
+    diagnostics::activate_tracing_store(store);
     let filter = logging_filter(config);
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
+        .with_filter(filter.clone());
+    let diagnostics_layer = diagnostics::tracing_layer().with_filter(filter);
+    let _ = tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(diagnostics_layer)
         .try_init();
 }
 
@@ -1140,5 +1239,20 @@ mod tests {
                 .split(',')
                 .any(|directive| directive == "bridge.xknx=trace")
         );
+    }
+
+    #[test]
+    fn web_config_accepts_ipv4_and_ipv6_but_rejects_port_zero() {
+        let ipv4 = WebConfig::new("127.0.0.1".parse().unwrap(), 8080).unwrap();
+        assert_eq!(ipv4.socket_addr().to_string(), "127.0.0.1:8080");
+        let ipv6 = WebConfig::new("::1".parse().unwrap(), 8080).unwrap();
+        assert_eq!(ipv6.socket_addr().to_string(), "[::1]:8080");
+        assert!(matches!(
+            WebConfig::new("127.0.0.1".parse().unwrap(), 0),
+            Err(ConfigError::Field {
+                field: "web.listen_port",
+                ..
+            })
+        ));
     }
 }

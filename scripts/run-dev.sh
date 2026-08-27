@@ -17,4 +17,9 @@ if [ ! -x .venv/bin/python ]; then
     exit 1
 fi
 
+if [ ! -d logiksmith-web/node_modules ]; then
+    mise exec -- npm --prefix logiksmith-web ci
+fi
+mise exec -- npm --prefix logiksmith-web run build
+
 exec mise exec -- cargo run -p logiksmith-desktop -- --config config/local.toml

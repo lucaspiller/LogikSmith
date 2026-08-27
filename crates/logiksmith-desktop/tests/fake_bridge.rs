@@ -2,6 +2,7 @@ use logiksmith_desktop::{BridgeCommand, HostError, load_config, run_with_bridge}
 use std::{
     ffi::OsString,
     fs,
+    net::TcpListener,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -18,9 +19,15 @@ fn temporary_path(suffix: &str) -> PathBuf {
 async fn fake_bridge_drives_on_then_timer_off() {
     let config_path = temporary_path("config.toml");
     let marker_path = temporary_path("writes.log");
+    let web_port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     fs::write(
         &config_path,
-        r#"
+        format!(
+            r#"
 [knx]
 connection_type = "tunneling"
 gateway_ip = "192.0.2.1"
@@ -39,7 +46,12 @@ python = "/bin/sh"
 [logging]
 level = "off"
 bridge_level = "off"
-"#,
+
+[web]
+listen_ip = "127.0.0.1"
+listen_port = {web_port}
+"#
+        ),
     )
     .unwrap();
 

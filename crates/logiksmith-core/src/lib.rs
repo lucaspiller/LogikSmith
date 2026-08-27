@@ -458,6 +458,12 @@ pub struct Engine {
     off_deadline: Option<MonotonicMs>,
 }
 
+/// Read-only view of the engine's current timer state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EngineSnapshot {
+    pub off_deadline: Option<MonotonicMs>,
+}
+
 impl Engine {
     /// Constructs an engine, panicking if the configuration is invalid.
     /// Prefer [`Self::try_new`] at an external configuration boundary.
@@ -471,6 +477,12 @@ impl Engine {
             config,
             off_deadline: None,
         })
+    }
+
+    pub fn snapshot(&self) -> EngineSnapshot {
+        EngineSnapshot {
+            off_deadline: self.off_deadline,
+        }
     }
 
     pub fn handle_event(&mut self, event: KnxEvent, now: MonotonicMs) -> Vec<Command> {
@@ -545,6 +557,81 @@ mod tests {
             dpt: Dpt::BOOL,
             value: Value::Bool(false),
         }
+    }
+
+    #[test]
+    fn snapshot_is_idle_before_trigger() {
+        let engine = Engine::new(config());
+
+        assert_eq!(engine.snapshot(), EngineSnapshot { off_deadline: None });
+    }
+
+    #[test]
+    fn snapshot_reports_deadline_after_trigger() {
+        let mut engine = Engine::new(config());
+        engine.handle_event(
+            event(
+                "2/2/52",
+                GroupService::Write,
+                Dpt::BOOL,
+                Some(Value::Bool(true)),
+            ),
+            MonotonicMs(1_000),
+        );
+
+        assert_eq!(
+            engine.snapshot(),
+            EngineSnapshot {
+                off_deadline: Some(MonotonicMs(6_000)),
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_reports_retriggered_deadline() {
+        let mut engine = Engine::new(config());
+        engine.handle_event(
+            event(
+                "2/2/52",
+                GroupService::Write,
+                Dpt::BOOL,
+                Some(Value::Bool(true)),
+            ),
+            MonotonicMs(1_000),
+        );
+        engine.handle_event(
+            event(
+                "2/2/52",
+                GroupService::Write,
+                Dpt::BOOL,
+                Some(Value::Bool(true)),
+            ),
+            MonotonicMs(4_000),
+        );
+
+        assert_eq!(
+            engine.snapshot(),
+            EngineSnapshot {
+                off_deadline: Some(MonotonicMs(9_000)),
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_clears_after_expiry() {
+        let mut engine = Engine::new(config());
+        engine.handle_event(
+            event(
+                "2/2/52",
+                GroupService::Write,
+                Dpt::BOOL,
+                Some(Value::Bool(true)),
+            ),
+            MonotonicMs(1_000),
+        );
+
+        assert_eq!(engine.poll(MonotonicMs(6_000)), vec![off_command()]);
+        assert_eq!(engine.snapshot(), EngineSnapshot { off_deadline: None });
     }
 
     #[test]
