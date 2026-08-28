@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { DashboardClient, decodeEvent, decodeSnapshot, loadSnapshot } from '../src/lib/api';
 import {
   countdownMs,
+  displayedCountdownMs,
   formatAge,
   formatCountdown,
   formatDuration,
@@ -111,6 +112,21 @@ describe('dashboard API and state', () => {
     expect(formatDuration(1_250)).toBe('1.25 ms');
     expect(formatAge(null)).toBe('—');
     expect(formatAge(2_400)).toBe('2.4 s');
+  });
+
+  it('freezes a named timer countdown at the moment the stream goes stale', () => {
+    const mapped = decodeSnapshot(snapshot(1, {
+      captured_at_ms: 1_000,
+      pending_timers: [{ name: 'off', scheduled_at_ms: 800, due_at_ms: 5_800, logic_revision: 12 }]
+    }), 1_000);
+    let dashboard = reduceDashboardState(initialDashboardState, { type: 'snapshot_loaded', snapshot: mapped, nowMs: 1_000 });
+    dashboard = reduceDashboardState(dashboard, { type: 'stream_open' });
+    dashboard = reduceDashboardState(dashboard, { type: 'tick', nowMs: 2_000 });
+    expect(displayedCountdownMs(dashboard, 'off')).toBe(4_800);
+    dashboard = reduceDashboardState(dashboard, { type: 'stream_lost' });
+    expect(dashboard.staleAtMs).toBe(2_000);
+    dashboard = reduceDashboardState(dashboard, { type: 'tick', nowMs: 9_000 });
+    expect(displayedCountdownMs(dashboard, 'off')).toBe(4_800);
   });
 
   it('decodes successful, zero-effect, and unknown-input execution records', () => {

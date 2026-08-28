@@ -317,6 +317,7 @@ struct SaveAutomationResponse {
     logic_activated: bool,
     active_logic_revision: u64,
     restart_required: bool,
+    cancelled_timers: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -387,6 +388,7 @@ async fn put_automation(
                 let active_structural_revision =
                     state.store.snapshot().logic.active_structural_revision;
                 let mut logic_activated = false;
+                let mut cancelled_timers = Vec::new();
                 let mut restart_required =
                     candidate_structural_revision != active_structural_revision;
                 if !restart_required {
@@ -399,11 +401,16 @@ async fn put_automation(
                             reply,
                         };
                         if activation.send(request).await.is_ok() {
-                            logic_activated = tokio::time::timeout(Duration::from_secs(2), result)
-                                .await
-                                .ok()
-                                .and_then(Result::ok)
-                                .is_some();
+                            if let Some(activation) =
+                                tokio::time::timeout(Duration::from_secs(2), result)
+                                    .await
+                                    .ok()
+                                    .and_then(|result| result.ok())
+                                    .and_then(Result::ok)
+                            {
+                                logic_activated = true;
+                                cancelled_timers = activation.cancelled_timers;
+                            }
                         }
                     }
                     restart_required = !logic_activated;
@@ -414,12 +421,6 @@ async fn put_automation(
                     candidate_structural_revision,
                     restart_required,
                 );
-                if logic_activated {
-                    state.store.set_active_logic(
-                        u64::from(revision),
-                        request.document.logic.source.clone(),
-                    );
-                }
                 let active_logic_revision = state.store.snapshot().logic.active_logic_revision;
                 (
                     StatusCode::OK,
@@ -428,6 +429,7 @@ async fn put_automation(
                         logic_activated,
                         active_logic_revision,
                         restart_required,
+                        cancelled_timers,
                     }),
                 )
                     .into_response()

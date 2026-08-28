@@ -1,8 +1,14 @@
 //! Bounded, read-only diagnostic state for the desktop dashboard.
 
-use crate::{AutomationRuntime, DptMessage, GroupAddress, KnxEvent, ValueMessage};
-use logiksmith_core::{Dpt, Effect, EndpointDirection, EndpointName, Execution, TypedValue};
+use crate::{
+    AutomationRuntime, BoolValueMessage, DptMessage, GroupAddress, KnxEvent, ValueMessage,
+};
+use logiksmith_core::{
+    Dpt, EndpointDirection, EndpointName, Execution, OutputEffect, StateValue, TimerAction,
+    Trigger, TypedValue,
+};
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 use std::{
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
@@ -40,6 +46,9 @@ pub struct Snapshot {
     pub automation: AutomationSnapshot,
     pub active_automation_revision: u64,
     pub saved_automation_revision: u64,
+    pub captured_at_ms: u64,
+    pub state: BTreeMap<String, StateValueRecord>,
+    pub pending_timers: Vec<PendingTimerRecord>,
     pub values: ValuesSnapshot,
     pub write: WriteSnapshot,
     pub logic: LogicStatusSnapshot,
@@ -96,7 +105,26 @@ pub struct LogicStatusSnapshot {
     pub active_structural_revision: u64,
     pub saved_structural_revision: u64,
     pub restart_required: bool,
+    /// Current transient state owned by the active logic block. Values are
+    /// tagged so Lua integers remain distinguishable from Lua numbers.
+    pub state: BTreeMap<String, StateValueRecord>,
+    /// Pending named timers in deterministic name/deadline order.
+    pub pending_timers: Vec<PendingTimerRecord>,
     pub executions: Vec<ExecutionRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StateValueRecord {
+    pub kind: String,
+    pub value: JsonValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PendingTimerRecord {
+    pub name: String,
+    pub scheduled_at_ms: u64,
+    pub due_at_ms: u64,
+    pub logic_revision: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -113,11 +141,16 @@ pub struct ExecutionRecord {
     pub status: LogicExecutionStatus,
     pub trigger: LogicalTriggerRecord,
     pub inputs: Vec<LogicalInputSnapshot>,
+    pub state_before: BTreeMap<String, StateValueRecord>,
+    pub state_after: BTreeMap<String, StateValueRecord>,
+    pub transition: Option<LogicalTransitionRecord>,
     pub effects: Vec<LogicalEffectRecord>,
+    pub timer_effects: Vec<LogicalTimerEffectRecord>,
     pub error: Option<LogicErrorRecord>,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicalTriggerRecord {
+    pub trigger_type: String,
     pub endpoint: String,
     pub dpt: DptMessage,
     pub value: ValueMessage,
@@ -125,6 +158,52 @@ pub struct LogicalTriggerRecord {
     pub changed: bool,
     pub rising: bool,
     pub falling: bool,
+    pub name: Option<String>,
+    pub scheduled_at_ms: Option<u64>,
+    pub due_at_ms: Option<u64>,
+    pub fired_at_ms: Option<u64>,
+    pub late_by_ms: Option<u64>,
+    pub scheduled_logic_revision: Option<u64>,
+}
+
+impl Serialize for LogicalTriggerRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("type", &self.trigger_type)?;
+        if self.trigger_type == "timer" {
+            if let Some(value) = &self.name {
+                map.serialize_entry("name", value)?;
+            }
+            if let Some(value) = self.scheduled_at_ms {
+                map.serialize_entry("scheduled_at_ms", &value)?;
+            }
+            if let Some(value) = self.due_at_ms {
+                map.serialize_entry("due_at_ms", &value)?;
+            }
+            if let Some(value) = self.fired_at_ms {
+                map.serialize_entry("fired_at_ms", &value)?;
+            }
+            if let Some(value) = self.late_by_ms {
+                map.serialize_entry("late_by_ms", &value)?;
+            }
+            if let Some(value) = self.scheduled_logic_revision {
+                map.serialize_entry("scheduled_logic_revision", &value)?;
+            }
+        } else {
+            map.serialize_entry("endpoint", &self.endpoint)?;
+            map.serialize_entry("dpt", &self.dpt)?;
+            map.serialize_entry("value", &self.value)?;
+            map.serialize_entry("previous", &self.previous)?;
+            map.serialize_entry("changed", &self.changed)?;
+            map.serialize_entry("rising", &self.rising)?;
+            map.serialize_entry("falling", &self.falling)?;
+        }
+        map.end()
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LogicalInputSnapshot {
@@ -148,6 +227,25 @@ pub struct LogicalEffectRecord {
     pub value: ValueMessage,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LogicalTransitionRecord {
+    pub state: BTreeMap<String, StateValueRecord>,
+    pub effects: Vec<LogicalEffectRecord>,
+    pub timers: Vec<LogicalTimerEffectRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LogicalTimerEffectRecord {
+    pub name: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_due_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_at_ms: Option<u64>,
+}
+
 /// Browser-facing result for an immutable simulation. It intentionally omits
 /// live execution IDs and timestamps because no live diagnostic record exists.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -157,7 +255,12 @@ pub struct SimulationResponse {
     pub status: LogicExecutionStatus,
     pub trigger: LogicalTriggerRecord,
     pub inputs: Vec<LogicalInputSnapshot>,
+    pub state_before: BTreeMap<String, StateValueRecord>,
+    pub state_after: BTreeMap<String, StateValueRecord>,
+    pub transition: Option<LogicalTransitionRecord>,
+    pub pending_timers: Vec<PendingTimerRecord>,
     pub effects: Vec<LogicalEffectRecord>,
+    pub timer_effects: Vec<LogicalTimerEffectRecord>,
     pub error: Option<LogicErrorRecord>,
 }
 
@@ -231,6 +334,7 @@ pub struct DiagnosticStore {
 }
 struct Inner {
     revision: u64,
+    captured_at_ms: u64,
     connection: ConnectionState,
     automation_path: PathBuf,
     automation: AutomationSnapshot,
@@ -243,6 +347,8 @@ struct Inner {
     active_structural_revision: u64,
     saved_structural_revision: u64,
     restart_required: bool,
+    state: BTreeMap<String, StateValueRecord>,
+    pending_timers: Vec<PendingTimerRecord>,
     executions: VecDeque<ExecutionRecord>,
     next_execution_id: u64,
     telegrams: VecDeque<TelegramRecord>,
@@ -282,6 +388,7 @@ impl DiagnosticStore {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 revision: 0,
+                captured_at_ms: 0,
                 connection: ConnectionState::Starting,
                 automation_path,
                 automation,
@@ -299,6 +406,8 @@ impl DiagnosticStore {
                 active_structural_revision: runtime.structural_revision,
                 saved_structural_revision: runtime.structural_revision,
                 restart_required: false,
+                state: BTreeMap::new(),
+                pending_timers: Vec::new(),
                 executions: VecDeque::new(),
                 next_execution_id: 1,
                 telegrams: VecDeque::new(),
@@ -389,6 +498,83 @@ impl DiagnosticStore {
             inner.saved_structural_revision != inner.active_structural_revision;
         self.publish_locked(&mut inner);
     }
+
+    /// Publishes a source activation together with its cancelled timer names
+    /// and the new core projection in one SSE update.
+    pub fn record_activation(
+        &self,
+        logic_revision: u64,
+        source: impl Into<String>,
+        cancelled_timers: &[String],
+        snapshot: &logiksmith_core::EngineSnapshot,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.active_logic_revision = logic_revision;
+        inner.active_automation_revision = logic_revision;
+        inner.automation.logic.source = source.into();
+        inner.restart_required =
+            inner.saved_structural_revision != inner.active_structural_revision;
+        inner.state = state_record(&snapshot.state);
+        inner.pending_timers = snapshot
+            .pending_timers
+            .iter()
+            .map(|timer| pending_timer_record(timer, logic_revision))
+            .collect();
+        if !cancelled_timers.is_empty() {
+            let mut fields = BTreeMap::new();
+            fields.insert("cancelled_timers".to_owned(), cancelled_timers.join(","));
+            inner.logs.push_back(LogRecord {
+                time_ms: self.now().0,
+                level: "info".to_owned(),
+                target: "logiksmith".to_owned(),
+                message: "source activation cancelled pending timers".to_owned(),
+                fields,
+            });
+            while inner.logs.len() > MAX_LOGS {
+                inner.logs.pop_front();
+            }
+        }
+        self.publish_locked(&mut inner);
+    }
+
+    /// Replaces the browser projection of core-owned transient state and
+    /// pending timers. The session calls this after every serialized runtime
+    /// operation, so snapshots and SSE updates share one coherent view.
+    pub fn set_runtime_projection(
+        &self,
+        state: BTreeMap<String, StateValueRecord>,
+        pending_timers: Vec<PendingTimerRecord>,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.state == state && inner.pending_timers == pending_timers {
+            return;
+        }
+        inner.state = state;
+        inner.pending_timers = pending_timers;
+        self.publish_locked(&mut inner);
+    }
+
+    pub fn set_engine_snapshot(&self, snapshot: &logiksmith_core::EngineSnapshot) {
+        let logic_revision = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_logic_revision;
+        self.set_runtime_projection(
+            state_record(&snapshot.state),
+            snapshot
+                .pending_timers
+                .iter()
+                .map(|timer| pending_timer_record(timer, logic_revision))
+                .collect(),
+        );
+    }
     /// Stores one immutable semantic core execution with host-only timing and
     /// resolved KNX destinations. The core outcome is intentionally handled
     /// here so zero-effect successes and contained Lua failures are retained.
@@ -415,18 +601,21 @@ impl DiagnosticStore {
         let execution_id = inner.next_execution_id;
         inner.next_execution_id = inner.next_execution_id.saturating_add(1);
         let document_revision = inner.active_logic_revision;
-        let (status, effects, error) = match &execution.outcome {
+        let (status, effects, transition, error) = match &execution.outcome {
             Ok(effects) => (
                 LogicExecutionStatus::Succeeded,
                 effects
+                    .outputs
                     .iter()
                     .filter_map(|effect| effect_record(effect, automation))
                     .collect(),
+                Some(transition_record(effects, automation)),
                 None,
             ),
             Err(error) => (
                 LogicExecutionStatus::Failed,
                 Vec::new(),
+                None,
                 Some(logic_error_record(error)),
             ),
         };
@@ -436,11 +625,24 @@ impl DiagnosticStore {
             duration_us,
             logic_revision: document_revision,
             status,
-            trigger: trigger_record(&execution.trigger),
+            trigger: trigger_record(&execution.trigger, document_revision),
             inputs: execution.inputs.iter().map(input_snapshot_record).collect(),
+            state_before: state_record(&execution.state_before),
+            state_after: state_record(&execution.state_after),
+            timer_effects: transition
+                .as_ref()
+                .map(|transition| transition.timers.clone())
+                .unwrap_or_default(),
+            transition,
             effects,
             error,
         });
+        inner.state = state_record(&execution.state_after);
+        inner.pending_timers = execution
+            .pending_timers
+            .iter()
+            .map(|timer| pending_timer_record(timer, document_revision))
+            .collect();
         while inner.executions.len() > MAX_EXECUTIONS {
             inner.executions.pop_front();
         }
@@ -570,6 +772,7 @@ impl DiagnosticStore {
     }
     fn publish_locked(&self, inner: &mut Inner) {
         inner.revision = inner.revision.saturating_add(1);
+        inner.captured_at_ms = self.now().0;
         let update = DiagnosticUpdate {
             revision: inner.revision,
             snapshot: snapshot_locked(inner, self.now()),
@@ -582,15 +785,46 @@ impl DiagnosticStore {
     }
 }
 
-fn trigger_record(trigger: &logiksmith_core::InputTrigger) -> LogicalTriggerRecord {
-    LogicalTriggerRecord {
-        endpoint: trigger.endpoint.to_string(),
-        dpt: DptMessage::from_core(trigger.value.dpt),
-        value: ValueMessage::from_core(trigger.value),
-        previous: trigger.previous.map(ValueMessage::from_core),
-        changed: trigger.changed,
-        rising: trigger.rising,
-        falling: trigger.falling,
+fn trigger_record(trigger: &Trigger, document_revision: u64) -> LogicalTriggerRecord {
+    match trigger {
+        Trigger::Input(trigger) => LogicalTriggerRecord {
+            trigger_type: "input".to_owned(),
+            endpoint: trigger.endpoint.to_string(),
+            dpt: DptMessage::from_core(trigger.value.dpt),
+            value: ValueMessage::from_core(trigger.value),
+            previous: trigger.previous.map(ValueMessage::from_core),
+            changed: trigger.changed,
+            rising: trigger.rising,
+            falling: trigger.falling,
+            name: None,
+            scheduled_at_ms: None,
+            due_at_ms: None,
+            fired_at_ms: None,
+            late_by_ms: None,
+            scheduled_logic_revision: None,
+        },
+        Trigger::Timer(trigger) => LogicalTriggerRecord {
+            trigger_type: "timer".to_owned(),
+            endpoint: String::new(),
+            dpt: DptMessage {
+                major: 0,
+                subtype: 0,
+            },
+            value: ValueMessage::Bool(BoolValueMessage {
+                kind: "bool".to_owned(),
+                value: false,
+            }),
+            previous: None,
+            changed: false,
+            rising: false,
+            falling: false,
+            name: Some(trigger.name.to_string()),
+            scheduled_at_ms: Some(trigger.scheduled_at.0),
+            due_at_ms: Some(trigger.due_at.0),
+            fired_at_ms: Some(trigger.fired_at.0),
+            late_by_ms: Some(trigger.fired_at.0.saturating_sub(trigger.due_at.0)),
+            scheduled_logic_revision: Some(document_revision),
+        },
     }
 }
 
@@ -600,18 +834,21 @@ pub fn simulation_response(
     logic_revision: u64,
     automation: &AutomationRuntime,
 ) -> SimulationResponse {
-    let (status, effects, error) = match &execution.outcome {
+    let (status, effects, transition, error) = match &execution.outcome {
         Ok(effects) => (
             LogicExecutionStatus::Succeeded,
             effects
+                .outputs
                 .iter()
                 .filter_map(|effect| effect_record(effect, automation))
                 .collect(),
+            Some(transition_record(effects, automation)),
             None,
         ),
         Err(error) => (
             LogicExecutionStatus::Failed,
             Vec::new(),
+            None,
             Some(logic_error_record(error)),
         ),
     };
@@ -619,9 +856,21 @@ pub fn simulation_response(
         logic_revision,
         duration_us,
         status,
-        trigger: trigger_record(&execution.trigger),
+        trigger: trigger_record(&execution.trigger, logic_revision),
         inputs: execution.inputs.iter().map(input_snapshot_record).collect(),
+        state_before: state_record(&execution.state_before),
+        state_after: state_record(&execution.state_after),
+        transition: transition.clone(),
+        pending_timers: execution
+            .pending_timers
+            .iter()
+            .map(|timer| pending_timer_record(timer, logic_revision))
+            .collect(),
         effects,
+        timer_effects: transition
+            .as_ref()
+            .map(|transition| transition.timers.clone())
+            .unwrap_or_default(),
         error,
     }
 }
@@ -636,14 +885,101 @@ fn input_snapshot_record(input: &logiksmith_core::InputSnapshot) -> LogicalInput
     }
 }
 
-fn effect_record(effect: &Effect, automation: &AutomationRuntime) -> Option<LogicalEffectRecord> {
-    let Effect::SetOutput { endpoint, value } = effect;
+fn effect_record(
+    effect: &OutputEffect,
+    automation: &AutomationRuntime,
+) -> Option<LogicalEffectRecord> {
+    let endpoint = &effect.endpoint;
+    let value = effect.value;
     Some(LogicalEffectRecord {
         endpoint: endpoint.to_string(),
         destination: automation.endpoint_to_address.get(endpoint)?.to_string(),
         dpt: DptMessage::from_core(value.dpt),
-        value: ValueMessage::from_core(*value),
+        value: ValueMessage::from_core(value),
     })
+}
+
+fn state_value_record(value: &StateValue) -> StateValueRecord {
+    let (kind, value) = match value {
+        StateValue::Bool(value) => ("bool", JsonValue::Bool(*value)),
+        StateValue::Integer(value) => ("integer", JsonValue::Number((*value).into())),
+        StateValue::Number(value) => (
+            "number",
+            serde_json::Number::from_f64(*value)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null),
+        ),
+        StateValue::String(value) => ("string", JsonValue::String(value.clone())),
+    };
+    StateValueRecord {
+        kind: kind.to_owned(),
+        value,
+    }
+}
+
+fn state_record(state: &logiksmith_core::TransientState) -> BTreeMap<String, StateValueRecord> {
+    state
+        .iter()
+        .map(|(key, value)| (key.clone(), state_value_record(value)))
+        .collect()
+}
+
+fn pending_timer_record(
+    timer: &logiksmith_core::PendingTimer,
+    document_revision: u64,
+) -> PendingTimerRecord {
+    PendingTimerRecord {
+        name: timer.name.to_string(),
+        scheduled_at_ms: timer.scheduled_at.0,
+        due_at_ms: timer.due_at.0,
+        logic_revision: document_revision,
+    }
+}
+
+fn transition_record(
+    transition: &logiksmith_core::Transition,
+    automation: &AutomationRuntime,
+) -> LogicalTransitionRecord {
+    LogicalTransitionRecord {
+        state: state_record(&transition.state),
+        effects: transition
+            .outputs
+            .iter()
+            .filter_map(|effect| effect_record(effect, automation))
+            .collect(),
+        timers: transition
+            .timers
+            .iter()
+            .map(|effect| {
+                let (action, after_ms, previous_due_at_ms, due_at_ms) = match effect.action {
+                    TimerAction::Scheduled { after_ms, due_at } => {
+                        ("scheduled", Some(after_ms), None, Some(due_at.0))
+                    }
+                    TimerAction::Replaced {
+                        previous_due_at,
+                        after_ms,
+                        due_at,
+                    } => (
+                        "replaced",
+                        Some(after_ms),
+                        Some(previous_due_at.0),
+                        Some(due_at.0),
+                    ),
+                    TimerAction::Cancelled { previous_due_at } => {
+                        ("cancelled", None, Some(previous_due_at.0), None)
+                    }
+                    TimerAction::CancelNoop => ("cancel_noop", None, None, None),
+                };
+                LogicalTimerEffectRecord {
+                    name: effect.name.to_string(),
+                    action: action.to_owned(),
+                    after_ms,
+                    previous_due_at_ms,
+                    due_at_ms,
+                }
+            })
+            .collect(),
+    }
 }
 
 fn logic_error_record(error: &logiksmith_core::LogicError) -> LogicErrorRecord {
@@ -723,6 +1059,9 @@ fn snapshot_locked(inner: &Inner, _now: logiksmith_core::MonotonicMs) -> Snapsho
         automation: inner.automation.clone(),
         active_automation_revision: inner.active_automation_revision,
         saved_automation_revision: inner.saved_automation_revision,
+        captured_at_ms: inner.captured_at_ms,
+        state: inner.state.clone(),
+        pending_timers: inner.pending_timers.clone(),
         values,
         write: inner.last_write.clone(),
         logic: LogicStatusSnapshot {
@@ -731,6 +1070,8 @@ fn snapshot_locked(inner: &Inner, _now: logiksmith_core::MonotonicMs) -> Snapsho
             active_structural_revision: inner.active_structural_revision,
             saved_structural_revision: inner.saved_structural_revision,
             restart_required: inner.restart_required,
+            state: inner.state.clone(),
+            pending_timers: inner.pending_timers.clone(),
             executions: inner.executions.iter().rev().cloned().collect(),
         },
         telegrams: inner.telegrams.iter().cloned().collect(),

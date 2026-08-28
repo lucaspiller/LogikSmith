@@ -72,6 +72,17 @@ describe('automation editor model', () => {
     expect(JSON.parse(String(request?.body))).toEqual({ document: document(), revision: 7 });
   });
 
+  it('decodes the names cancelled by a source activation', async () => {
+    const result = await saveAutomation(document(), 7, async () => new Response(JSON.stringify({
+      revision: 8,
+      logic_activated: true,
+      active_logic_revision: 8,
+      restart_required: false,
+      cancelled_timers: ['dim', 'off']
+    }), { status: 200 }));
+    expect(result.cancelledTimers).toEqual(['dim', 'off']);
+  });
+
   it('retains the latest document from a stale-save conflict', async () => {
     await expect(saveAutomation(document(), 7, async () => new Response(JSON.stringify({ document: document(), revision: 8 }), { status: 409 }))).rejects.toMatchObject({ status: 409, latest: { revision: 8 } });
   });

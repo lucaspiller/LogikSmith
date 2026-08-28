@@ -28,6 +28,7 @@ export interface AutomationSaveResult {
   logicActivated: boolean;
   activeLogicRevision: number | null;
   restartRequired: boolean;
+  cancelledTimers?: string[];
 }
 
 type FetchLike = typeof fetch;
@@ -132,11 +133,15 @@ export async function saveAutomation(document: AutomationDocument, replacedRevis
   const response = await fetchImpl('/api/automation', { method: 'PUT', headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify({ document, revision: replacedRevision }) });
   if (response.ok) {
     const source = record(await response.json(), 'save');
+    const cancellationRaw = source.cancelled_timers ?? source.cancelledTimers;
     return {
       revision: revision(source.revision ?? source.content_revision, 'save.revision'),
       logicActivated: source.logic_activated === true || source.logicActivated === true,
       activeLogicRevision: optionalRevision(source.active_logic_revision ?? source.activeLogicRevision, 'save.active_logic_revision'),
-      restartRequired: source.restart_required === true || source.restartRequired === true
+      restartRequired: source.restart_required === true || source.restartRequired === true,
+      ...(Array.isArray(cancellationRaw)
+        ? { cancelledTimers: (cancellationRaw as unknown[]).map((value: unknown, index: number) => nonEmptyString(value, `save.cancelled_timers[${index}]`)) }
+        : {})
     };
   }
   const body = await jsonOrNull(response);

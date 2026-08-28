@@ -5,8 +5,9 @@ pub mod web;
 
 use diagnostics::{ConnectionState, DiagnosticStore, TelegramRecord};
 use logiksmith_core::{
-    Dpt, Effect, Endpoint, EndpointDirection, EndpointName, Engine, EngineConfig, InputEvent,
-    InputObservation, SimulationError, SimulationInput, SimulationScenario, SimulationTrigger,
+    Dpt, Endpoint, EndpointDirection, EndpointName, Engine, EngineConfig, InputEvent,
+    InputObservation, MonotonicMs, OutputEffect, PendingTimer, SimulationError, SimulationInput,
+    SimulationScenario, SimulationTrigger, StateValue, TimerName, TimerSimulationScenario,
     TypedValue, Value,
 };
 use serde::{Deserialize, Serialize};
@@ -40,7 +41,14 @@ pub struct ActivationRequest {
     pub source: String,
     pub logic_hash: u64,
     pub document_revision: u64,
-    pub reply: oneshot::Sender<Result<(), String>>,
+    pub reply: oneshot::Sender<Result<ActivationResult, String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationResult {
+    pub logic_revision: u64,
+    pub cancelled_timers: Vec<String>,
+    pub changed: bool,
 }
 
 /// Browser payload for one immutable input simulation. Values carry their
@@ -48,18 +56,52 @@ pub struct ActivationRequest {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimulationPayload {
+    #[serde(alias = "expectedLogicRevision")]
     pub expected_logic_revision: u64,
     pub trigger: SimulationTriggerPayload,
     pub inputs: Vec<SimulationInputPayload>,
+    #[serde(default)]
+    pub state: Option<std::collections::BTreeMap<String, StateValuePayload>>,
+    #[serde(default, alias = "pendingTimers")]
+    pub pending_timers: Option<Vec<PendingTimerPayload>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimulationTriggerPayload {
-    pub endpoint: String,
-    pub value: ValueMessage,
+    #[serde(rename = "type", default)]
+    pub trigger_type: Option<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub value: Option<ValueMessage>,
     #[serde(default)]
     pub previous: Option<ValueMessage>,
+    #[serde(default)]
+    #[serde(alias = "timer")]
+    pub name: Option<String>,
+    #[serde(default)]
+    #[serde(alias = "firedAtMs")]
+    pub fired_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateValuePayload {
+    pub kind: String,
+    pub value: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingTimerPayload {
+    pub name: String,
+    #[serde(alias = "scheduledAtMs")]
+    pub scheduled_at_ms: u64,
+    #[serde(alias = "dueAtMs")]
+    pub due_at_ms: u64,
+    #[serde(alias = "logicRevision")]
+    pub logic_revision: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -68,6 +110,7 @@ pub struct SimulationInputPayload {
     pub endpoint: String,
     pub value: Option<ValueMessage>,
     pub valid: bool,
+    #[serde(alias = "ageMs")]
     pub age_ms: Option<u64>,
 }
 
@@ -788,6 +831,111 @@ fn simulation_value(value: &ValueMessage, dpt: Dpt, path: &str) -> Result<TypedV
     })
 }
 
+fn simulation_state_value(value: &StateValuePayload, path: &str) -> Result<StateValue, FieldError> {
+    let invalid = || FieldError {
+        path: path.to_owned(),
+        message: "must be a tagged bool, integer, number, or string".to_owned(),
+    };
+    match value.kind.as_str() {
+        "bool" => value
+            .value
+            .as_bool()
+            .map(StateValue::Bool)
+            .ok_or_else(invalid),
+        "integer" => value
+            .value
+            .as_i64()
+            .map(StateValue::Integer)
+            .ok_or_else(invalid),
+        "number" => value
+            .value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(StateValue::Number)
+            .ok_or_else(invalid),
+        "string" => value
+            .value
+            .as_str()
+            .map(|value| StateValue::String(value.to_owned()))
+            .ok_or_else(invalid),
+        _ => Err(invalid()),
+    }
+}
+
+fn simulation_state(
+    payload: &SimulationPayload,
+    fallback: Option<&logiksmith_core::TransientState>,
+) -> Result<logiksmith_core::TransientState, Vec<FieldError>> {
+    let mut errors = Vec::new();
+    let Some(source) = payload.state.as_ref() else {
+        return Ok(fallback.cloned().unwrap_or_default());
+    };
+    let state = source
+        .iter()
+        .filter_map(
+            |(key, value)| match simulation_state_value(value, &format!("state.{key}")) {
+                Ok(value) => Some((key.clone(), value)),
+                Err(error) => {
+                    errors.push(error);
+                    None
+                }
+            },
+        )
+        .collect();
+    if errors.is_empty() {
+        Ok(state)
+    } else {
+        Err(errors)
+    }
+}
+
+fn simulation_pending_timers(
+    payload: &SimulationPayload,
+    fallback: Option<&[PendingTimer]>,
+    active_document_revision: u64,
+    active_core_revision: u64,
+) -> Result<Vec<PendingTimer>, Vec<FieldError>> {
+    let Some(source) = payload.pending_timers.as_ref() else {
+        return Ok(fallback.map(ToOwned::to_owned).unwrap_or_default());
+    };
+    let mut errors = Vec::new();
+    let timers = source
+        .iter()
+        .enumerate()
+        .filter_map(|(index, timer)| {
+            let path = format!("pending_timers[{index}]");
+            let name = match timer.name.parse::<TimerName>() {
+                Ok(name) => Some(name),
+                Err(error) => {
+                    errors.push(FieldError {
+                        path: format!("{path}.name"),
+                        message: error.to_string(),
+                    });
+                    None
+                }
+            }?;
+            if timer.logic_revision != active_document_revision {
+                errors.push(FieldError {
+                    path: format!("{path}.logic_revision"),
+                    message: "must use the active logic revision".to_owned(),
+                });
+                return None;
+            }
+            Some(PendingTimer {
+                name,
+                scheduled_at: MonotonicMs(timer.scheduled_at_ms),
+                due_at: MonotonicMs(timer.due_at_ms),
+                scheduled_logic_revision: active_core_revision,
+            })
+        })
+        .collect();
+    if errors.is_empty() {
+        Ok(timers)
+    } else {
+        Err(errors)
+    }
+}
+
 /// Converts the browser wire representation into the core-owned scenario.
 /// Endpoint and value checks that depend on the active configuration are kept
 /// here, before the immutable core operation is called.
@@ -795,11 +943,31 @@ pub(crate) fn simulation_scenario(
     payload: SimulationPayload,
     automation: &AutomationRuntime,
 ) -> Result<SimulationScenario, Vec<FieldError>> {
+    if payload
+        .trigger
+        .trigger_type
+        .as_deref()
+        .is_some_and(|kind| kind != "input")
+    {
+        return Err(vec![FieldError {
+            path: "trigger.type".to_owned(),
+            message: "must be 'input' for an input simulation".to_owned(),
+        }]);
+    }
     let mut errors = Vec::new();
-    let trigger_endpoint = match endpoint_name("trigger.endpoint", &payload.trigger.endpoint) {
-        Ok(endpoint) => Some(endpoint),
-        Err(error) => {
-            errors.push(error);
+    let trigger_endpoint = match payload.trigger.endpoint.as_deref() {
+        Some(endpoint) => match endpoint_name("trigger.endpoint", endpoint) {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                errors.push(error);
+                None
+            }
+        },
+        None => {
+            errors.push(FieldError {
+                path: "trigger.endpoint".to_owned(),
+                message: "is required for an input simulation".to_owned(),
+            });
             None
         }
     };
@@ -812,10 +980,17 @@ pub(crate) fn simulation_scenario(
             message: "must reference an existing input endpoint".to_owned(),
         });
     }
-    let trigger_value = trigger_dpt.and_then(|dpt| {
-        simulation_value(&payload.trigger.value, dpt, "trigger.value")
+    let trigger_value = trigger_dpt.and_then(|dpt| match payload.trigger.value.as_ref() {
+        Some(value) => simulation_value(value, dpt, "trigger.value")
             .map_err(|error| errors.push(error))
-            .ok()
+            .ok(),
+        None => {
+            errors.push(FieldError {
+                path: "trigger.value".to_owned(),
+                message: "is required for an input simulation".to_owned(),
+            });
+            None
+        }
     });
     let previous = match (trigger_dpt, payload.trigger.previous.as_ref()) {
         (Some(dpt), Some(value)) => simulation_value(value, dpt, "trigger.previous")
@@ -877,12 +1052,128 @@ pub(crate) fn simulation_scenario(
     })
 }
 
+pub(crate) fn simulation_timer_scenario(
+    payload: &SimulationPayload,
+    automation: &AutomationRuntime,
+    active_document_revision: u64,
+    active_core_revision: u64,
+    fallback_state: Option<&logiksmith_core::TransientState>,
+) -> Result<TimerSimulationScenario, Vec<FieldError>> {
+    let mut errors = Vec::new();
+    if payload.trigger.trigger_type.as_deref() != Some("timer") {
+        errors.push(FieldError {
+            path: "trigger.type".to_owned(),
+            message: "must be 'timer' for a timer simulation".to_owned(),
+        });
+    }
+    let timer = payload
+        .trigger
+        .name
+        .as_deref()
+        .ok_or_else(|| FieldError {
+            path: "trigger.name".to_owned(),
+            message: "is required for a timer simulation".to_owned(),
+        })
+        .and_then(|value| {
+            value.parse::<TimerName>().map_err(|error| FieldError {
+                path: "trigger.name".to_owned(),
+                message: error.to_string(),
+            })
+        });
+    let fired_at = payload.trigger.fired_at_ms.ok_or_else(|| FieldError {
+        path: "trigger.fired_at_ms".to_owned(),
+        message: "is required for a timer simulation".to_owned(),
+    });
+    let inputs = simulation_input_values(payload, automation, &mut errors);
+    let state = match simulation_state(payload, fallback_state) {
+        Ok(state) => state,
+        Err(mut state_errors) => {
+            errors.append(&mut state_errors);
+            Default::default()
+        }
+    };
+    let pending_timers = match simulation_pending_timers(
+        payload,
+        None,
+        active_document_revision,
+        active_core_revision,
+    ) {
+        Ok(timers) => timers,
+        Err(mut timer_errors) => {
+            errors.append(&mut timer_errors);
+            Vec::new()
+        }
+    };
+    if let Ok(timer) = &timer
+        && !pending_timers
+            .iter()
+            .any(|candidate| candidate.name == *timer)
+    {
+        errors.push(FieldError {
+            path: "trigger.name".to_owned(),
+            message: "must select a supplied pending timer".to_owned(),
+        });
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(TimerSimulationScenario {
+        timer: timer.expect("validated timer"),
+        fired_at: MonotonicMs(fired_at.expect("validated fired_at")),
+        inputs,
+        state,
+        pending_timers,
+    })
+}
+
+fn simulation_input_values(
+    payload: &SimulationPayload,
+    automation: &AutomationRuntime,
+    errors: &mut Vec<FieldError>,
+) -> Vec<SimulationInput> {
+    payload
+        .inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, input)| {
+            let path = format!("inputs[{index}]");
+            let endpoint = match endpoint_name(&format!("{path}.endpoint"), &input.endpoint) {
+                Ok(endpoint) => Some(endpoint),
+                Err(error) => {
+                    errors.push(error);
+                    None
+                }
+            }?;
+            let dpt = automation.endpoint_dpts.get(&endpoint).copied();
+            if dpt.is_none() {
+                errors.push(FieldError {
+                    path: format!("{path}.endpoint"),
+                    message: "must reference an existing input endpoint".to_owned(),
+                });
+            }
+            let value = match (dpt, input.value.as_ref()) {
+                (Some(dpt), Some(value)) => simulation_value(value, dpt, &format!("{path}.value"))
+                    .map_err(|error| errors.push(error))
+                    .ok(),
+                (_, None) => None,
+                (None, Some(_)) => None,
+            };
+            Some(SimulationInput {
+                endpoint,
+                value,
+                valid: input.valid,
+                age_ms: input.age_ms,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn simulation_error_fields(
     error: &SimulationError,
     payload: &SimulationPayload,
 ) -> Vec<FieldError> {
     let endpoint_path = |endpoint: &EndpointName| {
-        if payload.trigger.endpoint == endpoint.as_str() {
+        if payload.trigger.endpoint.as_deref() == Some(endpoint.as_str()) {
             "trigger.endpoint".to_owned()
         } else {
             payload
@@ -910,7 +1201,7 @@ pub(crate) fn simulation_error_fields(
             input_field(endpoint, "endpoint")
         }
         SimulationError::DptMismatch { endpoint, .. } => {
-            if payload.trigger.endpoint == endpoint.as_str() {
+            if payload.trigger.endpoint.as_deref() == Some(endpoint.as_str()) {
                 "trigger.value".to_owned()
             } else {
                 input_field(endpoint, "value")
@@ -925,6 +1216,12 @@ pub(crate) fn simulation_error_fields(
             input_field(endpoint, "age_ms")
         }
         SimulationError::TriggerAgeMismatch { endpoint, .. } => input_field(endpoint, "age_ms"),
+        SimulationError::UnknownTimer(_) | SimulationError::DuplicateTimer(_) => {
+            "trigger.name".to_owned()
+        }
+        SimulationError::TimerRevisionMismatch { .. } => "pending_timers".to_owned(),
+        SimulationError::InvalidState(_) => "state".to_owned(),
+        SimulationError::TimeWentBackwards { .. } => "trigger.fired_at_ms".to_owned(),
     };
     vec![FieldError {
         path,
@@ -1508,13 +1805,20 @@ async fn run_simulation_session(
     let interrupt = signal::ctrl_c();
     tokio::pin!(interrupt);
     let mut active_logic_revision = config.automation.document_revision;
+    let mut timer_sleep = Box::pin(time::sleep(timer_wait(engine, store)));
     loop {
         tokio::select! {
             Some(request) = activations.recv() => {
                 apply_activation(engine, store, &mut active_logic_revision, request);
+                reset_timer_sleep(&mut timer_sleep, engine, store);
             }
             Some(request) = simulations.recv() => {
-                apply_simulation(engine, config, active_logic_revision, request);
+                apply_simulation(engine, store, config, active_logic_revision, request);
+                reset_timer_sleep(&mut timer_sleep, engine, store);
+            }
+            _ = &mut timer_sleep => {
+                drain_due_timers(engine, store, config, None).await?;
+                reset_timer_sleep(&mut timer_sleep, engine, store);
             }
             signal = &mut interrupt => {
                 signal?;
@@ -1577,6 +1881,7 @@ async fn run_session(
     let mut next_request_id = 1u64;
     let mut pending = HashSet::new();
     let mut active_logic_revision = config.automation.document_revision;
+    let mut timer_sleep = Box::pin(time::sleep(timer_wait(engine, store)));
     loop {
         tokio::select! {
             read = reader.read_line(&mut line) => {
@@ -1604,16 +1909,19 @@ async fn run_session(
                             };
                             let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
                             store.record_execution(&execution, duration_us, &config.automation);
-                            if let Ok(effects) = &execution.outcome {
-                                dispatch_effects(store, stdin, &config.automation, effects.clone(), &mut next_request_id, &mut pending).await?;
+                            if let Ok(transition) = &execution.outcome {
+                                dispatch_effects(store, stdin, &config.automation, transition.outputs.clone(), &mut next_request_id, &mut pending).await?;
                             }
+                            reset_timer_sleep(&mut timer_sleep, engine, store);
                         } else if event.service == "group_value_response"
                             && let Ok(observation) = event.to_input_observation(binding.endpoint.clone())
                             && let Err(error) = engine.observe_input(observation, store.now()) { tracing::warn!(target: "logiksmith", error = %error, "ignoring invalid passive input observation"); }
+                        reset_timer_sleep(&mut timer_sleep, engine, store);
                     }
                     Message::CommandResult(result) => {
                         if !pending.remove(&result.request_id) { return Err(HostError::UnknownRequest(result.request_id)); }
                         store.record_write_result(result.request_id, result.ok, result.error.clone());
+                        reset_timer_sleep(&mut timer_sleep, engine, store);
                     }
                     Message::Fatal(fatal) => return Err(HostError::BridgeFatal { code: fatal.code, message: fatal.message }),
                     _ => return Err(ProtocolError::Field("runtime", "unexpected bridge message".to_owned()).into()),
@@ -1621,9 +1929,15 @@ async fn run_session(
             }
             Some(request) = activations.recv() => {
                 apply_activation(engine, store, &mut active_logic_revision, request);
+                reset_timer_sleep(&mut timer_sleep, engine, store);
             }
             Some(request) = simulations.recv() => {
-                apply_simulation(engine, config, active_logic_revision, request);
+                apply_simulation(engine, store, config, active_logic_revision, request);
+                reset_timer_sleep(&mut timer_sleep, engine, store);
+            }
+            _ = &mut timer_sleep => {
+                drain_due_timers(engine, store, config, Some((&mut *stdin, &mut next_request_id, &mut pending))).await?;
+                reset_timer_sleep(&mut timer_sleep, engine, store);
             }
             signal = &mut interrupt => {
                 signal?;
@@ -1643,18 +1957,41 @@ fn apply_activation(
 ) {
     let source = request.source;
     let result = engine
-        .replace_logic(source.clone(), request.logic_hash)
-        .map(|_| ())
+        .activate_source(source.clone())
+        .map(|activation| {
+            let cancelled_timers = activation
+                .cancelled_timers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            if !activation.changed {
+                let result = ActivationResult {
+                    logic_revision: *active_logic_revision,
+                    cancelled_timers,
+                    changed: false,
+                };
+                return result;
+            }
+            *active_logic_revision = request.document_revision;
+            store.record_activation(
+                request.document_revision,
+                source,
+                &cancelled_timers,
+                &engine.snapshot(),
+            );
+            ActivationResult {
+                logic_revision: request.document_revision,
+                cancelled_timers,
+                changed: activation.changed,
+            }
+        })
         .map_err(|error| error.to_string());
-    if result.is_ok() {
-        *active_logic_revision = request.document_revision;
-        store.set_active_logic(request.document_revision, source);
-    }
     let _ = request.reply.send(result);
 }
 
 fn apply_simulation(
     engine: &Engine,
+    store: &DiagnosticStore,
     config: &RuntimeConfig,
     active_logic_revision: u64,
     request: SimulationRequest,
@@ -1665,11 +2002,17 @@ fn apply_simulation(
             current_revision: active_logic_revision,
         }
     } else {
-        match simulation_scenario(payload.clone(), &config.automation) {
-            Err(errors) => SimulationOutcome::Invalid(errors),
-            Ok(scenario) => {
-                let started = Instant::now();
-                match engine.simulate_input(scenario) {
+        let started = Instant::now();
+        if payload.trigger.trigger_type.as_deref() == Some("timer") {
+            match simulation_timer_scenario(
+                &payload,
+                &config.automation,
+                active_logic_revision,
+                engine.active_logic_revision(),
+                Some(engine.transient_state()),
+            ) {
+                Err(errors) => SimulationOutcome::Invalid(errors),
+                Ok(scenario) => match engine.simulate_timer(scenario) {
                     Ok(execution) => SimulationOutcome::Complete(diagnostics::simulation_response(
                         &execution,
                         u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -1679,11 +2022,102 @@ fn apply_simulation(
                     Err(error) => {
                         SimulationOutcome::Invalid(simulation_error_fields(&error, &payload))
                     }
-                }
+                },
+            }
+        } else {
+            match simulation_scenario(payload.clone(), &config.automation) {
+                Err(errors) => SimulationOutcome::Invalid(errors),
+                Ok(scenario) => match simulation_state(&payload, Some(engine.transient_state())) {
+                    Err(errors) => SimulationOutcome::Invalid(errors),
+                    Ok(state) => match simulation_pending_timers(
+                        &payload,
+                        Some(&engine.snapshot().pending_timers),
+                        active_logic_revision,
+                        engine.active_logic_revision(),
+                    ) {
+                        Err(errors) => SimulationOutcome::Invalid(errors),
+                        Ok(pending_timers) => match engine.simulate_input_with_state(
+                            scenario,
+                            state,
+                            pending_timers,
+                            store.now(),
+                        ) {
+                            Ok(execution) => {
+                                SimulationOutcome::Complete(diagnostics::simulation_response(
+                                    &execution,
+                                    u64::try_from(started.elapsed().as_micros())
+                                        .unwrap_or(u64::MAX),
+                                    active_logic_revision,
+                                    &config.automation,
+                                ))
+                            }
+                            Err(error) => SimulationOutcome::Invalid(simulation_error_fields(
+                                &error, &payload,
+                            )),
+                        },
+                    },
+                },
             }
         }
     };
     let _ = reply.send(outcome);
+}
+
+fn timer_wait(engine: &Engine, store: &DiagnosticStore) -> Duration {
+    engine
+        .next_timer_deadline()
+        .map(|deadline| Duration::from_millis(deadline.0.saturating_sub(store.now().0)))
+        .unwrap_or(Duration::from_secs(86_400))
+}
+
+fn reset_timer_sleep(
+    sleep: &mut std::pin::Pin<Box<time::Sleep>>,
+    engine: &Engine,
+    store: &DiagnosticStore,
+) {
+    sleep
+        .as_mut()
+        .reset(time::Instant::now() + timer_wait(engine, store));
+}
+
+async fn drain_due_timers(
+    engine: &mut Engine,
+    store: &DiagnosticStore,
+    config: &RuntimeConfig,
+    mut bridge: Option<(&mut ChildStdin, &mut u64, &mut HashSet<u64>)>,
+) -> Result<(), HostError> {
+    let now = store.now();
+    while engine
+        .next_timer_deadline()
+        .is_some_and(|deadline| deadline <= now)
+    {
+        let started = Instant::now();
+        let execution = match engine.process_next_due_timer(now) {
+            Ok(Some(execution)) => execution,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(target: "logiksmith", error = %error, "discarding invalid timer execution");
+                store.set_engine_snapshot(&engine.snapshot());
+                continue;
+            }
+        };
+        let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        store.record_execution(&execution, duration_us, &config.automation);
+        if let Some((stdin, next_request_id, pending)) = bridge.as_mut()
+            && let Ok(transition) = &execution.outcome
+        {
+            dispatch_effects(
+                store,
+                stdin,
+                &config.automation,
+                transition.outputs.clone(),
+                next_request_id,
+                pending,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 fn configure_message(config: &RuntimeConfig) -> Message {
@@ -1721,12 +2155,13 @@ async fn dispatch_effects(
     store: &DiagnosticStore,
     stdin: &mut ChildStdin,
     automation: &AutomationRuntime,
-    effects: Vec<Effect>,
+    effects: Vec<OutputEffect>,
     next_request_id: &mut u64,
     pending: &mut HashSet<u64>,
 ) -> Result<(), HostError> {
     for effect in effects {
-        let Effect::SetOutput { endpoint, value } = effect;
+        let endpoint = effect.endpoint;
+        let value = effect.value;
         let Some(destination) = automation.endpoint_to_address.get(&endpoint).copied() else {
             tracing::error!(target: "logiksmith", endpoint = %endpoint, "core returned an unresolved output effect");
             continue;
@@ -1826,5 +2261,29 @@ fn format_status(status: std::process::ExitStatus) -> String {
 impl fmt::Display for DptMessage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}.{:03}", self.major, self.subtype)
+    }
+}
+
+#[cfg(test)]
+mod milestone7_simulation_tests {
+    use super::*;
+
+    #[test]
+    fn simulated_timer_document_revisions_are_mapped_to_the_core_revision() {
+        let payload: SimulationPayload = serde_json::from_value(serde_json::json!({
+            "expected_logic_revision": 6,
+            "trigger": {},
+            "inputs": [],
+            "pending_timers": [{
+                "name": "off",
+                "scheduled_at_ms": 1000,
+                "due_at_ms": 6000,
+                "logic_revision": 6
+            }]
+        }))
+        .unwrap();
+
+        let timers = simulation_pending_timers(&payload, None, 6, u64::MAX).unwrap();
+        assert_eq!(timers[0].scheduled_logic_revision, u64::MAX);
     }
 }

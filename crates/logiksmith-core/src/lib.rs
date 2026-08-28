@@ -5,9 +5,11 @@
 //! active Lua program. Transport details such as KNX group addresses stay
 //! outside this crate.
 
-use std::{cell::Cell, error::Error, fmt, rc::Rc, str::FromStr};
+use std::{cell::Cell, collections::BTreeMap, error::Error, fmt, ops::Deref, rc::Rc, str::FromStr};
 
-use mlua::{HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Value as LuaValue, VmState};
+use mlua::{
+    Function, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Value as LuaValue, VmState,
+};
 
 /// Maximum UTF-8 source size accepted by the logic evaluator.
 pub const MAX_LOGIC_SOURCE_BYTES: usize = 64 * 1024;
@@ -38,6 +40,163 @@ impl EndpointName {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod milestone7_tests {
+    use super::*;
+
+    fn n(value: &str) -> EndpointName {
+        value.parse().unwrap()
+    }
+    fn t(value: &str) -> TimerName {
+        value.parse().unwrap()
+    }
+    fn endpoint(value: &str, direction: EndpointDirection, dpt: Dpt) -> Endpoint {
+        Endpoint::new(n(value), direction, dpt)
+    }
+    fn engine(source: &str) -> Engine {
+        Engine::new(EngineConfig::new(
+            vec![
+                endpoint("wall_switch", EndpointDirection::Input, Dpt::BOOL),
+                endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
+            ],
+            source,
+        ))
+    }
+    fn event(value: bool) -> InputEvent {
+        InputEvent::new(n("wall_switch"), TypedValue::bool(value))
+    }
+
+    #[test]
+    fn state_and_named_timers_round_trip_and_expire() {
+        let mut engine = engine(
+            r#"
+            function handle(event, input, meta, state)
+              if event.type == "input" and event.rising then
+                return { state = { count = (state.count or 0) + 1 }, outputs = { test_light = true }, timers = { dim = { after = seconds(2) }, off = { after = seconds(3) } } }
+              end
+              if event.type == "timer" and event.timer == "off" then
+                return { state = { done = true }, outputs = { test_light = false } }
+              end
+            end
+        "#,
+        );
+        engine.process_input(event(false), MonotonicMs(1)).unwrap();
+        let first = engine.process_input(event(true), MonotonicMs(10)).unwrap();
+        let transition = first.outcome.unwrap();
+        assert_eq!(transition.state["count"], StateValue::Integer(1));
+        assert_eq!(transition.timers.len(), 2);
+        assert_eq!(engine.pending_timers()[0].name, t("dim"));
+        assert_eq!(engine.next_timer_deadline(), Some(MonotonicMs(2010)));
+        assert!(
+            engine
+                .process_next_due_timer(MonotonicMs(2009))
+                .unwrap()
+                .is_none()
+        );
+        let _dim = engine
+            .process_next_due_timer(MonotonicMs(3010))
+            .unwrap()
+            .unwrap();
+        let timer = engine
+            .process_next_due_timer(MonotonicMs(3010))
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(timer.trigger, Trigger::Timer(TimerTrigger { ref name, scheduled_at: MonotonicMs(10), due_at: MonotonicMs(3010), fired_at: MonotonicMs(3010), .. }) if name == &t("off"))
+        );
+        assert_eq!(engine.state()["done"], StateValue::Bool(true));
+    }
+
+    #[test]
+    fn failed_transition_rolls_back_state_outputs_and_timers() {
+        let mut engine = engine(
+            r#"function handle() return { state = { value = { bad = true } }, outputs = { test_light = true }, timers = { off = { after = 2 } } } end"#,
+        );
+        let execution = engine.process_input(event(true), MonotonicMs(1)).unwrap();
+        assert!(matches!(
+            execution.outcome,
+            Err(LogicError::InvalidResult { .. })
+        ));
+        assert!(engine.state().is_empty());
+        assert!(engine.pending_timers().is_empty());
+    }
+
+    #[test]
+    fn read_only_views_reject_assignment_and_pairs() {
+        let mut bad_engine =
+            engine(r#"function handle(event, input, meta, state) event.x = 1 end"#);
+        let execution = bad_engine
+            .process_input(event(true), MonotonicMs(1))
+            .unwrap();
+        assert!(
+            matches!(execution.outcome, Err(LogicError::Runtime { message, .. }) if message.contains(READ_ONLY_ARGUMENT_MARKER))
+        );
+        let mut engine2 = engine(
+            r#"function handle(event, input, meta, state) local seen = 0 for k,v in pairs(meta) do seen = seen + 1 end local k,v = next(meta) assert(k == "wall_switch") return { state = { seen = seen } } end"#,
+        );
+        let execution = engine2.process_input(event(true), MonotonicMs(1)).unwrap();
+        assert!(execution.outcome.is_ok(), "{:?}", execution.outcome);
+    }
+
+    #[test]
+    fn duration_helpers_accept_fractional_values() {
+        let mut engine = engine(
+            r#"function handle() return { timers = { off = { after = seconds(1.5) } } } end"#,
+        );
+        engine.process_input(event(true), MonotonicMs(4)).unwrap();
+        assert_eq!(engine.pending_timers()[0].due_at, MonotonicMs(1504));
+    }
+
+    #[test]
+    fn timer_replacement_cancellation_and_activation_are_atomic() {
+        let mut engine = engine(
+            r#"function handle() return { timers = { off = { after = 100 }, dim = { after = 200 } } } end"#,
+        );
+        engine.process_input(event(true), MonotonicMs(10)).unwrap();
+        engine.process_input(event(false), MonotonicMs(20)).unwrap();
+        assert_eq!(engine.pending_timers().len(), 2);
+        let cancelled = engine
+            .activate_source(r#"function handle() return nil end"#)
+            .unwrap();
+        assert_eq!(cancelled.cancelled_timers, vec![t("dim"), t("off")]);
+        assert!(engine.pending_timers().is_empty());
+        let same = engine
+            .activate_source(r#"function handle() return nil end"#)
+            .unwrap();
+        assert!(!same.changed);
+    }
+
+    #[test]
+    fn timer_simulation_does_not_mutate_live_state() {
+        let mut engine = engine(
+            r#"function handle(event, input, meta, state) if event.type == "input" then return { state = { count = 1 }, timers = { off = { after = 10 } } } end return { state = { count = 2 } } end"#,
+        );
+        engine.process_input(event(true), MonotonicMs(10)).unwrap();
+        let before = engine.snapshot();
+        let simulation = engine
+            .simulate_timer(TimerSimulationScenario {
+                timer: t("off"),
+                fired_at: MonotonicMs(25),
+                inputs: vec![SimulationInput {
+                    endpoint: n("wall_switch"),
+                    value: Some(TypedValue::bool(true)),
+                    valid: true,
+                    age_ms: Some(15),
+                }],
+                state: before.state.clone(),
+                pending_timers: before.pending_timers.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            simulation.state_after["count"],
+            StateValue::Integer(2),
+            "{:?}",
+            simulation.outcome
+        );
+        assert_eq!(engine.snapshot(), before);
     }
 }
 
@@ -338,17 +497,30 @@ impl InputObservation {
 
 /// A logical output effect for the host to execute.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Effect {
-    SetOutput {
-        endpoint: EndpointName,
-        value: TypedValue,
-    },
+pub struct OutputEffect {
+    pub endpoint: EndpointName,
+    pub value: TypedValue,
 }
 
+impl OutputEffect {
+    pub fn new(endpoint: EndpointName, value: TypedValue) -> Self {
+        Self { endpoint, value }
+    }
+}
+
+/// Compatibility alias for the Milestone 5 output name.
+pub type Effect = OutputEffect;
+
 /// A host-provided monotonic timestamp retained as a small transport-neutral
-/// value for desktop diagnostics. The Lua milestone does not schedule work.
+/// value for core-owned timer deadlines and desktop diagnostics.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct MonotonicMs(pub u64);
+
+impl MonotonicMs {
+    pub fn checked_add(self, milliseconds: u32) -> Option<Self> {
+        self.0.checked_add(u64::from(milliseconds)).map(Self)
+    }
+}
 
 /// A deterministic revision derived from the exact source bytes.
 ///
@@ -578,6 +750,11 @@ pub enum EventError {
         previous: MonotonicMs,
         current: MonotonicMs,
     },
+    StaleTimer {
+        timer: TimerName,
+        scheduled_logic_revision: LogicRevision,
+        active_logic_revision: LogicRevision,
+    },
 }
 
 impl fmt::Display for EventError {
@@ -601,6 +778,14 @@ impl fmt::Display for EventError {
             Self::TimeWentBackwards { previous, current } => write!(
                 formatter,
                 "event time {current:?} is earlier than the last accepted time {previous:?}"
+            ),
+            Self::StaleTimer {
+                timer,
+                scheduled_logic_revision,
+                active_logic_revision,
+            } => write!(
+                formatter,
+                "timer {timer} belongs to stale logic revision {scheduled_logic_revision}; active revision is {active_logic_revision}"
             ),
         }
     }
@@ -635,6 +820,17 @@ pub struct SimulationScenario {
     pub inputs: Vec<SimulationInput>,
 }
 
+/// A pending timer supplied to a timer simulation. The value is deliberately
+/// a plain snapshot so simulation cannot borrow or mutate the live engine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimerSimulationScenario {
+    pub timer: TimerName,
+    pub fired_at: MonotonicMs,
+    pub inputs: Vec<SimulationInput>,
+    pub state: TransientState,
+    pub pending_timers: Vec<PendingTimer>,
+}
+
 /// Errors caused by a malformed browser-supplied simulation scenario.
 ///
 /// Lua failures are deliberately not represented here: they are contained in
@@ -666,6 +862,18 @@ pub enum SimulationError {
     TriggerAgeMismatch {
         endpoint: EndpointName,
         actual: Option<u64>,
+    },
+    UnknownTimer(TimerName),
+    DuplicateTimer(TimerName),
+    TimerRevisionMismatch {
+        timer: TimerName,
+        scheduled: LogicRevision,
+        active: LogicRevision,
+    },
+    InvalidState(StateError),
+    TimeWentBackwards {
+        previous: MonotonicMs,
+        current: MonotonicMs,
     },
 }
 
@@ -728,6 +936,24 @@ impl fmt::Display for SimulationError {
                 formatter,
                 "simulation trigger {endpoint} must have age 0, got {actual:?}"
             ),
+            Self::UnknownTimer(timer) => write!(formatter, "unknown simulation timer {timer}"),
+            Self::DuplicateTimer(timer) => write!(
+                formatter,
+                "simulation timer {timer} was supplied more than once"
+            ),
+            Self::TimerRevisionMismatch {
+                timer,
+                scheduled,
+                active,
+            } => write!(
+                formatter,
+                "simulation timer {timer} has revision {scheduled}, expected active revision {active}"
+            ),
+            Self::InvalidState(error) => error.fmt(formatter),
+            Self::TimeWentBackwards { previous, current } => write!(
+                formatter,
+                "simulation time {current:?} is earlier than {previous:?}"
+            ),
         }
     }
 }
@@ -755,13 +981,247 @@ pub struct InputSnapshot {
     pub age_ms: Option<u64>,
 }
 
+/// A distinct timer identity. Timer names intentionally use the same lexical
+/// grammar as endpoint names while remaining a separate type.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TimerName(String);
+
+pub type TimerNameError = EndpointNameError;
+
+impl TimerName {
+    pub fn new(value: impl Into<String>) -> Result<Self, EndpointNameError> {
+        let value = value.into();
+        validate_endpoint_name(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn parse(value: &str) -> Result<Self, EndpointNameError> {
+        value.parse()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for TimerName {
+    type Err = EndpointNameError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for TimerName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Bounded scalar values carried by the block's transient state.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StateValue {
+    Bool(bool),
+    Integer(i64),
+    Number(f64),
+    String(String),
+}
+
+// NaN is rejected at every conversion boundary. Keeping Eq on this public
+// value makes snapshots and execution records convenient to compare.
+impl Eq for StateValue {}
+
+pub type TransientState = BTreeMap<String, StateValue>;
+pub type StatePatch = BTreeMap<String, StateValue>;
+
+impl StateValue {
+    pub fn validate(&self, key: &str) -> Result<(), StateError> {
+        validate_state_entry(key, self)
+    }
+}
+
+pub fn validate_state(state: &TransientState) -> Result<(), StateError> {
+    validate_state_map(state)
+}
+
+pub const MAX_STATE_ENTRIES: usize = 64;
+pub const MAX_STATE_KEY_BYTES: usize = 64;
+pub const MAX_STATE_STRING_BYTES: usize = 1024;
+pub const MAX_STATE_TOTAL_BYTES: usize = 16 * 1024;
+pub const MAX_PENDING_TIMERS: usize = 32;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StateError {
+    TooManyEntries {
+        actual: usize,
+        maximum: usize,
+    },
+    KeyTooLarge {
+        key: String,
+        actual: usize,
+        maximum: usize,
+    },
+    EmptyKey,
+    StringTooLarge {
+        key: String,
+        actual: usize,
+        maximum: usize,
+    },
+    TotalTooLarge {
+        actual: usize,
+        maximum: usize,
+    },
+    NonFiniteNumber {
+        key: String,
+    },
+}
+
+impl fmt::Display for StateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyEntries { actual, maximum } => write!(
+                formatter,
+                "state has {actual} entries; maximum is {maximum}"
+            ),
+            Self::KeyTooLarge {
+                key,
+                actual,
+                maximum,
+            } => write!(
+                formatter,
+                "state key {key:?} is {actual} bytes; maximum is {maximum}"
+            ),
+            Self::EmptyKey => formatter.write_str("state keys must not be empty"),
+            Self::StringTooLarge {
+                key,
+                actual,
+                maximum,
+            } => write!(
+                formatter,
+                "state string {key:?} is {actual} bytes; maximum is {maximum}"
+            ),
+            Self::TotalTooLarge { actual, maximum } => {
+                write!(formatter, "state uses {actual} bytes; maximum is {maximum}")
+            }
+            Self::NonFiniteNumber { key } => {
+                write!(formatter, "state number {key:?} must be finite")
+            }
+        }
+    }
+}
+
+impl Error for StateError {}
+
+/// An operation committed against one named timer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TimerAction {
+    Scheduled {
+        after_ms: u32,
+        due_at: MonotonicMs,
+    },
+    Replaced {
+        previous_due_at: MonotonicMs,
+        after_ms: u32,
+        due_at: MonotonicMs,
+    },
+    Cancelled {
+        previous_due_at: MonotonicMs,
+    },
+    CancelNoop,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimerEffect {
+    pub name: TimerName,
+    pub action: TimerAction,
+}
+
+/// A validated transition returned by one handler call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Transition {
+    pub state: StatePatch,
+    pub outputs: Vec<OutputEffect>,
+    pub timers: Vec<TimerEffect>,
+}
+
+impl Default for Transition {
+    fn default() -> Self {
+        Self {
+            state: BTreeMap::new(),
+            outputs: Vec::new(),
+            timers: Vec::new(),
+        }
+    }
+}
+
+impl Transition {
+    pub fn is_empty(&self) -> bool {
+        self.state.is_empty() && self.outputs.is_empty() && self.timers.is_empty()
+    }
+}
+
+/// Trigger for one semantic execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Trigger {
+    Input(InputTrigger),
+    Timer(TimerTrigger),
+}
+
+/// Compatibility view for callers that only handle input executions. Timer
+/// callers should match [`Trigger`] explicitly.
+impl Deref for Trigger {
+    type Target = InputTrigger;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Input(trigger) => trigger,
+            Self::Timer(_) => panic!("timer trigger does not have input fields"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimerTrigger {
+    pub name: TimerName,
+    pub scheduled_at: MonotonicMs,
+    pub due_at: MonotonicMs,
+    pub fired_at: MonotonicMs,
+    pub scheduled_logic_revision: LogicRevision,
+}
+
+/// A timer projected in a live or simulated snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTimer {
+    pub name: TimerName,
+    pub scheduled_at: MonotonicMs,
+    pub due_at: MonotonicMs,
+    pub scheduled_logic_revision: LogicRevision,
+}
+
+impl PendingTimer {
+    pub fn logic_revision(&self) -> LogicRevision {
+        self.scheduled_logic_revision
+    }
+}
+
+/// Result of a successful source activation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceActivation {
+    pub logic_revision: LogicRevision,
+    pub cancelled_timers: Vec<TimerName>,
+    pub changed: bool,
+}
+
 /// One complete semantic execution, including contained Lua failures.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Execution {
     pub logic_revision: LogicRevision,
-    pub trigger: InputTrigger,
+    pub trigger: Trigger,
     pub inputs: Vec<InputSnapshot>,
-    pub outcome: Result<Vec<Effect>, LogicError>,
+    pub state_before: TransientState,
+    pub state_after: TransientState,
+    pub pending_timers: Vec<PendingTimer>,
+    pub outcome: Result<Transition, LogicError>,
 }
 
 /// A source-backed portable endpoint engine.
@@ -822,6 +1282,8 @@ pub struct EngineSnapshot {
     /// Known values in configured input declaration order. Unknown values are
     /// absent, rather than being represented as `false` or `0`.
     pub known_inputs: Vec<(EndpointName, TypedValue)>,
+    pub state: TransientState,
+    pub pending_timers: Vec<PendingTimer>,
 }
 
 /// The core event-to-Lua-to-effect engine.
@@ -829,6 +1291,8 @@ pub struct EngineSnapshot {
 pub struct Engine {
     config: EngineConfig,
     inputs: Vec<InputState>,
+    state: TransientState,
+    pending_timers: BTreeMap<TimerName, PendingTimer>,
     last_accepted_at: Option<MonotonicMs>,
 }
 
@@ -851,6 +1315,8 @@ impl Engine {
         Ok(Self {
             config,
             inputs,
+            state: BTreeMap::new(),
+            pending_timers: BTreeMap::new(),
             last_accepted_at: None,
         })
     }
@@ -879,7 +1345,25 @@ impl Engine {
         EngineSnapshot {
             logic_revision: self.active_logic_revision(),
             known_inputs: self.known_input_values(),
+            state: self.state.clone(),
+            pending_timers: self.pending_timers(),
         }
+    }
+
+    pub fn state(&self) -> &TransientState {
+        &self.state
+    }
+
+    pub fn transient_state(&self) -> &TransientState {
+        self.state()
+    }
+
+    pub fn pending_timers(&self) -> Vec<PendingTimer> {
+        self.pending_timers.values().cloned().collect()
+    }
+
+    pub fn next_timer_deadline(&self) -> Option<MonotonicMs> {
+        self.pending_timers.values().map(|timer| timer.due_at).min()
     }
 
     /// Returns known values in configured input declaration order.
@@ -912,10 +1396,50 @@ impl Engine {
         &mut self,
         source: impl Into<String>,
     ) -> Result<LogicRevision, LogicError> {
+        Ok(self.activate_source(source)?.logic_revision)
+    }
+
+    /// Validates and activates source, preserving state and cancelling timers
+    /// from a previous revision as one atomic operation.
+    pub fn activate_source(
+        &mut self,
+        source: impl Into<String>,
+    ) -> Result<SourceActivation, LogicError> {
         let program = LogicProgram::try_new(source)?;
         let revision = program.revision;
+        if revision == self.active_logic_revision() {
+            return Ok(SourceActivation {
+                logic_revision: revision,
+                cancelled_timers: Vec::new(),
+                changed: false,
+            });
+        }
+        let cancelled_timers = self.pending_timers.keys().cloned().collect();
+        self.pending_timers.clear();
         self.config.logic = program;
-        Ok(revision)
+        Ok(SourceActivation {
+            logic_revision: revision,
+            cancelled_timers,
+            changed: true,
+        })
+    }
+
+    pub fn activate_logic_source(
+        &mut self,
+        source: impl Into<String>,
+    ) -> Result<SourceActivation, LogicError> {
+        self.activate_source(source)
+    }
+
+    pub fn activate(&mut self, source: impl Into<String>) -> Result<SourceActivation, LogicError> {
+        self.activate_source(source)
+    }
+
+    pub fn replace_source_with_cancellations(
+        &mut self,
+        source: impl Into<String>,
+    ) -> Result<SourceActivation, LogicError> {
+        self.activate_source(source)
     }
 
     /// Alias emphasizing that this replaces the active logic block.
@@ -941,8 +1465,27 @@ impl Engine {
                 line: None,
             });
         }
-        self.config.logic = program;
+        if program.revision != self.active_logic_revision() {
+            self.pending_timers.clear();
+            self.config.logic = program;
+        }
         Ok(())
+    }
+
+    pub fn replace_logic_with_cancellations(
+        &mut self,
+        source: impl Into<String>,
+        revision: LogicRevision,
+    ) -> Result<SourceActivation, LogicError> {
+        let source = source.into();
+        let program = LogicProgram::try_new(source.clone())?;
+        if program.revision != revision {
+            return Err(LogicError::Load {
+                message: "logic source revision does not match its source bytes".to_owned(),
+                line: None,
+            });
+        }
+        self.activate_source(source)
     }
 
     /// Records a value-carrying observation without invoking Lua.
@@ -975,18 +1518,117 @@ impl Engine {
         };
         let trigger = input_trigger(event.endpoint, event.value, previous);
         let snapshots = self.input_snapshots(now);
+        let state_before = self.state.clone();
         let outcome = execute_logic(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
-            &trigger,
+            &Trigger::Input(trigger.clone()),
+            &state_before,
+            &self.pending_timers,
+            now,
         );
+        let mut state_after = state_before.clone();
+        let mut pending_timers = self.pending_timers();
+        if let Ok(transition) = &outcome {
+            state_after = merge_state(&state_before, &transition.state)
+                .expect("validated transition state must merge");
+            let candidate = apply_timer_effects(
+                &self.pending_timers,
+                &transition.timers,
+                now,
+                self.active_logic_revision(),
+            );
+            pending_timers = candidate.values().cloned().collect();
+            self.state = state_after.clone();
+            self.pending_timers = candidate;
+        }
         Ok(Execution {
             logic_revision: self.active_logic_revision(),
-            trigger,
+            trigger: Trigger::Input(trigger),
             inputs: snapshots,
+            state_before,
+            state_after,
+            pending_timers,
             outcome,
         })
+    }
+
+    /// Consumes and evaluates at most one due timer. The timer is removed
+    /// before Lua is called, so failure does not cause an automatic retry.
+    pub fn process_next_due_timer(
+        &mut self,
+        now: MonotonicMs,
+    ) -> Result<Option<Execution>, EventError> {
+        self.accept_time(now)?;
+        let Some((name, timer)) = self
+            .pending_timers
+            .values()
+            .filter(|timer| timer.due_at <= now)
+            .min_by(|left, right| {
+                left.due_at
+                    .cmp(&right.due_at)
+                    .then_with(|| left.name.cmp(&right.name))
+            })
+            .map(|timer| (timer.name.clone(), timer.clone()))
+        else {
+            return Ok(None);
+        };
+        self.pending_timers.remove(&name);
+        if timer.scheduled_logic_revision != self.active_logic_revision() {
+            return Err(EventError::StaleTimer {
+                timer: name,
+                scheduled_logic_revision: timer.scheduled_logic_revision,
+                active_logic_revision: self.active_logic_revision(),
+            });
+        }
+        let trigger = TimerTrigger {
+            name,
+            scheduled_at: timer.scheduled_at,
+            due_at: timer.due_at,
+            fired_at: now,
+            scheduled_logic_revision: timer.scheduled_logic_revision,
+        };
+        let public_trigger = Trigger::Timer(trigger.clone());
+        let snapshots = self.input_snapshots(now);
+        let state_before = self.state.clone();
+        let outcome = execute_logic(
+            &self.config.endpoints,
+            &self.config.logic,
+            &snapshots,
+            &public_trigger,
+            &state_before,
+            &self.pending_timers,
+            now,
+        );
+        let mut state_after = state_before.clone();
+        let mut pending_timers = self.pending_timers();
+        if let Ok(transition) = &outcome {
+            state_after = merge_state(&state_before, &transition.state)
+                .expect("validated transition state must merge");
+            let candidate = apply_timer_effects(
+                &self.pending_timers,
+                &transition.timers,
+                now,
+                self.active_logic_revision(),
+            );
+            pending_timers = candidate.values().cloned().collect();
+            self.state = state_after.clone();
+            self.pending_timers = candidate;
+        }
+        Ok(Some(Execution {
+            logic_revision: self.active_logic_revision(),
+            trigger: public_trigger,
+            inputs: snapshots,
+            state_before,
+            state_after,
+            pending_timers,
+            outcome,
+        }))
+    }
+
+    pub fn process_due_timer(&mut self, now: MonotonicMs) -> Result<Option<Execution>, EventError> {
+        self.process_next_due_timer(now)
     }
 
     /// Evaluates the active source against a complete browser-supplied input
@@ -1093,16 +1735,129 @@ impl Engine {
             scenario.trigger.value,
             scenario.trigger.previous,
         );
+        let state_before = self.state.clone();
+        let outcome = execute_logic(
+            &self.config.endpoints,
+            &self.config.logic,
+            &snapshots,
+            &Trigger::Input(trigger.clone()),
+            &state_before,
+            &self.pending_timers,
+            MonotonicMs(0),
+        );
+        let state_after = outcome
+            .as_ref()
+            .ok()
+            .and_then(|transition| merge_state(&state_before, &transition.state).ok())
+            .unwrap_or_else(|| state_before.clone());
+        let pending_timers = outcome
+            .as_ref()
+            .ok()
+            .map(|transition| {
+                apply_timer_effects(
+                    &self.pending_timers,
+                    &transition.timers,
+                    MonotonicMs(0),
+                    self.active_logic_revision(),
+                )
+                .values()
+                .cloned()
+                .collect()
+            })
+            .unwrap_or_else(|| self.pending_timers());
+        Ok(Execution {
+            logic_revision: self.active_logic_revision(),
+            trigger: Trigger::Input(trigger),
+            inputs: snapshots,
+            state_before,
+            state_after,
+            pending_timers,
+            outcome,
+        })
+    }
+
+    /// Simulates an input using explicit copied state, timers, and execution
+    /// time. This is the extension point used by the desktop simulation form.
+    pub fn simulate_input_with_state(
+        &self,
+        scenario: SimulationScenario,
+        state: TransientState,
+        pending_timers: Vec<PendingTimer>,
+        now: MonotonicMs,
+    ) -> Result<Execution, SimulationError> {
+        validate_state_map(&state).map_err(SimulationError::InvalidState)?;
+        validate_pending_timers(&pending_timers, self.active_logic_revision())?;
+        let execution = self.simulate_input_against(scenario, state, pending_timers, now)?;
+        Ok(execution)
+    }
+
+    pub fn simulate_timer(
+        &self,
+        scenario: TimerSimulationScenario,
+    ) -> Result<Execution, SimulationError> {
+        validate_state_map(&scenario.state).map_err(SimulationError::InvalidState)?;
+        let mut supplied = BTreeMap::new();
+        for timer in scenario.pending_timers {
+            if supplied.insert(timer.name.clone(), timer.clone()).is_some() {
+                return Err(SimulationError::DuplicateTimer(timer.name));
+            }
+        }
+        validate_pending_timer_map(&supplied, self.active_logic_revision())?;
+        let timer = supplied
+            .remove(&scenario.timer)
+            .ok_or_else(|| SimulationError::UnknownTimer(scenario.timer.clone()))?;
+        if timer.scheduled_logic_revision != self.active_logic_revision() {
+            return Err(SimulationError::TimerRevisionMismatch {
+                timer: scenario.timer,
+                scheduled: timer.scheduled_logic_revision,
+                active: self.active_logic_revision(),
+            });
+        }
+        let snapshots = self.validate_and_build_snapshots(&scenario.inputs)?;
+        let trigger = Trigger::Timer(TimerTrigger {
+            name: timer.name,
+            scheduled_at: timer.scheduled_at,
+            due_at: timer.due_at,
+            fired_at: scenario.fired_at,
+            scheduled_logic_revision: timer.scheduled_logic_revision,
+        });
+        let state_before = scenario.state;
         let outcome = execute_logic(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
             &trigger,
+            &state_before,
+            &supplied,
+            scenario.fired_at,
         );
+        let state_after = outcome
+            .as_ref()
+            .ok()
+            .and_then(|transition| merge_state(&state_before, &transition.state).ok())
+            .unwrap_or_else(|| state_before.clone());
+        let pending_timers = outcome
+            .as_ref()
+            .ok()
+            .map(|transition| {
+                apply_timer_effects(
+                    &supplied,
+                    &transition.timers,
+                    scenario.fired_at,
+                    self.active_logic_revision(),
+                )
+                .values()
+                .cloned()
+                .collect()
+            })
+            .unwrap_or_else(|| supplied.values().cloned().collect());
         Ok(Execution {
             logic_revision: self.active_logic_revision(),
             trigger,
             inputs: snapshots,
+            state_before,
+            state_after,
+            pending_timers,
             outcome,
         })
     }
@@ -1167,6 +1922,154 @@ impl Engine {
                         valid: state.value.is_some() && state.observed_at.is_some(),
                         age_ms,
                     }
+                })
+            })
+            .collect()
+    }
+
+    fn simulate_input_against(
+        &self,
+        scenario: SimulationScenario,
+        state: TransientState,
+        pending_timers: Vec<PendingTimer>,
+        now: MonotonicMs,
+    ) -> Result<Execution, SimulationError> {
+        let snapshots = self.validate_and_build_snapshots(&scenario.inputs)?;
+        let trigger_index = self
+            .config
+            .endpoints
+            .iter()
+            .position(|endpoint| endpoint.name == scenario.trigger.endpoint)
+            .ok_or_else(|| SimulationError::UnknownEndpoint(scenario.trigger.endpoint.clone()))?;
+        let endpoint = &self.config.endpoints[trigger_index];
+        if endpoint.direction != EndpointDirection::Input {
+            return Err(SimulationError::EndpointNotInput {
+                endpoint: scenario.trigger.endpoint.clone(),
+                actual: endpoint.direction,
+            });
+        }
+        validate_simulation_value(endpoint, scenario.trigger.value)?;
+        if let Some(previous) = scenario.trigger.previous {
+            validate_simulation_value(endpoint, previous)?;
+        }
+        let supplied = snapshots
+            .iter()
+            .find(|input| input.endpoint == scenario.trigger.endpoint)
+            .ok_or_else(|| SimulationError::MissingInput(scenario.trigger.endpoint.clone()))?;
+        if !supplied.valid {
+            return Err(SimulationError::MissingValue(
+                scenario.trigger.endpoint.clone(),
+            ));
+        }
+        if supplied.value != Some(scenario.trigger.value) {
+            return Err(SimulationError::TriggerValueMismatch {
+                endpoint: scenario.trigger.endpoint.clone(),
+                expected: scenario.trigger.value,
+                actual: supplied.value.unwrap_or(scenario.trigger.value),
+            });
+        }
+        if supplied.age_ms != Some(0) {
+            return Err(SimulationError::TriggerAgeMismatch {
+                endpoint: scenario.trigger.endpoint.clone(),
+                actual: supplied.age_ms,
+            });
+        }
+        let trigger = input_trigger(
+            scenario.trigger.endpoint,
+            scenario.trigger.value,
+            scenario.trigger.previous,
+        );
+        let trigger_kind = Trigger::Input(trigger.clone());
+        let state_before = state;
+        let mut timer_map = BTreeMap::new();
+        for timer in pending_timers {
+            let timer_name = timer.name.clone();
+            if timer_map.insert(timer_name.clone(), timer).is_some() {
+                return Err(SimulationError::DuplicateTimer(timer_name));
+            }
+        }
+        let outcome = execute_logic(
+            &self.config.endpoints,
+            &self.config.logic,
+            &snapshots,
+            &trigger_kind,
+            &state_before,
+            &timer_map,
+            now,
+        );
+        let state_after = outcome
+            .as_ref()
+            .ok()
+            .and_then(|transition| merge_state(&state_before, &transition.state).ok())
+            .unwrap_or_else(|| state_before.clone());
+        let pending_timers = outcome
+            .as_ref()
+            .ok()
+            .map(|transition| {
+                apply_timer_effects(
+                    &timer_map,
+                    &transition.timers,
+                    now,
+                    self.active_logic_revision(),
+                )
+                .values()
+                .cloned()
+                .collect()
+            })
+            .unwrap_or_else(|| timer_map.values().cloned().collect());
+        Ok(Execution {
+            logic_revision: self.active_logic_revision(),
+            trigger: trigger_kind,
+            inputs: snapshots,
+            state_before,
+            state_after,
+            pending_timers,
+            outcome,
+        })
+    }
+
+    fn validate_and_build_snapshots(
+        &self,
+        inputs: &[SimulationInput],
+    ) -> Result<Vec<InputSnapshot>, SimulationError> {
+        let mut supplied: Vec<Option<&SimulationInput>> = vec![None; self.config.endpoints.len()];
+        for input in inputs {
+            let Some(index) = self
+                .config
+                .endpoints
+                .iter()
+                .position(|endpoint| endpoint.name == input.endpoint)
+            else {
+                return Err(SimulationError::UnknownEndpoint(input.endpoint.clone()));
+            };
+            let endpoint = &self.config.endpoints[index];
+            if endpoint.direction != EndpointDirection::Input {
+                return Err(SimulationError::EndpointNotInput {
+                    endpoint: input.endpoint.clone(),
+                    actual: endpoint.direction,
+                });
+            }
+            if supplied[index].is_some() {
+                return Err(SimulationError::DuplicateInput(input.endpoint.clone()));
+            }
+            validate_simulation_input(endpoint, input)?;
+            supplied[index] = Some(input);
+        }
+        self.config
+            .endpoints
+            .iter()
+            .enumerate()
+            .filter_map(|(index, endpoint)| {
+                (endpoint.direction == EndpointDirection::Input).then(|| {
+                    supplied[index]
+                        .ok_or_else(|| SimulationError::MissingInput(endpoint.name.clone()))
+                        .map(|input| InputSnapshot {
+                            endpoint: endpoint.name.clone(),
+                            dpt: endpoint.dpt,
+                            value: input.value,
+                            valid: input.valid,
+                            age_ms: input.age_ms,
+                        })
                 })
             })
             .collect()
@@ -1281,7 +2184,7 @@ fn restricted_environment(lua: &Lua) -> Result<Table, mlua::Error> {
     // dofile, loadfile, require, print, and collectgarbage are not copied into
     // the per-execution environment.
     const SAFE_BASE: &[&str] = &[
-        "assert", "error", "ipairs", "next", "pairs", "select", "tonumber", "tostring", "type",
+        "assert", "error", "ipairs", "pairs", "select", "tonumber", "tostring", "type",
     ];
     for name in SAFE_BASE {
         let value: LuaValue = globals.get(*name)?;
@@ -1291,7 +2194,135 @@ fn restricted_environment(lua: &Lua) -> Result<Table, mlua::Error> {
         let value: LuaValue = globals.get(name)?;
         environment.set(name, value)?;
     }
+    let builtin_next: Function = globals.get("next")?;
+    let safe_next = lua.create_function(
+        move |_lua, (table, key): (LuaValue, LuaValue)| -> Result<MultiValue, mlua::Error> {
+            if let LuaValue::Table(table) = &table
+                && let Some(metatable) = table.metatable()
+                && metatable
+                    .get::<bool>("__logiksmith_readonly")
+                    .unwrap_or(false)
+            {
+                let next_fn: Function = metatable.get("__logiksmith_next")?;
+                return next_fn.call((key,));
+            }
+            builtin_next.call((table, key))
+        },
+    )?;
+    environment.set("next", safe_next)?;
+    environment.set("seconds", duration_helper(lua, 1_000)?)?;
+    environment.set("minutes", duration_helper(lua, 60_000)?)?;
+    environment.set("hours", duration_helper(lua, 3_600_000)?)?;
+    environment.set("days", duration_helper(lua, 86_400_000)?)?;
     Ok(environment)
+}
+
+const READ_ONLY_ARGUMENT_MARKER: &str = "logiksmith read-only argument";
+
+fn duration_helper(lua: &Lua, factor: u64) -> Result<Function, mlua::Error> {
+    lua.create_function(move |_lua, value: LuaValue| {
+        let number = match value {
+            LuaValue::Integer(value) => value as f64,
+            LuaValue::Number(value) => value,
+            other => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "duration helper expects a positive finite number, got {}",
+                    other.type_name()
+                )));
+            }
+        };
+        if !number.is_finite() || number <= 0.0 {
+            return Err(mlua::Error::RuntimeError(
+                "duration helper expects a positive finite number".to_owned(),
+            ));
+        }
+        let milliseconds = number * factor as f64;
+        if !milliseconds.is_finite()
+            || milliseconds < 1.0
+            || milliseconds.fract() != 0.0
+            || milliseconds > u32::MAX as f64
+        {
+            return Err(mlua::Error::RuntimeError(
+                "duration helper result must be a whole millisecond in range 1..=u32::MAX"
+                    .to_owned(),
+            ));
+        }
+        Ok(milliseconds as i64)
+    })
+}
+
+fn readonly_proxy(lua: &Lua, backing: Table) -> Result<Table, mlua::Error> {
+    let proxy = lua.create_table()?;
+    let metatable = lua.create_table()?;
+    metatable.set("__logiksmith_readonly", true)?;
+    metatable.set("__index", backing.clone())?;
+    metatable.set(
+        "__newindex",
+        lua.create_function(
+            |_, (_table, _key, _value): (LuaValue, LuaValue, LuaValue)| {
+                Err::<(), _>(mlua::Error::RuntimeError(
+                    READ_ONLY_ARGUMENT_MARKER.to_owned(),
+                ))
+            },
+        )?,
+    )?;
+
+    let pairs_backing = backing.clone();
+    metatable.set(
+        "__pairs",
+        lua.create_function(move |lua, ()| {
+            let entries = pairs_backing
+                .pairs::<LuaValue, LuaValue>()
+                .collect::<Result<Vec<_>, _>>()?;
+            let index = Rc::new(Cell::new(0usize));
+            let iterator =
+                lua.create_function(move |_lua, (_state, _key): (LuaValue, LuaValue)| {
+                    let current = index.get();
+                    if current >= entries.len() {
+                        return Ok(MultiValue::from_vec(vec![LuaValue::Nil]));
+                    }
+                    index.set(current + 1);
+                    Ok(MultiValue::from_vec(vec![
+                        entries[current].0.clone(),
+                        entries[current].1.clone(),
+                    ]))
+                })?;
+            Ok((iterator, LuaValue::Nil, LuaValue::Nil))
+        })?,
+    )?;
+
+    let next_backing = backing;
+    metatable.set(
+        "__logiksmith_next",
+        lua.create_function(move |_lua, key: LuaValue| {
+            let entries = next_backing
+                .pairs::<LuaValue, LuaValue>()
+                .collect::<Result<Vec<_>, _>>()?;
+            let index = if key.is_nil() {
+                Some(0)
+            } else {
+                entries
+                    .iter()
+                    .position(|(entry_key, _)| entry_key.equals(&key).unwrap_or(false))
+                    .map(|position| position + 1)
+            };
+            let Some(index) = index else {
+                return Err(mlua::Error::RuntimeError(
+                    "invalid key to 'next'".to_owned(),
+                ));
+            };
+            if index >= entries.len() {
+                Ok(MultiValue::from_vec(vec![LuaValue::Nil]))
+            } else {
+                Ok(MultiValue::from_vec(vec![
+                    entries[index].0.clone(),
+                    entries[index].1.clone(),
+                ]))
+            }
+        })?,
+    )?;
+    proxy.set_metatable(Some(metatable));
+    Ok(proxy)
 }
 
 fn install_instruction_hook(lua: &Lua) {
@@ -1347,8 +2378,11 @@ fn execute_logic(
     endpoints: &[Endpoint],
     program: &LogicProgram,
     snapshots: &[InputSnapshot],
-    trigger: &InputTrigger,
-) -> Result<Vec<Effect>, LogicError> {
+    trigger: &Trigger,
+    state: &TransientState,
+    pending_timers: &BTreeMap<TimerName, PendingTimer>,
+    now: MonotonicMs,
+) -> Result<Transition, LogicError> {
     // Validate size even though an active program was previously checked. It
     // keeps this boundary correct if a LogicProgram is constructed directly.
     check_source_size(&program.source)?;
@@ -1382,55 +2416,78 @@ fn execute_logic(
         }
     };
 
-    let event_table = lua
+    let event_backing = lua
         .create_table()
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
-    event_table
+    event_backing
         .set("type", "input")
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
-    event_table
-        .set("input", trigger.endpoint.as_str())
-        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
-    event_table
-        .set(
-            "value",
-            typed_value_to_lua(trigger.value).map_err(|message| LogicError::Runtime {
-                message,
-                line: None,
-            })?,
-        )
-        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
-    let previous = trigger
-        .previous
-        .map(typed_value_to_lua)
-        .transpose()
-        .map_err(|message| LogicError::Runtime {
-            message,
-            line: None,
-        })?
-        .unwrap_or(LuaValue::Nil);
-    event_table
-        .set("previous", previous)
-        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
-    event_table
-        .set("changed", trigger.changed)
-        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
-    event_table
-        .set("rising", trigger.rising)
-        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
-    event_table
-        .set("falling", trigger.falling)
-        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    match trigger {
+        Trigger::Input(trigger) => {
+            event_backing
+                .set("input", trigger.endpoint.as_str())
+                .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+            event_backing
+                .set(
+                    "value",
+                    typed_value_to_lua(trigger.value).map_err(|message| LogicError::Runtime {
+                        message,
+                        line: None,
+                    })?,
+                )
+                .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+            event_backing
+                .set(
+                    "previous",
+                    trigger
+                        .previous
+                        .map(typed_value_to_lua)
+                        .transpose()
+                        .map_err(|message| LogicError::Runtime {
+                            message,
+                            line: None,
+                        })?
+                        .unwrap_or(LuaValue::Nil),
+                )
+                .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+            event_backing
+                .set("changed", trigger.changed)
+                .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+            event_backing
+                .set("rising", trigger.rising)
+                .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+            event_backing
+                .set("falling", trigger.falling)
+                .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+        }
+        Trigger::Timer(trigger) => {
+            event_backing
+                .set("type", "timer")
+                .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+            event_backing
+                .set("timer", trigger.name.as_str())
+                .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+            event_backing
+                .set("scheduled_at", trigger.scheduled_at.0)
+                .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+            event_backing
+                .set("due_at", trigger.due_at.0)
+                .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+            event_backing
+                .set("fired_at", trigger.fired_at.0)
+                .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+        }
+    }
 
-    let input_table = lua
+    let input_backing = lua
         .create_table()
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
-    let meta_table = lua
+    let meta_backing = lua
         .create_table()
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
     for snapshot in snapshots {
         if let Some(value) = snapshot.value {
-            input_table
+            input_backing
                 .set(
                     snapshot.endpoint.as_str(),
                     typed_value_to_lua(value).map_err(|message| LogicError::Runtime {
@@ -1440,24 +2497,47 @@ fn execute_logic(
                 )
                 .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
         }
-        let metadata = lua
+        let metadata_backing = lua
             .create_table()
             .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
-        metadata
+        metadata_backing
             .set("valid", snapshot.valid)
             .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
         if let Some(age_ms) = snapshot.age_ms {
-            metadata
+            metadata_backing
                 .set("age_ms", age_ms)
                 .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
         }
-        meta_table
+        let metadata = readonly_proxy(&lua, metadata_backing)
+            .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+        meta_backing
             .set(snapshot.endpoint.as_str(), metadata)
             .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
     }
 
+    let state_backing = lua
+        .create_table()
+        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    for (key, value) in state {
+        state_backing
+            .set(
+                key.as_str(),
+                state_value_to_lua(&lua, value)
+                    .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?,
+            )
+            .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    }
+    let event_table = readonly_proxy(&lua, event_backing)
+        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    let input_table = readonly_proxy(&lua, input_backing)
+        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    let meta_table = readonly_proxy(&lua, meta_backing)
+        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    let state_table = readonly_proxy(&lua, state_backing)
+        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+
     let returned: MultiValue = handle
-        .call((event_table, input_table, meta_table))
+        .call((event_table, input_table, meta_table, state_table))
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
     let mut returned = returned.into_iter();
     let result = returned.next().unwrap_or(LuaValue::Nil);
@@ -1467,7 +2547,7 @@ fn execute_logic(
             line: None,
         });
     }
-    convert_result(endpoints, result)
+    convert_result(endpoints, result, state, pending_timers, now)
 }
 
 fn typed_value_to_lua(value: TypedValue) -> Result<LuaValue, String> {
@@ -1480,9 +2560,67 @@ fn typed_value_to_lua(value: TypedValue) -> Result<LuaValue, String> {
     }
 }
 
-fn convert_result(endpoints: &[Endpoint], result: LuaValue) -> Result<Vec<Effect>, LogicError> {
+fn state_value_to_lua(lua: &Lua, value: &StateValue) -> Result<LuaValue, mlua::Error> {
+    match value {
+        StateValue::Bool(value) => Ok(LuaValue::Boolean(*value)),
+        StateValue::Integer(value) => Ok(LuaValue::Integer(*value)),
+        StateValue::Number(value) => Ok(LuaValue::Number(*value)),
+        StateValue::String(value) => Ok(LuaValue::String(lua.create_string(value)?)),
+    }
+}
+
+fn convert_state_value(key: &str, value: LuaValue) -> Result<StateValue, LogicError> {
+    let state_value = match value {
+        LuaValue::Boolean(value) => StateValue::Bool(value),
+        LuaValue::Integer(value) => StateValue::Integer(value),
+        LuaValue::Number(value) if value.is_finite() => StateValue::Number(value),
+        LuaValue::Number(_) => {
+            return Err(LogicError::InvalidResult {
+                message: format!("state value {key:?} must be finite"),
+                line: None,
+            });
+        }
+        LuaValue::String(value) => StateValue::String(
+            value
+                .to_str()
+                .map_err(|error| LogicError::InvalidResult {
+                    message: format!("state string {key:?} is not valid UTF-8: {error}"),
+                    line: None,
+                })?
+                .to_owned(),
+        ),
+        value => {
+            return Err(LogicError::InvalidResult {
+                message: format!(
+                    "state value {key:?} must be boolean, integer, finite number, or string, got {}",
+                    value.type_name()
+                ),
+                line: None,
+            });
+        }
+    };
+    validate_state_entry(key, &state_value).map_err(|error| LogicError::InvalidResult {
+        message: error.to_string(),
+        line: None,
+    })?;
+    Ok(state_value)
+}
+
+fn convert_result(
+    endpoints: &[Endpoint],
+    result: LuaValue,
+    current_state: &TransientState,
+    pending_timers: &BTreeMap<TimerName, PendingTimer>,
+    now: MonotonicMs,
+) -> Result<Transition, LogicError> {
     let result_table = match result {
-        LuaValue::Nil => return Ok(Vec::new()),
+        LuaValue::Nil => {
+            return Ok(Transition {
+                state: BTreeMap::new(),
+                outputs: Vec::new(),
+                timers: Vec::new(),
+            });
+        }
         LuaValue::Table(table) => table,
         value => {
             return Err(LogicError::InvalidResult {
@@ -1495,7 +2633,9 @@ fn convert_result(endpoints: &[Endpoint], result: LuaValue) -> Result<Vec<Effect
         }
     };
 
+    let mut state: Option<Table> = None;
     let mut outputs: Option<Table> = None;
+    let mut timers: Option<Table> = None;
     for pair in result_table.pairs::<LuaValue, LuaValue>() {
         let (key, value) = pair.map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?;
         let key = match key {
@@ -1510,30 +2650,72 @@ fn convert_result(endpoints: &[Endpoint], result: LuaValue) -> Result<Vec<Effect
                 });
             }
         };
-        if key != "outputs" {
+        if !matches!(key.as_str(), "state" | "outputs" | "timers") {
             return Err(LogicError::InvalidResult {
-                message: format!("unsupported result field {key:?}; only outputs is allowed"),
+                message: format!(
+                    "unsupported result field {key:?}; only state, outputs, and timers are allowed"
+                ),
                 line: None,
             });
         }
         match value {
-            LuaValue::Table(table) if outputs.is_none() => outputs = Some(table),
+            LuaValue::Table(table) if key == "state" && state.is_none() => state = Some(table),
+            LuaValue::Table(table) if key == "outputs" && outputs.is_none() => {
+                outputs = Some(table)
+            }
+            LuaValue::Table(table) if key == "timers" && timers.is_none() => timers = Some(table),
             LuaValue::Table(_) => {
                 return Err(LogicError::InvalidResult {
-                    message: "result contains duplicate outputs fields".to_owned(),
+                    message: format!("result contains duplicate {key} fields"),
                     line: None,
                 });
             }
             value => {
                 return Err(LogicError::InvalidResult {
-                    message: format!("outputs must be a table, got {}", value.type_name()),
+                    message: format!("{key} must be a table, got {}", value.type_name()),
                     line: None,
                 });
             }
         }
     }
+    let mut state_patch = BTreeMap::new();
+    if let Some(state_table) = state {
+        for pair in state_table.pairs::<LuaValue, LuaValue>() {
+            let (key, value) =
+                pair.map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?;
+            let key = match key {
+                LuaValue::String(key) => key
+                    .to_str()
+                    .map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?
+                    .to_owned(),
+                value => {
+                    return Err(LogicError::InvalidResult {
+                        message: format!("state key must be a string, got {}", value.type_name()),
+                        line: None,
+                    });
+                }
+            };
+            let value = convert_state_value(&key, value)?;
+            if state_patch.insert(key.clone(), value).is_some() {
+                return Err(LogicError::InvalidResult {
+                    message: format!("state key {key:?} was returned more than once"),
+                    line: None,
+                });
+            }
+        }
+    }
+    merge_state(current_state, &state_patch).map_err(|error| LogicError::InvalidResult {
+        message: error.to_string(),
+        line: None,
+    })?;
+
     let Some(outputs_table) = outputs else {
-        return Ok(Vec::new());
+        let timers = convert_timers(timers, pending_timers, now)?;
+        return Ok(Transition {
+            state: state_patch,
+            outputs: Vec::new(),
+            timers,
+        });
     };
 
     // Keep temporary slots until every returned field has passed validation;
@@ -1572,20 +2754,314 @@ fn convert_result(endpoints: &[Endpoint], result: LuaValue) -> Result<Vec<Effect
         }
     }
 
-    Ok(endpoints
+    let outputs = endpoints
         .iter()
         .enumerate()
         .filter_map(|(index, endpoint)| {
             (endpoint.direction == EndpointDirection::Output)
                 .then(|| {
-                    values[index].map(|value| Effect::SetOutput {
+                    values[index].map(|value| OutputEffect {
                         endpoint: endpoint.name.clone(),
                         value,
                     })
                 })
                 .flatten()
         })
-        .collect())
+        .collect::<Vec<_>>();
+    let timers = convert_timers(timers, pending_timers, now)?;
+    Ok(Transition {
+        state: state_patch,
+        outputs,
+        timers,
+    })
+}
+
+fn convert_timers(
+    timers: Option<Table>,
+    pending: &BTreeMap<TimerName, PendingTimer>,
+    now: MonotonicMs,
+) -> Result<Vec<TimerEffect>, LogicError> {
+    let Some(timers) = timers else {
+        return Ok(Vec::new());
+    };
+    let mut raw = Vec::new();
+    for pair in timers.pairs::<LuaValue, LuaValue>() {
+        let (key, value) = pair.map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?;
+        let key = match key {
+            LuaValue::String(key) => key
+                .to_str()
+                .map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?
+                .to_owned(),
+            value => {
+                return Err(LogicError::InvalidResult {
+                    message: format!("timer name must be a string, got {}", value.type_name()),
+                    line: None,
+                });
+            }
+        };
+        let name = TimerName::new(key.clone()).map_err(|error| LogicError::InvalidResult {
+            message: format!("invalid timer name {key:?}: {error}"),
+            line: None,
+        })?;
+        let action = match value {
+            LuaValue::Boolean(false) => match pending.get(&name) {
+                Some(timer) => TimerAction::Cancelled {
+                    previous_due_at: timer.due_at,
+                },
+                None => TimerAction::CancelNoop,
+            },
+            LuaValue::Table(schedule) => {
+                let mut after: Option<u32> = None;
+                for pair in schedule.pairs::<LuaValue, LuaValue>() {
+                    let (field, value) =
+                        pair.map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?;
+                    let field = match field {
+                        LuaValue::String(field) => field
+                            .to_str()
+                            .map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?
+                            .to_owned(),
+                        value => {
+                            return Err(LogicError::InvalidResult {
+                                message: format!(
+                                    "timer {name} field must be a string, got {}",
+                                    value.type_name()
+                                ),
+                                line: None,
+                            });
+                        }
+                    };
+                    if field != "after" {
+                        return Err(LogicError::InvalidResult {
+                            message: format!(
+                                "timer {name} schedule only accepts after, got {field:?}"
+                            ),
+                            line: None,
+                        });
+                    }
+                    let after_value = lua_duration_ms(value)?;
+                    if after.replace(after_value).is_some() {
+                        return Err(LogicError::InvalidResult {
+                            message: format!("timer {name} contains duplicate after fields"),
+                            line: None,
+                        });
+                    }
+                }
+                let after_ms = after.ok_or_else(|| LogicError::InvalidResult {
+                    message: format!("timer {name} schedule requires after"),
+                    line: None,
+                })?;
+                let due_at =
+                    now.checked_add(after_ms)
+                        .ok_or_else(|| LogicError::InvalidResult {
+                            message: format!("timer {name} deadline overflows MonotonicMs"),
+                            line: None,
+                        })?;
+                match pending.get(&name) {
+                    Some(timer) => TimerAction::Replaced {
+                        previous_due_at: timer.due_at,
+                        after_ms,
+                        due_at,
+                    },
+                    None => TimerAction::Scheduled { after_ms, due_at },
+                }
+            }
+            value => {
+                return Err(LogicError::InvalidResult {
+                    message: format!(
+                        "timer {name} must be false or a schedule table, got {}",
+                        value.type_name()
+                    ),
+                    line: None,
+                });
+            }
+        };
+        raw.push(TimerEffect { name, action });
+    }
+    raw.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut candidate = pending.clone();
+    for effect in &raw {
+        match effect.action {
+            TimerAction::Scheduled { after_ms, due_at }
+            | TimerAction::Replaced {
+                after_ms, due_at, ..
+            } => {
+                candidate.insert(
+                    effect.name.clone(),
+                    PendingTimer {
+                        name: effect.name.clone(),
+                        scheduled_at: now,
+                        due_at,
+                        scheduled_logic_revision: 0,
+                    },
+                );
+                let _ = after_ms;
+            }
+            TimerAction::Cancelled { .. } | TimerAction::CancelNoop => {
+                candidate.remove(&effect.name);
+            }
+        }
+    }
+    if candidate.len() > MAX_PENDING_TIMERS {
+        return Err(LogicError::InvalidResult {
+            message: format!("pending timers exceed maximum of {MAX_PENDING_TIMERS}"),
+            line: None,
+        });
+    }
+    Ok(raw)
+}
+
+fn lua_duration_ms(value: LuaValue) -> Result<u32, LogicError> {
+    let number = match value {
+        LuaValue::Integer(value) if (1..=i64::from(u32::MAX)).contains(&value) => {
+            return Ok(value as u32);
+        }
+        LuaValue::Integer(value) => value as f64,
+        LuaValue::Number(value) => value,
+        value => {
+            return Err(LogicError::InvalidResult {
+                message: format!(
+                    "timer after must be a positive finite whole millisecond, got {}",
+                    value.type_name()
+                ),
+                line: None,
+            });
+        }
+    };
+    if !number.is_finite() || number <= 0.0 || number.fract() != 0.0 || number > u32::MAX as f64 {
+        return Err(LogicError::InvalidResult {
+            message:
+                "timer after must be a positive finite whole millisecond in range 1..=u32::MAX"
+                    .to_owned(),
+            line: None,
+        });
+    }
+    Ok(number as u32)
+}
+
+fn validate_state_entry(key: &str, value: &StateValue) -> Result<(), StateError> {
+    if key.is_empty() {
+        return Err(StateError::EmptyKey);
+    }
+    let key_bytes = key.len();
+    if key_bytes > MAX_STATE_KEY_BYTES {
+        return Err(StateError::KeyTooLarge {
+            key: key.to_owned(),
+            actual: key_bytes,
+            maximum: MAX_STATE_KEY_BYTES,
+        });
+    }
+    match value {
+        StateValue::String(value) if value.len() > MAX_STATE_STRING_BYTES => {
+            return Err(StateError::StringTooLarge {
+                key: key.to_owned(),
+                actual: value.len(),
+                maximum: MAX_STATE_STRING_BYTES,
+            });
+        }
+        StateValue::Number(value) if !value.is_finite() => {
+            return Err(StateError::NonFiniteNumber {
+                key: key.to_owned(),
+            });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_state_map(state: &TransientState) -> Result<(), StateError> {
+    if state.len() > MAX_STATE_ENTRIES {
+        return Err(StateError::TooManyEntries {
+            actual: state.len(),
+            maximum: MAX_STATE_ENTRIES,
+        });
+    }
+    let mut total = 0usize;
+    for (key, value) in state {
+        validate_state_entry(key, value)?;
+        total = total.saturating_add(key.len());
+        if let StateValue::String(value) = value {
+            total = total.saturating_add(value.len());
+        }
+    }
+    if total > MAX_STATE_TOTAL_BYTES {
+        return Err(StateError::TotalTooLarge {
+            actual: total,
+            maximum: MAX_STATE_TOTAL_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_pending_timers(
+    timers: &[PendingTimer],
+    active_revision: LogicRevision,
+) -> Result<(), SimulationError> {
+    let mut map = BTreeMap::new();
+    for timer in timers {
+        if map.insert(timer.name.clone(), timer.clone()).is_some() {
+            return Err(SimulationError::DuplicateTimer(timer.name.clone()));
+        }
+    }
+    validate_pending_timer_map(&map, active_revision)
+}
+
+fn validate_pending_timer_map(
+    timers: &BTreeMap<TimerName, PendingTimer>,
+    active_revision: LogicRevision,
+) -> Result<(), SimulationError> {
+    if timers.len() > MAX_PENDING_TIMERS {
+        return Err(SimulationError::InvalidState(StateError::TooManyEntries {
+            actual: timers.len(),
+            maximum: MAX_PENDING_TIMERS,
+        }));
+    }
+    for timer in timers.values() {
+        if timer.scheduled_logic_revision != active_revision {
+            return Err(SimulationError::TimerRevisionMismatch {
+                timer: timer.name.clone(),
+                scheduled: timer.scheduled_logic_revision,
+                active: active_revision,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn merge_state(current: &TransientState, patch: &StatePatch) -> Result<TransientState, StateError> {
+    let mut merged = current.clone();
+    for (key, value) in patch {
+        merged.insert(key.clone(), value.clone());
+    }
+    validate_state_map(&merged)?;
+    Ok(merged)
+}
+
+fn apply_timer_effects(
+    pending: &BTreeMap<TimerName, PendingTimer>,
+    effects: &[TimerEffect],
+    now: MonotonicMs,
+    revision: LogicRevision,
+) -> BTreeMap<TimerName, PendingTimer> {
+    let mut candidate = pending.clone();
+    for effect in effects {
+        match effect.action {
+            TimerAction::Scheduled { due_at, .. } | TimerAction::Replaced { due_at, .. } => {
+                candidate.insert(
+                    effect.name.clone(),
+                    PendingTimer {
+                        name: effect.name.clone(),
+                        scheduled_at: now,
+                        due_at,
+                        scheduled_logic_revision: revision,
+                    },
+                );
+            }
+            TimerAction::Cancelled { .. } | TimerAction::CancelNoop => {
+                candidate.remove(&effect.name);
+            }
+        }
+    }
+    candidate
 }
 
 fn lua_to_typed_value(endpoint: &Endpoint, value: LuaValue) -> Result<TypedValue, LogicError> {
@@ -1809,7 +3285,7 @@ mod tests {
     }
 
     fn effects(execution: &Execution) -> &Vec<Effect> {
-        execution.outcome.as_ref().unwrap()
+        &execution.outcome.as_ref().unwrap().outputs
     }
 
     #[test]
@@ -1881,11 +3357,11 @@ mod tests {
         assert_eq!(
             effects(&execution).as_slice(),
             vec![
-                Effect::SetOutput {
+                OutputEffect {
                     endpoint: name("test_light"),
                     value: TypedValue::bool(true),
                 },
-                Effect::SetOutput {
+                OutputEffect {
                     endpoint: name("dimmer_output"),
                     value: TypedValue::percent(42).unwrap(),
                 },
@@ -2012,11 +3488,11 @@ mod tests {
         assert_eq!(
             effects(&execution),
             &vec![
-                Effect::SetOutput {
+                OutputEffect {
                     endpoint: name("test_light"),
                     value: TypedValue::bool(true),
                 },
-                Effect::SetOutput {
+                OutputEffect {
                     endpoint: name("dimmer_output"),
                     value: TypedValue::percent(73).unwrap(),
                 },
@@ -2407,7 +3883,14 @@ mod tests {
             "function handle(event, input) return nil end",
         ));
         let success = run(&mut engine, true, 1);
-        assert_eq!(success.outcome, Ok(Vec::new()));
+        assert_eq!(
+            success.outcome,
+            Ok(Transition {
+                state: BTreeMap::new(),
+                outputs: Vec::new(),
+                timers: Vec::new(),
+            })
+        );
         assert_eq!(success.inputs[0].value, Some(TypedValue::bool(true)));
         engine
             .replace_source("function handle(event, input) error('boom') end")
