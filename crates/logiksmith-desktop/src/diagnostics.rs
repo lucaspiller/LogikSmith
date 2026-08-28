@@ -1,7 +1,7 @@
 //! Bounded, read-only diagnostic state for the desktop dashboard.
 
 use crate::{AutomationRuntime, DptMessage, GroupAddress, KnxEvent, ValueMessage};
-use logiksmith_core::{Dpt, Effect, EndpointDirection, EndpointName, InputEvent, TypedValue};
+use logiksmith_core::{Dpt, Effect, EndpointDirection, EndpointName, Execution, TypedValue};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -17,7 +17,7 @@ use tracing_subscriber::{
 
 pub const MAX_TELEGRAMS: usize = 200;
 pub const MAX_LOGS: usize = 500;
-pub const MAX_LOGICAL_EFFECTS: usize = 200;
+pub const MAX_EXECUTIONS: usize = 50;
 pub const JOURNAL_CAPACITY: usize = 512;
 const MAX_PENDING_WRITES: usize = 200;
 const MAX_LOGIC_ERROR: usize = 2_000;
@@ -96,29 +96,43 @@ pub struct LogicStatusSnapshot {
     pub active_structural_revision: u64,
     pub saved_structural_revision: u64,
     pub restart_required: bool,
-    pub last_execution: LastExecutionSnapshot,
-    pub recent_effects: Vec<LogicalEffectRecord>,
-}
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct LastExecutionSnapshot {
-    pub status: LogicExecutionStatus,
-    pub trigger: Option<LogicalInputRecord>,
-    pub logic_revision: Option<u64>,
-    pub effect_count: usize,
-    pub error: Option<LogicErrorRecord>,
+    pub executions: Vec<ExecutionRecord>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogicExecutionStatus {
-    Idle,
     Succeeded,
     Failed,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct LogicalInputRecord {
+pub struct ExecutionRecord {
+    pub execution_id: u64,
+    pub time_ms: u64,
+    pub duration_us: u64,
+    pub logic_revision: u64,
+    pub status: LogicExecutionStatus,
+    pub trigger: LogicalTriggerRecord,
+    pub inputs: Vec<LogicalInputSnapshot>,
+    pub effects: Vec<LogicalEffectRecord>,
+    pub error: Option<LogicErrorRecord>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LogicalTriggerRecord {
     pub endpoint: String,
     pub dpt: DptMessage,
     pub value: ValueMessage,
+    pub previous: Option<ValueMessage>,
+    pub changed: bool,
+    pub rising: bool,
+    pub falling: bool,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LogicalInputSnapshot {
+    pub endpoint: String,
+    pub dpt: DptMessage,
+    pub value: Option<ValueMessage>,
+    pub valid: bool,
+    pub age_ms: Option<u64>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LogicErrorRecord {
@@ -128,7 +142,6 @@ pub struct LogicErrorRecord {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LogicalEffectRecord {
-    pub time_ms: u64,
     pub endpoint: String,
     pub destination: String,
     pub dpt: DptMessage,
@@ -217,8 +230,8 @@ struct Inner {
     active_structural_revision: u64,
     saved_structural_revision: u64,
     restart_required: bool,
-    last_execution: LastExecutionSnapshot,
-    logical_effects: VecDeque<LogicalEffectRecord>,
+    executions: VecDeque<ExecutionRecord>,
+    next_execution_id: u64,
     telegrams: VecDeque<TelegramRecord>,
     logs: VecDeque<LogRecord>,
     journal: VecDeque<DiagnosticUpdate>,
@@ -253,13 +266,6 @@ impl DiagnosticStore {
             );
         }
         let automation = automation_snapshot(runtime);
-        let idle = LastExecutionSnapshot {
-            status: LogicExecutionStatus::Idle,
-            trigger: None,
-            logic_revision: None,
-            effect_count: 0,
-            error: None,
-        };
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 revision: 0,
@@ -275,13 +281,13 @@ impl DiagnosticStore {
                     value: None,
                     error: None,
                 },
-                active_logic_revision: runtime.logic_revision,
-                saved_logic_revision: runtime.logic_revision,
+                active_logic_revision: runtime.document_revision,
+                saved_logic_revision: runtime.document_revision,
                 active_structural_revision: runtime.structural_revision,
                 saved_structural_revision: runtime.structural_revision,
                 restart_required: false,
-                last_execution: idle,
-                logical_effects: VecDeque::new(),
+                executions: VecDeque::new(),
+                next_execution_id: 1,
                 telegrams: VecDeque::new(),
                 logs: VecDeque::new(),
                 journal: VecDeque::new(),
@@ -364,71 +370,67 @@ impl DiagnosticStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.active_logic_revision = logic_revision;
+        inner.active_automation_revision = logic_revision;
         inner.automation.logic.source = source.into();
         inner.restart_required =
             inner.saved_structural_revision != inner.active_structural_revision;
         self.publish_locked(&mut inner);
     }
-    pub fn record_logic_success(
+    /// Stores one immutable semantic core execution with host-only timing and
+    /// resolved KNX destinations. The core outcome is intentionally handled
+    /// here so zero-effect successes and contained Lua failures are retained.
+    pub fn record_execution(
         &self,
-        event: &InputEvent,
-        revision: u64,
-        effects: &[Effect],
+        execution: &Execution,
+        duration_us: u64,
+        automation: &AutomationRuntime,
+    ) {
+        self.record_execution_at(execution, self.now(), duration_us, automation);
+    }
+
+    pub fn record_execution_at(
+        &self,
+        execution: &Execution,
+        now: logiksmith_core::MonotonicMs,
+        duration_us: u64,
         automation: &AutomationRuntime,
     ) {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.last_execution = LastExecutionSnapshot {
-            status: LogicExecutionStatus::Succeeded,
-            trigger: Some(input_record(event)),
-            logic_revision: Some(revision),
-            effect_count: effects.len(),
-            error: None,
+        let execution_id = inner.next_execution_id;
+        inner.next_execution_id = inner.next_execution_id.saturating_add(1);
+        let document_revision = inner.active_logic_revision;
+        let (status, effects, error) = match &execution.outcome {
+            Ok(effects) => (
+                LogicExecutionStatus::Succeeded,
+                effects
+                    .iter()
+                    .filter_map(|effect| effect_record(effect, automation))
+                    .collect(),
+                None,
+            ),
+            Err(error) => (
+                LogicExecutionStatus::Failed,
+                Vec::new(),
+                Some(logic_error_record(error)),
+            ),
         };
-        for effect in effects {
-            let Effect::SetOutput { endpoint, value } = effect;
-            if let Some(address) = automation.endpoint_to_address.get(endpoint) {
-                inner.logical_effects.push_back(LogicalEffectRecord {
-                    time_ms: self.now().0,
-                    endpoint: endpoint.to_string(),
-                    destination: address.to_string(),
-                    dpt: DptMessage::from_core(value.dpt),
-                    value: ValueMessage::from_core(*value),
-                });
-            }
+        inner.executions.push_back(ExecutionRecord {
+            execution_id,
+            time_ms: now.0,
+            duration_us,
+            logic_revision: document_revision,
+            status,
+            trigger: trigger_record(&execution.trigger),
+            inputs: execution.inputs.iter().map(input_snapshot_record).collect(),
+            effects,
+            error,
+        });
+        while inner.executions.len() > MAX_EXECUTIONS {
+            inner.executions.pop_front();
         }
-        while inner.logical_effects.len() > MAX_LOGICAL_EFFECTS {
-            inner.logical_effects.pop_front();
-        }
-        self.publish_locked(&mut inner);
-    }
-    pub fn record_logic_failure(
-        &self,
-        event: &InputEvent,
-        revision: u64,
-        category: impl Into<String>,
-        message: impl Into<String>,
-        line: Option<u32>,
-    ) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut message = message.into();
-        message.truncate(MAX_LOGIC_ERROR);
-        inner.last_execution = LastExecutionSnapshot {
-            status: LogicExecutionStatus::Failed,
-            trigger: Some(input_record(event)),
-            logic_revision: Some(revision),
-            effect_count: 0,
-            error: Some(LogicErrorRecord {
-                category: category.into(),
-                message,
-                line,
-            }),
-        };
         self.publish_locked(&mut inner);
     }
     pub fn record_telegram(&self, mut telegram: TelegramRecord) {
@@ -567,11 +569,51 @@ impl DiagnosticStore {
     }
 }
 
-fn input_record(event: &InputEvent) -> LogicalInputRecord {
-    LogicalInputRecord {
-        endpoint: event.endpoint.to_string(),
-        dpt: DptMessage::from_core(event.value.dpt),
-        value: ValueMessage::from_core(event.value),
+fn trigger_record(trigger: &logiksmith_core::InputTrigger) -> LogicalTriggerRecord {
+    LogicalTriggerRecord {
+        endpoint: trigger.endpoint.to_string(),
+        dpt: DptMessage::from_core(trigger.value.dpt),
+        value: ValueMessage::from_core(trigger.value),
+        previous: trigger.previous.map(ValueMessage::from_core),
+        changed: trigger.changed,
+        rising: trigger.rising,
+        falling: trigger.falling,
+    }
+}
+
+fn input_snapshot_record(input: &logiksmith_core::InputSnapshot) -> LogicalInputSnapshot {
+    LogicalInputSnapshot {
+        endpoint: input.endpoint.to_string(),
+        dpt: DptMessage::from_core(input.dpt),
+        value: input.value.map(ValueMessage::from_core),
+        valid: input.valid,
+        age_ms: input.age_ms,
+    }
+}
+
+fn effect_record(effect: &Effect, automation: &AutomationRuntime) -> Option<LogicalEffectRecord> {
+    let Effect::SetOutput { endpoint, value } = effect;
+    Some(LogicalEffectRecord {
+        endpoint: endpoint.to_string(),
+        destination: automation.endpoint_to_address.get(endpoint)?.to_string(),
+        dpt: DptMessage::from_core(value.dpt),
+        value: ValueMessage::from_core(*value),
+    })
+}
+
+fn logic_error_record(error: &logiksmith_core::LogicError) -> LogicErrorRecord {
+    let mut message = error.message().to_owned();
+    if message.len() > MAX_LOGIC_ERROR {
+        let end = (0..=MAX_LOGIC_ERROR)
+            .rev()
+            .find(|index| message.is_char_boundary(*index))
+            .unwrap_or(0);
+        message.truncate(end);
+    }
+    LogicErrorRecord {
+        category: error.category().to_owned(),
+        message,
+        line: error.line().and_then(|line| u32::try_from(line).ok()),
     }
 }
 fn automation_snapshot(runtime: &AutomationRuntime) -> AutomationSnapshot {
@@ -644,8 +686,7 @@ fn snapshot_locked(inner: &Inner, _now: logiksmith_core::MonotonicMs) -> Snapsho
             active_structural_revision: inner.active_structural_revision,
             saved_structural_revision: inner.saved_structural_revision,
             restart_required: inner.restart_required,
-            last_execution: inner.last_execution.clone(),
-            recent_effects: inner.logical_effects.iter().cloned().collect(),
+            executions: inner.executions.iter().rev().cloned().collect(),
         },
         telegrams: inner.telegrams.iter().cloned().collect(),
         logs: inner.logs.iter().cloned().collect(),

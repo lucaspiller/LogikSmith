@@ -16,7 +16,9 @@
   } from './lib/automation';
   import { DashboardClient } from './lib/api';
   import {
+    formatAge,
     formatValue,
+    formatDuration,
     hasPendingRestart,
     initialDashboardState,
     reduceDashboardState,
@@ -46,6 +48,7 @@
   $: envelopeStructuralPending = automation?.activeStructuralRevision !== undefined && automation?.savedStructuralRevision !== undefined && automation.activeStructuralRevision !== null && automation.savedStructuralRevision !== null && automation.activeStructuralRevision !== automation.savedStructuralRevision;
   $: pendingRestart = Boolean(snapshot?.restartRequired || automation?.restartRequired || restartRequired || legacyRevisionPending || envelopeStructuralPending || (activeStructural !== null && savedStructural !== null && activeStructural !== savedStructural));
   $: source = draft.logic?.source ?? '';
+  $: selectedExecution = snapshot?.executions.find((execution) => execution.executionId === state.selectedExecutionId) ?? null;
 
   const dispatch = (action: Parameters<typeof reduceDashboardState>[1]) => { state = reduceDashboardState(state, action); };
 
@@ -125,7 +128,7 @@
       automation = { ...automation, document: candidate, revision: result.revision, activeLogicRevision: result.activeLogicRevision, restartRequired: result.restartRequired };
       restartRequired = result.restartRequired;
       saveNotice = result.logicActivated && !result.restartRequired
-        ? `Source activated for the next event (active logic revision ${result.activeLogicRevision ?? 'updated'}).`
+      ? `Source activated for the next event (active document revision ${result.activeLogicRevision ?? 'updated'}).`
         : result.restartRequired
           ? 'Saved. Structural changes are waiting for a desktop restart; live source activation is paused.'
           : 'Saved. The active runtime will use this source after its next activation.';
@@ -183,6 +186,14 @@
   function inputValue(event: Event): string { return (event.currentTarget as HTMLInputElement).value; }
   function selectValue(event: Event): string { return (event.currentTarget as HTMLSelectElement).value; }
   function endpointValue(endpoint: DisplayEndpoint): string { return formatValue(endpoint.observed ?? null); }
+  function executionTime(milliseconds: number): string { return `${milliseconds} ms`; }
+  function transition(execution: NonNullable<typeof selectedExecution>): string {
+    const previous = formatValue(execution.trigger.previous);
+    const current = formatValue(execution.trigger.value);
+    const flags = [execution.trigger.changed ? 'changed' : null, execution.trigger.rising ? 'rising' : null, execution.trigger.falling ? 'falling' : null].filter(Boolean).join(', ');
+    return `${previous} → ${current}${flags ? ` (${flags})` : ''}`;
+  }
+  function selectExecution(executionId: number): void { dispatch({ type: 'select_execution', executionId }); }
 </script>
 
 <svelte:head><meta name="description" content="Live LogikSmith KNX runtime dashboard" /></svelte:head>
@@ -207,14 +218,17 @@
     {#if automationLoading}
       <p class="empty">Loading saved automation…</p>
     {:else if automation}
-      {#if automationError}<div class="alert" role="alert">{automationError}</div>{/if}
-      {#if conflictLatest}<div class="conflict" role="alert"><span>The saved file is newer than this draft.</span><button type="button" on:click={reloadConflict}>Reload latest</button></div>{/if}
+      {#if conflictLatest}
+        <div class="conflict" role="alert"><span>The saved document changed. Reload the latest document before saving.</span><button type="button" on:click={reloadConflict}>Reload latest</button></div>
+      {:else if automationError}
+        <div class="alert" role="alert">{automationError}</div>
+      {/if}
       {#if pendingRestart}<div class="restart-notice" role="status">Structural changes are waiting for a restart. Live Lua activation is paused, but the full document can still be saved.</div>{/if}
       {#if saveNotice}<div class="success-notice" role="status">{saveNotice}</div>{/if}
-      <p class="subtle revision-line">Saved document revision {automation.revision}; active logic revision {snapshot?.activeLogicRevision ?? automation.activeLogicRevision ?? 'unknown'}</p>
+      <p class="subtle revision-line">Saved document revision {automation.revision}; active document revision {snapshot?.activeLogicRevision ?? automation.activeLogicRevision ?? 'unknown'}</p>
 
       <div class="source-editor">
-        <div class="section-heading compact"><div><h3>Lua logic source</h3><p class="subtle">One global <code>handle(event, input)</code> function runs for each input write.</p></div><span class="source-size">{new TextEncoder().encode(source).byteLength} / 65536 bytes</span></div>
+        <div class="section-heading compact"><div><h3>Lua logic source</h3><p class="subtle">One global <code>handle(event, input, meta)</code> function runs for each input write.</p></div><span class="source-size">{new TextEncoder().encode(source).byteLength} / 65536 bytes</span></div>
         <textarea aria-label="Lua source" spellcheck="false" value={source} on:input={(event) => updateSource(inputValue(event))}></textarea>
         {#if errorFor('logic.source')}<small class="field-error">{errorFor('logic.source')}</small>{/if}
         <details class="source-reference">
@@ -222,7 +236,12 @@
           <div class="reference-grid">
             <code>event.input</code><span>logical input name</span>
             <code>event.value</code><span>trigger value: boolean or 0–100 percentage</span>
+            <code>event.previous</code><span>previous value, or nil when unknown</span>
+            <code>event.changed</code><span>true when a known previous value differs</span>
+            <code>event.rising / event.falling</code><span>boolean false→true / true→false edge flags</span>
             <code>input.name</code><span>current value for every configured input</span>
+            <code>meta.&lt;input&gt;.valid</code><span>whether that input has an observed value</span>
+            <code>meta.&lt;input&gt;.age_ms</code><span>frozen age in milliseconds, or nil when invalid</span>
             <code>return &#123; outputs = &#123;...&#125; &#125;</code><span>named output values; omit outputs to do nothing</span>
           </div>
         </details>
@@ -271,31 +290,50 @@
   </section>
 
   {#if snapshot}
-    <section class="grid two-columns" aria-label="Logic status and current values">
-      <article class="panel">
-        <h2>Logic runtime</h2>
-        <dl class="facts">
-          <dt>Saved logic revision</dt><dd>{snapshot.savedLogicRevision ?? automation?.savedLogicRevision ?? automation?.activeLogicRevision ?? 'unknown'}</dd>
-          <dt>Active logic revision</dt><dd>{snapshot.activeLogicRevision ?? automation?.activeLogicRevision ?? 'unknown'}</dd>
-          <dt>Structural state</dt><dd>{pendingRestart ? 'restart pending' : 'active'}</dd>
-          <dt>Last execution</dt><dd><span class="status-pill logic-{snapshot.logicExecution.status}">{snapshot.logicExecution.status}</span></dd>
-          <dt>Trigger</dt><dd>{snapshot.logicExecution.triggerInput ?? '—'}{snapshot.logicExecution.triggerValue !== null ? ` = ${formatValue(snapshot.logicExecution.triggerValue)}` : ''}</dd>
-          <dt>Execution revision</dt><dd>{snapshot.logicExecution.logicRevision ?? '—'}</dd>
-          <dt>Returned effects</dt><dd>{snapshot.logicExecution.effectCount}</dd>
-        </dl>
-        {#if snapshot.logicExecution.error}<div class="logic-error" role="alert"><strong>{snapshot.logicExecution.error.category}</strong>{#if snapshot.logicExecution.error.line !== null} line {snapshot.logicExecution.error.line}:{/if} {snapshot.logicExecution.error.message}</div>{/if}
-      </article>
+    <section class="panel inspector" aria-label="Execution inspector">
+      <div class="section-heading"><div><h2>Execution inspector</h2><p class="subtle">The latest 50 immutable logic decisions, newest first.</p></div><span>{snapshot.executions.length}</span></div>
+      <dl class="facts runtime-facts">
+        <dt>Saved document revision</dt><dd>{snapshot.savedLogicRevision ?? automation?.savedLogicRevision ?? automation?.activeLogicRevision ?? 'unknown'}</dd>
+        <dt>Active document revision</dt><dd>{snapshot.activeLogicRevision ?? automation?.activeLogicRevision ?? 'unknown'}</dd>
+        <dt>Structural state</dt><dd>{pendingRestart ? 'restart pending' : 'active'}</dd>
+      </dl>
+      {#if state.selectionNotice}<p class="selection-notice" role="status">{state.selectionNotice}</p>{/if}
+      {#if snapshot.executions.length}
+        <div class="table-wrap execution-history"><table><thead><tr><th>Time</th><th>Trigger</th><th>Transition</th><th>Status</th><th>Effects</th><th>Document revision</th><th>Duration</th></tr></thead><tbody>
+          {#each snapshot.executions as execution}
+            <tr class:selected={execution.executionId === state.selectedExecutionId} class:pinned={execution.executionId === state.selectedExecutionId && state.selectionPinned} tabindex="0" role="button" on:click={() => selectExecution(execution.executionId)} on:keydown={(event) => { if (event.key === 'Enter' || event.key === ' ') selectExecution(execution.executionId); }}>
+              <td>{executionTime(execution.timeMs)}</td><td>{execution.trigger.endpoint} = {formatValue(execution.trigger.value)}</td><td>{transition(execution)}</td><td><span class="status-pill logic-{execution.status}">{execution.status}</span></td><td>{execution.effects.length}</td><td>{execution.logicRevision ?? '—'}</td><td>{formatDuration(execution.durationUs)}</td>
+            </tr>
+          {/each}
+        </tbody></table></div>
+        {#if selectedExecution}
+          <article class="execution-detail" aria-label="Selected execution details">
+            <div class="section-heading"><h3>Execution {selectedExecution.executionId}</h3><span>{state.selectionPinned ? 'pinned selection' : 'following newest'}</span></div>
+            <dl class="facts">
+              <dt>Status</dt><dd><span class="status-pill logic-{selectedExecution.status}">{selectedExecution.status}</span></dd>
+              <dt>Time</dt><dd>{executionTime(selectedExecution.timeMs)}</dd>
+              <dt>Duration</dt><dd>{formatDuration(selectedExecution.durationUs)}</dd>
+              <dt>Document revision</dt><dd>{selectedExecution.logicRevision ?? '—'}</dd>
+              <dt>Trigger</dt><dd><code>{selectedExecution.trigger.endpoint}</code> / {selectedExecution.trigger.dpt} / {formatValue(selectedExecution.trigger.value)}</dd>
+              <dt>Transition flags</dt><dd>previous {formatValue(selectedExecution.trigger.previous)}; changed {String(selectedExecution.trigger.changed)}; rising {String(selectedExecution.trigger.rising)}; falling {String(selectedExecution.trigger.falling)}</dd>
+            </dl>
+            <h3>Input snapshot</h3>
+            <div class="table-wrap"><table><thead><tr><th>Endpoint</th><th>DPT</th><th>Value</th><th>Validity</th><th>Age</th></tr></thead><tbody>{#each selectedExecution.inputs as input}<tr><td>{input.endpoint}</td><td>{input.dpt}</td><td><span class="value">{formatValue(input.value)}</span></td><td>{input.valid ? 'valid' : 'invalid'}</td><td>{formatAge(input.ageMs)}</td></tr>{/each}</tbody></table></div>
+            <h3>Returned effects</h3>
+            {#if selectedExecution.effects.length}<div class="table-wrap"><table><thead><tr><th>Endpoint</th><th>DPT</th><th>Value</th><th>Resolved KNX address</th></tr></thead><tbody>{#each selectedExecution.effects as effect}<tr><td>{effect.endpoint}</td><td>{effect.dpt}</td><td><span class="value">{formatValue(effect.value)}</span></td><td><code>{effect.destination}</code></td></tr>{/each}</tbody></table></div>{:else}<p class="empty">No effects returned.</p>{/if}
+            {#if selectedExecution.error}<div class="logic-error" role="alert"><strong>{selectedExecution.error.category}</strong>{#if selectedExecution.error.line !== null} line {selectedExecution.error.line}:{/if} {selectedExecution.error.message}</div>{/if}
+          </article>
+        {/if}
+      {:else}<p class="empty">No executions yet. Trigger a configured input to inspect its decision.</p>{/if}
+    </section>
+
+    <section class="grid two-columns" aria-label="Current values">
       <article class="panel">
         <h2>Active endpoints</h2>
         {#if snapshot.automation}
           <div class="endpoint-list">{#each snapshot.automation.inputs as endpoint}<div><span class="endpoint-name">{endpoint.name ?? '—'}</span> <small>input / {endpoint.dpt}</small> <code>{endpoint.address || '—'}</code> <span class="value">{endpointValue(endpoint)}</span></div>{/each}{#each snapshot.automation.outputs as endpoint}<div><span class="endpoint-name">{endpoint.name ?? '—'}</span> <small>output / {endpoint.dpt}</small> <code>{endpoint.address || '—'}</code> <span class="value">{endpointValue(endpoint)}</span> <span class="value requested">requested {formatValue(endpoint.requested ?? null)}</span></div>{/each}</div>
         {:else}<p class="empty">No endpoint projection available.</p>{/if}
       </article>
-    </section>
-
-    <section class="panel" aria-label="Recent logical output effects">
-      <div class="section-heading"><h2>Recent logical output effects</h2><span>{snapshot.logicEffects.length}</span></div>
-      {#if snapshot.logicEffects.length}<div class="table-wrap"><table><thead><tr><th>Time</th><th>Endpoint</th><th>DPT</th><th>Value</th><th>Resolved KNX address</th></tr></thead><tbody>{#each snapshot.logicEffects as effect}<tr><td>{displayTime(effect.time)}</td><td>{effect.endpoint}</td><td>{effect.dpt}</td><td><span class="value">{formatValue(effect.value)}</span></td><td><code>{effect.address}</code></td></tr>{/each}</tbody></table></div>{:else}<p class="empty">No logical effects returned yet.</p>{/if}
     </section>
 
     <section class="panel" aria-label="Values and writes"><h2>Values and writes</h2><dl class="facts"><dt>Observed input</dt><dd><span class="value">{formatValue(snapshot.values.input.observed)}</span></dd><dt>Observed output</dt><dd><span class="value">{formatValue(snapshot.values.output.observed)}</span></dd><dt>Requested output</dt><dd><span class="value requested">{formatValue(snapshot.values.output.requested)}</span></dd><dt>Write status</dt><dd>{snapshot.write.status}{snapshot.write.error ? ` — ${snapshot.write.error}` : ''}</dd></dl></section>

@@ -574,6 +574,10 @@ pub enum EventError {
         actual: Dpt,
     },
     InvalidValue(ValueError),
+    TimeWentBackwards {
+        previous: MonotonicMs,
+        current: MonotonicMs,
+    },
 }
 
 impl fmt::Display for EventError {
@@ -594,55 +598,44 @@ impl fmt::Display for EventError {
                 "input endpoint {endpoint} expects DPT {expected}, got {actual}"
             ),
             Self::InvalidValue(error) => error.fmt(formatter),
+            Self::TimeWentBackwards { previous, current } => write!(
+                formatter,
+                "event time {current:?} is earlier than the last accepted time {previous:?}"
+            ),
         }
     }
 }
 
 impl Error for EventError {}
 
-/// Failure from either event validation or one contained Lua execution.
+/// The immutable transition metadata for one accepted triggering input.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExecutionError {
-    Event(EventError),
-    Logic(LogicError),
+pub struct InputTrigger {
+    pub endpoint: EndpointName,
+    pub value: TypedValue,
+    pub previous: Option<TypedValue>,
+    pub changed: bool,
+    pub rising: bool,
+    pub falling: bool,
 }
 
-impl fmt::Display for ExecutionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Event(error) => error.fmt(formatter),
-            Self::Logic(error) => error.fmt(formatter),
-        }
-    }
+/// The immutable value and age of one configured input at execution time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InputSnapshot {
+    pub endpoint: EndpointName,
+    pub dpt: Dpt,
+    pub value: Option<TypedValue>,
+    pub valid: bool,
+    pub age_ms: Option<u64>,
 }
 
-impl Error for ExecutionError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Event(error) => Some(error),
-            Self::Logic(error) => Some(error),
-        }
-    }
-}
-
-impl From<EventError> for ExecutionError {
-    fn from(error: EventError) -> Self {
-        Self::Event(error)
-    }
-}
-
-impl From<LogicError> for ExecutionError {
-    fn from(error: LogicError) -> Self {
-        Self::Logic(error)
-    }
-}
-
-/// A successful execution, including the revision and trigger used.
+/// One complete semantic execution, including contained Lua failures.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Execution {
     pub logic_revision: LogicRevision,
-    pub trigger: InputEvent,
-    pub effects: Vec<Effect>,
+    pub trigger: InputTrigger,
+    pub inputs: Vec<InputSnapshot>,
+    pub outcome: Result<Vec<Effect>, LogicError>,
 }
 
 /// A source-backed portable endpoint engine.
@@ -709,7 +702,14 @@ pub struct EngineSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Engine {
     config: EngineConfig,
-    known_inputs: Vec<Option<TypedValue>>,
+    inputs: Vec<InputState>,
+    last_accepted_at: Option<MonotonicMs>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InputState {
+    value: Option<TypedValue>,
+    observed_at: Option<MonotonicMs>,
 }
 
 impl Engine {
@@ -721,10 +721,11 @@ impl Engine {
 
     pub fn try_new(config: EngineConfig) -> Result<Self, ConfigError> {
         config.validate()?;
-        let known_inputs = vec![None; config.endpoints.len()];
+        let inputs = vec![InputState::default(); config.endpoints.len()];
         Ok(Self {
             config,
-            known_inputs,
+            inputs,
+            last_accepted_at: None,
         })
     }
 
@@ -763,7 +764,11 @@ impl Engine {
             .enumerate()
             .filter_map(|(index, endpoint)| {
                 (endpoint.direction == EndpointDirection::Input)
-                    .then(|| self.known_inputs[index].map(|value| (endpoint.name.clone(), value)))
+                    .then(|| {
+                        self.inputs[index]
+                            .value
+                            .map(|value| (endpoint.name.clone(), value))
+                    })
                     .flatten()
             })
             .collect()
@@ -815,49 +820,60 @@ impl Engine {
     }
 
     /// Records a value-carrying observation without invoking Lua.
-    pub fn observe_input(&mut self, observation: InputObservation) -> Result<(), EventError> {
+    pub fn observe_input(
+        &mut self,
+        observation: InputObservation,
+        now: MonotonicMs,
+    ) -> Result<(), EventError> {
         let index = self.validate_input(&observation.endpoint, observation.value)?;
-        self.known_inputs[index] = Some(observation.value);
+        self.accept_time(now)?;
+        self.inputs[index] = InputState {
+            value: Some(observation.value),
+            observed_at: Some(now),
+        };
         Ok(())
     }
 
-    /// Alias for adapters that model observations as state updates.
-    pub fn record_observation(&mut self, observation: InputObservation) -> Result<(), EventError> {
-        self.observe_input(observation)
-    }
-
-    /// Compatibility entry point for adapters that use the same event shape
-    /// for passive response observations and triggering writes.
-    pub fn observe(&mut self, event: InputEvent) -> Result<(), EventError> {
-        self.observe_input(InputObservation::new(event.endpoint, event.value))
-    }
-
     /// Updates the triggering input before evaluating the active source.
-    pub fn process_input(&mut self, event: InputEvent) -> Result<Execution, ExecutionError> {
+    pub fn process_input(
+        &mut self,
+        event: InputEvent,
+        now: MonotonicMs,
+    ) -> Result<Execution, EventError> {
         let index = self.validate_input(&event.endpoint, event.value)?;
-        self.known_inputs[index] = Some(event.value);
-
-        let effects = execute_logic(
+        self.accept_time(now)?;
+        let previous = self.inputs[index].value;
+        self.inputs[index] = InputState {
+            value: Some(event.value),
+            observed_at: Some(now),
+        };
+        let trigger = InputTrigger {
+            endpoint: event.endpoint,
+            value: event.value,
+            previous,
+            changed: previous.is_some_and(|value| value != event.value),
+            rising: matches!(
+                (previous.map(|value| value.value), event.value.value),
+                (Some(Value::Bool(false)), Value::Bool(true))
+            ),
+            falling: matches!(
+                (previous.map(|value| value.value), event.value.value),
+                (Some(Value::Bool(true)), Value::Bool(false))
+            ),
+        };
+        let snapshots = self.input_snapshots(now);
+        let outcome = execute_logic(
             &self.config.endpoints,
             &self.config.logic,
-            &self.known_inputs,
-            &event,
-        )?;
+            &snapshots,
+            &trigger,
+        );
         Ok(Execution {
             logic_revision: self.active_logic_revision(),
-            trigger: event,
-            effects,
+            trigger,
+            inputs: snapshots,
+            outcome,
         })
-    }
-
-    /// Alias for hosts that call the operation an event rather than an input.
-    pub fn process_event(&mut self, event: InputEvent) -> Result<Execution, ExecutionError> {
-        self.process_input(event)
-    }
-
-    /// Alias retained as the natural event-loop call name.
-    pub fn handle_event(&mut self, event: InputEvent) -> Result<Execution, ExecutionError> {
-        self.process_input(event)
     }
 
     fn validate_input(
@@ -887,6 +903,51 @@ impl Engine {
             });
         }
         Ok(index)
+    }
+
+    fn accept_time(&mut self, now: MonotonicMs) -> Result<(), EventError> {
+        if let Some(previous) = self.last_accepted_at
+            && now < previous
+        {
+            return Err(EventError::TimeWentBackwards {
+                previous,
+                current: now,
+            });
+        }
+        self.last_accepted_at = Some(now);
+        Ok(())
+    }
+
+    fn input_snapshots(&self, now: MonotonicMs) -> Vec<InputSnapshot> {
+        self.config
+            .endpoints
+            .iter()
+            .enumerate()
+            .filter_map(|(index, endpoint)| {
+                (endpoint.direction == EndpointDirection::Input).then(|| {
+                    let state = &self.inputs[index];
+                    let age_ms = state
+                        .observed_at
+                        .map(|observed_at| now.0.saturating_sub(observed_at.0));
+                    InputSnapshot {
+                        endpoint: endpoint.name.clone(),
+                        dpt: endpoint.dpt,
+                        value: state.value,
+                        valid: state.value.is_some() && state.observed_at.is_some(),
+                        age_ms,
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
+impl Default for InputState {
+    fn default() -> Self {
+        Self {
+            value: None,
+            observed_at: None,
+        }
     }
 }
 
@@ -995,8 +1056,8 @@ fn validate_logic_source(source: &str) -> Result<(), LogicError> {
 fn execute_logic(
     endpoints: &[Endpoint],
     program: &LogicProgram,
-    known_inputs: &[Option<TypedValue>],
-    event: &InputEvent,
+    snapshots: &[InputSnapshot],
+    trigger: &InputTrigger,
 ) -> Result<Vec<Effect>, LogicError> {
     // Validate size even though an active program was previously checked. It
     // keeps this boundary correct if a LogicProgram is constructed directly.
@@ -1038,29 +1099,50 @@ fn execute_logic(
         .set("type", "input")
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
     event_table
-        .set("input", event.endpoint.as_str())
+        .set("input", trigger.endpoint.as_str())
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
     event_table
         .set(
             "value",
-            typed_value_to_lua(event.value).map_err(|message| LogicError::Runtime {
+            typed_value_to_lua(trigger.value).map_err(|message| LogicError::Runtime {
                 message,
                 line: None,
             })?,
         )
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    let previous = trigger
+        .previous
+        .map(typed_value_to_lua)
+        .transpose()
+        .map_err(|message| LogicError::Runtime {
+            message,
+            line: None,
+        })?
+        .unwrap_or(LuaValue::Nil);
+    event_table
+        .set("previous", previous)
+        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    event_table
+        .set("changed", trigger.changed)
+        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    event_table
+        .set("rising", trigger.rising)
+        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    event_table
+        .set("falling", trigger.falling)
+        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
 
     let input_table = lua
         .create_table()
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
-    for (index, endpoint) in endpoints.iter().enumerate() {
-        if endpoint.direction != EndpointDirection::Input {
-            continue;
-        }
-        if let Some(value) = known_inputs.get(index).copied().flatten() {
+    let meta_table = lua
+        .create_table()
+        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    for snapshot in snapshots {
+        if let Some(value) = snapshot.value {
             input_table
                 .set(
-                    endpoint.name.as_str(),
+                    snapshot.endpoint.as_str(),
                     typed_value_to_lua(value).map_err(|message| LogicError::Runtime {
                         message,
                         line: None,
@@ -1068,10 +1150,24 @@ fn execute_logic(
                 )
                 .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
         }
+        let metadata = lua
+            .create_table()
+            .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+        metadata
+            .set("valid", snapshot.valid)
+            .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+        if let Some(age_ms) = snapshot.age_ms {
+            metadata
+                .set("age_ms", age_ms)
+                .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+        }
+        meta_table
+            .set(snapshot.endpoint.as_str(), metadata)
+            .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
     }
 
     let returned: MultiValue = handle
-        .call((event_table, input_table))
+        .call((event_table, input_table, meta_table))
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
     let mut returned = returned.into_iter();
     let result = returned.next().unwrap_or(LuaValue::Nil);
@@ -1365,13 +1461,7 @@ mod tests {
     }
 
     fn source() -> &'static str {
-        r#"
-function handle(event, input)
-    if event.input == "wall_switch" and event.value == true then
-        return { outputs = { test_light = true, dimmer_output = input.dimmer_level or 0 } }
-    end
-end
-"#
+        "function handle(event, input)\n  if event.input == 'wall_switch' and event.value == true then\n    return { outputs = { test_light = true, dimmer_output = input.dimmer_level or 0 } }\n  end\nend"
     }
 
     fn config() -> EngineConfig {
@@ -1389,6 +1479,18 @@ end
 
     fn trigger(value: bool) -> InputEvent {
         InputEvent::new(name("wall_switch"), TypedValue::bool(value))
+    }
+
+    fn at(now: u64) -> MonotonicMs {
+        MonotonicMs(now)
+    }
+
+    fn run(engine: &mut Engine, value: bool, now: u64) -> Execution {
+        engine.process_input(trigger(value), at(now)).unwrap()
+    }
+
+    fn effects(execution: &Execution) -> &Vec<Effect> {
+        execution.outcome.as_ref().unwrap()
     }
 
     #[test]
@@ -1435,10 +1537,10 @@ end
     fn observations_update_snapshot_without_execution() {
         let mut engine = Engine::new(config());
         engine
-            .observe_input(InputObservation::new(
-                name("dimmer_level"),
-                TypedValue::percent(42).unwrap(),
-            ))
+            .observe_input(
+                InputObservation::new(name("dimmer_level"), TypedValue::percent(42).unwrap()),
+                MonotonicMs(10),
+            )
             .unwrap();
         assert_eq!(
             engine.known_input_values(),
@@ -1450,15 +1552,15 @@ end
     fn triggering_value_is_in_snapshot_and_outputs_are_declaration_ordered() {
         let mut engine = Engine::new(config());
         engine
-            .observe_input(InputObservation::new(
-                name("dimmer_level"),
-                TypedValue::percent(42).unwrap(),
-            ))
+            .observe_input(
+                InputObservation::new(name("dimmer_level"), TypedValue::percent(42).unwrap()),
+                MonotonicMs(10),
+            )
             .unwrap();
-        let execution = engine.process_input(trigger(true)).unwrap();
-        assert_eq!(execution.effects.len(), 2);
+        let execution = run(&mut engine, true, 20);
+        assert_eq!(effects(&execution).len(), 2);
         assert_eq!(
-            execution.effects,
+            effects(&execution).as_slice(),
             vec![
                 Effect::SetOutput {
                     endpoint: name("test_light"),
@@ -1475,157 +1577,205 @@ end
                 .known_input_values()
                 .contains(&(name("wall_switch"), TypedValue::bool(true)))
         );
+        assert_eq!(execution.inputs[0].age_ms, Some(0));
+        assert_eq!(execution.inputs[1].age_ms, Some(10));
     }
 
     #[test]
-    fn nil_empty_and_repeated_results_have_expected_semantics() {
+    fn transition_metadata_covers_first_rising_falling_and_repeated_values() {
         let mut engine = Engine::new(EngineConfig::new(
             vec![
                 endpoint("wall_switch", EndpointDirection::Input, Dpt::BOOL),
                 endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
             ],
-            "function handle(event, input) return { outputs = { test_light = event.value } } end",
+            "function handle(event, input) return nil end",
         ));
-        assert_eq!(
-            engine.process_input(trigger(true)).unwrap().effects.len(),
-            1
-        );
-        assert_eq!(
-            engine.process_input(trigger(true)).unwrap().effects.len(),
-            1
-        );
-        engine
-            .replace_source("function handle(event, input) return nil end")
-            .unwrap();
-        assert!(
-            engine
-                .process_input(trigger(false))
-                .unwrap()
-                .effects
-                .is_empty()
-        );
-        engine
-            .replace_source("function handle(event, input) return {} end")
-            .unwrap();
-        assert!(
-            engine
-                .process_input(trigger(false))
-                .unwrap()
-                .effects
-                .is_empty()
-        );
+        let first = run(&mut engine, true, 1);
+        assert_eq!(first.trigger.previous, None);
+        assert!(!first.trigger.changed);
+        assert!(!first.trigger.rising);
+        assert!(!first.trigger.falling);
+        let repeated = run(&mut engine, true, 2);
+        assert_eq!(repeated.trigger.previous, Some(TypedValue::bool(true)));
+        assert!(!repeated.trigger.changed);
+        assert!(!repeated.trigger.rising);
+        assert!(!repeated.trigger.falling);
+        let falling = run(&mut engine, false, 3);
+        assert_eq!(falling.trigger.previous, Some(TypedValue::bool(true)));
+        assert!(falling.trigger.changed);
+        assert!(!falling.trigger.rising);
+        assert!(falling.trigger.falling);
     }
 
     #[test]
-    fn strict_return_conversion_and_all_or_nothing_validation() {
+    fn percentage_changes_set_changed_without_boolean_edges() {
+        let mut engine = Engine::new(EngineConfig::new(
+            vec![
+                endpoint("level", EndpointDirection::Input, Dpt::PERCENT),
+                endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
+            ],
+            "function handle(event, input) return nil end",
+        ));
+        let event = |value| InputEvent::new(name("level"), TypedValue::percent(value).unwrap());
+        let first = engine.process_input(event(10), MonotonicMs(1)).unwrap();
+        assert!(!first.trigger.changed);
+        let changed = engine.process_input(event(20), MonotonicMs(2)).unwrap();
+        assert!(changed.trigger.changed);
+        assert!(!changed.trigger.rising);
+        assert!(!changed.trigger.falling);
+        let same = engine.process_input(event(20), MonotonicMs(3)).unwrap();
+        assert!(!same.trigger.changed);
+    }
+
+    #[test]
+    fn passive_observations_establish_baseline_and_refresh_age() {
         let mut engine = Engine::new(config());
         engine
-            .replace_source(
-                "function handle(event, input) return { outputs = { test_light = true, dimmer_output = 12.5 } } end",
+            .observe_input(
+                InputObservation::new(name("dimmer_level"), TypedValue::percent(42).unwrap()),
+                MonotonicMs(10),
             )
             .unwrap();
-        assert!(matches!(
-            engine.process_input(trigger(true)),
-            Err(ExecutionError::Logic(LogicError::InvalidResult { .. }))
-        ));
+        let first = run(&mut engine, true, 20);
+        assert_eq!(first.trigger.previous, None);
+        assert_eq!(first.inputs[1].age_ms, Some(10));
         engine
-            .replace_source(
-                "function handle(event, input) return { nope = {}, outputs = { test_light = true } } end",
+            .observe_input(
+                InputObservation::new(name("dimmer_level"), TypedValue::percent(42).unwrap()),
+                MonotonicMs(30),
             )
             .unwrap();
-        assert!(matches!(
-            engine.process_input(trigger(true)),
-            Err(ExecutionError::Logic(LogicError::InvalidResult { .. }))
-        ));
+        let refreshed = run(&mut engine, false, 35);
+        assert_eq!(refreshed.inputs[1].age_ms, Some(5));
+        assert!(effects(&refreshed).is_empty());
     }
 
     #[test]
-    fn unsafe_apis_are_unavailable_and_globals_are_fresh() {
+    fn complete_snapshot_is_ordered_and_unknown_inputs_are_invalid() {
+        let mut engine = Engine::new(EngineConfig::new(
+            vec![
+                endpoint("wall_switch", EndpointDirection::Input, Dpt::BOOL),
+                endpoint("enabled", EndpointDirection::Input, Dpt::BOOL),
+                endpoint("level", EndpointDirection::Input, Dpt::PERCENT),
+                endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
+            ],
+            "function handle(event, input, meta)\n  return { outputs = { test_light = meta.enabled.valid == false and input.wall_switch == true and meta.wall_switch.age_ms == 0 } }\nend",
+        ));
+        engine
+            .observe_input(
+                InputObservation::new(name("level"), TypedValue::percent(9).unwrap()),
+                MonotonicMs(100),
+            )
+            .unwrap();
+        let execution = run(&mut engine, true, 150);
+        assert_eq!(execution.inputs.len(), 3);
+        assert_eq!(execution.inputs[0].endpoint, name("wall_switch"));
+        assert_eq!(execution.inputs[0].age_ms, Some(0));
+        assert!(execution.inputs[0].valid);
+        assert_eq!(execution.inputs[1].value, None);
+        assert!(!execution.inputs[1].valid);
+        assert_eq!(execution.inputs[1].age_ms, None);
+        assert_eq!(execution.inputs[2].age_ms, Some(50));
+        assert_eq!(effects(&execution).len(), 1);
+    }
+
+    #[test]
+    fn third_lua_argument_exposes_metadata_and_two_argument_scripts_work() {
+        let mut engine = Engine::new(EngineConfig::new(
+            vec![
+                endpoint("wall_switch", EndpointDirection::Input, Dpt::BOOL),
+                endpoint("enabled", EndpointDirection::Input, Dpt::BOOL),
+                endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
+            ],
+            "function handle(event, input, meta) return { outputs = { test_light = meta.enabled.valid and meta.enabled.age_ms == 7 and event.previous == nil } } end",
+        ));
+        engine
+            .observe_input(
+                InputObservation::new(name("enabled"), TypedValue::bool(true)),
+                MonotonicMs(10),
+            )
+            .unwrap();
+        assert_eq!(effects(&run(&mut engine, true, 17)).len(), 1);
+        engine
+            .replace_source(
+                "function handle(event, input) return { outputs = { test_light = event.value } } end",
+            )
+            .unwrap();
+        assert_eq!(effects(&run(&mut engine, false, 18)).len(), 1);
+    }
+
+    #[test]
+    fn zero_effect_success_and_contained_lua_failure_keep_full_execution() {
         let mut engine = Engine::new(EngineConfig::new(
             vec![
                 endpoint("wall_switch", EndpointDirection::Input, Dpt::BOOL),
                 endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
             ],
-            "counter = (counter or 0) + 1\nfunction handle(event, input) return { outputs = { test_light = load == nil and counter == 1 } } end",
+            "function handle(event, input) return nil end",
         ));
-        assert_eq!(
-            engine.process_input(trigger(true)).unwrap().effects.len(),
-            1
-        );
-        assert_eq!(
-            engine.process_input(trigger(true)).unwrap().effects.len(),
-            1
-        );
+        let success = run(&mut engine, true, 1);
+        assert_eq!(success.outcome, Ok(Vec::new()));
+        assert_eq!(success.inputs[0].value, Some(TypedValue::bool(true)));
         engine
-            .replace_source("function handle(event, input) return { outputs = { test_light = io == nil and os == nil and require == nil and debug == nil and coroutine == nil } } end")
+            .replace_source("function handle(event, input) error('boom') end")
             .unwrap();
-        assert_eq!(
-            engine.process_input(trigger(true)).unwrap().effects.len(),
-            1
-        );
+        let failed = run(&mut engine, false, 2);
+        assert!(matches!(failed.outcome, Err(LogicError::Runtime { .. })));
+        assert_eq!(failed.trigger.previous, Some(TypedValue::bool(true)));
+        assert!(failed.inputs[0].valid);
     }
 
     #[test]
-    fn instruction_limit_fails_and_next_event_recovers() {
+    fn strict_return_conversion_is_all_or_nothing() {
         let mut engine = Engine::new(EngineConfig::new(
             vec![
                 endpoint("wall_switch", EndpointDirection::Input, Dpt::BOOL),
                 endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
             ],
-            "function handle(event, input) while true do end end",
+            "function handle(event, input) return { outputs = { test_light = true, nope = false } } end",
         ));
         assert!(matches!(
-            engine.process_input(trigger(true)),
-            Err(ExecutionError::Logic(LogicError::InstructionLimit { .. }))
+            run(&mut engine, true, 1).outcome,
+            Err(LogicError::InvalidResult { .. })
         ));
+        assert!(engine.snapshot().known_inputs.is_empty() == false);
         engine
             .replace_source(
                 "function handle(event, input) return { outputs = { test_light = true } } end",
             )
             .unwrap();
-        assert_eq!(
-            engine.process_input(trigger(true)).unwrap().effects.len(),
-            1
-        );
+        assert_eq!(effects(&run(&mut engine, false, 2)).len(), 1);
     }
 
     #[test]
-    fn memory_limit_fails_and_next_event_recovers() {
-        let mut engine = Engine::new(EngineConfig::new(
-            vec![
-                endpoint("wall_switch", EndpointDirection::Input, Dpt::BOOL),
-                endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
-            ],
-            "function handle(event, input) local value = string.rep('x', 2 * 1024 * 1024) return { outputs = { test_light = true } } end",
-        ));
-        assert!(matches!(
-            engine.process_input(trigger(true)),
-            Err(ExecutionError::Logic(LogicError::MemoryLimit { .. }))
-        ));
-        engine
-            .replace_source(
-                "function handle(event, input) return { outputs = { test_light = true } } end",
-            )
-            .unwrap();
-        assert_eq!(
-            engine.process_input(trigger(true)).unwrap().effects.len(),
-            1
-        );
-    }
-
-    #[test]
-    fn event_validation_rejects_outputs_and_wrong_dpts() {
+    fn invalid_host_events_and_time_reversal_do_not_change_state() {
         let mut engine = Engine::new(config());
         assert!(matches!(
-            engine.process_input(InputEvent::new(name("test_light"), TypedValue::bool(true))),
-            Err(ExecutionError::Event(EventError::EndpointNotInput { .. }))
+            engine.process_input(
+                InputEvent::new(name("test_light"), TypedValue::bool(true)),
+                MonotonicMs(1),
+            ),
+            Err(EventError::EndpointNotInput { .. })
+        ));
+        assert!(engine.snapshot().known_inputs.is_empty());
+        engine
+            .observe_input(
+                InputObservation::new(name("wall_switch"), TypedValue::bool(true)),
+                MonotonicMs(10),
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.observe_input(
+                InputObservation::new(name("wall_switch"), TypedValue::bool(false)),
+                MonotonicMs(9),
+            ),
+            Err(EventError::TimeWentBackwards { .. })
         ));
         assert!(matches!(
-            engine.process_input(InputEvent::new(
-                name("wall_switch"),
-                TypedValue::percent(42).unwrap()
-            )),
-            Err(ExecutionError::Event(EventError::DptMismatch { .. }))
+            engine.process_input(trigger(false), MonotonicMs(8)),
+            Err(EventError::TimeWentBackwards { .. })
         ));
+        let execution = run(&mut engine, false, 11);
+        assert_eq!(execution.trigger.previous, Some(TypedValue::bool(true)));
     }
 }

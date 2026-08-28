@@ -72,6 +72,14 @@ small { color: #607080; }
 .logic-idle { color: #40515f; background: #e7edf1; }
 .logic-succeeded { color: #075b3a; background: #d5f2e5; }
 .logic-failed { color: #8c1d1d; background: #f8dddd; }
+.execution-history tbody tr { cursor: pointer; }
+.execution-history tbody tr:hover, .execution-history tbody tr:focus { background: #f3f6f8; outline: none; }
+.execution-history tbody tr.selected { background: #e8f0f4; }
+.execution-history tbody tr.pinned { box-shadow: inset 3px 0 #244b63; }
+.selection-notice { color: #734006; background: #fff0d1; border-left: 4px solid #d97706; margin: 14px 0; padding: 8px 10px; font-size: 0.78rem; }
+.runtime-facts { margin-bottom: 14px; }
+.execution-detail { border-top: 1px solid #e1e5e8; margin-top: 14px; padding-top: 14px; }
+.execution-detail h3 { margin: 16px 0 8px; font-size: 0.82rem; letter-spacing: 0.04em; text-transform: uppercase; }
 .section-heading { margin-bottom: 10px; }
 .section-heading h2 { margin-bottom: 0; }
 .section-heading > span { color: #607080; font-size: 0.8rem; }

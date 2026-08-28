@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { DashboardClient, decodeEvent, decodeSnapshot, loadSnapshot } from '../src/lib/api';
 import {
   countdownMs,
+  formatAge,
   formatCountdown,
+  formatDuration,
   initialDashboardState,
   reduceDashboardState
 } from '../src/lib/state';
@@ -23,6 +25,32 @@ function snapshot(revision = 1, overrides: Record<string, unknown> = {}) {
     timer: { state: 'pending', remaining_ms: 4_000 },
     telegrams: [{ time_ms: 12, source: '1.1.1', destination: '1/2/3', service: 'group_value_write', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true } }],
     logs: [{ time_ms: 13, level: 'info', target: 'logiksmith', message: 'ready', fields: { phase: 'startup' } }],
+    ...overrides
+  };
+}
+
+function execution(executionId: number, overrides: Record<string, unknown> = {}) {
+  return {
+    execution_id: executionId,
+    time_ms: executionId * 100,
+    duration_us: 417,
+    logic_revision: 12,
+    status: 'succeeded',
+    trigger: {
+      endpoint: 'wall_switch',
+      dpt: { major: 1, subtype: 1 },
+      value: { kind: 'bool', value: true },
+      previous: null,
+      changed: false,
+      rising: false,
+      falling: false
+    },
+    inputs: [
+      { endpoint: 'wall_switch', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true }, valid: true, age_ms: 0 },
+      { endpoint: 'enabled', dpt: { major: 1, subtype: 1 }, value: null, valid: false, age_ms: null }
+    ],
+    effects: [],
+    error: null,
     ...overrides
   };
 }
@@ -79,6 +107,46 @@ describe('dashboard API and state', () => {
     expect(countdownMs(mapped, 2_250)).toBe(2_750);
     expect(formatCountdown(2_750)).toBe('2.8 s');
     expect(formatCountdown(65_000)).toBe('1:05');
+    expect(formatDuration(417)).toBe('417 μs');
+    expect(formatDuration(1_250)).toBe('1.25 ms');
+    expect(formatAge(null)).toBe('—');
+    expect(formatAge(2_400)).toBe('2.4 s');
+  });
+
+  it('decodes successful, zero-effect, and unknown-input execution records', () => {
+    const mapped = decodeSnapshot(snapshot(1, { logic: { executions: [execution(5, { effects: [{ endpoint: 'test_light', destination: '2/4/52', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true } }] }), execution(3)] } }));
+    expect(mapped.executions).toHaveLength(2);
+    expect(mapped.executions[1]).toMatchObject({ executionId: 3, status: 'succeeded', effects: [], trigger: { previous: null, rising: false } });
+    expect(mapped.executions[1].inputs[1]).toMatchObject({ value: null, valid: false, ageMs: null });
+    expect(mapped.executions[0].effects[0]).toMatchObject({ endpoint: 'test_light', destination: '2/4/52', value: true });
+  });
+
+  it('decodes failed executions with effects and bounded error details', () => {
+    const mapped = decodeSnapshot(snapshot(1, {
+      logic: {
+        executions: [execution(4, {
+          status: 'failed',
+          effects: [],
+          error: { category: 'runtime', message: 'attempt to index nil', line: 7 }
+        })]
+      }
+    }));
+    expect(mapped.executions[0].effects).toHaveLength(0);
+    expect(mapped.executions[0].error).toMatchObject({ category: 'runtime', line: 7 });
+  });
+
+  it('follows the newest execution until an older selection is pinned, then reports eviction', () => {
+    const first = decodeSnapshot(snapshot(1, { logic: { executions: [execution(3), execution(2)] } }));
+    let state = reduceDashboardState(initialDashboardState, { type: 'snapshot_loaded', snapshot: first });
+    expect(state.selectedExecutionId).toBe(3);
+    state = reduceDashboardState(state, { type: 'select_execution', executionId: 2 });
+    expect(state.selectionPinned).toBe(true);
+    state = reduceDashboardState(state, { type: 'event_received', event: { kind: 'update', revision: 2, snapshot: decodeSnapshot(snapshot(2, { logic: { executions: [execution(4), execution(3), execution(2)] } })) } });
+    expect(state.selectedExecutionId).toBe(2);
+    state = reduceDashboardState(state, { type: 'event_received', event: { kind: 'update', revision: 3, snapshot: decodeSnapshot(snapshot(3, { logic: { executions: [execution(5), execution(4), execution(3)] } })) } });
+    expect(state.selectedExecutionId).toBe(5);
+    expect(state.selectionPinned).toBe(false);
+    expect(state.selectionNotice).toMatch(/expired/);
   });
 
   it('decodes the preferred update and resync SSE payloads', () => {

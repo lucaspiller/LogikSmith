@@ -2,7 +2,6 @@ export type ConnectionState = 'starting' | 'connecting' | 'connected' | 'disconn
 export type TimerState = 'idle' | 'pending';
 export type StreamStatus = 'connecting' | 'connected' | 'stale' | 'error';
 export type WriteStatus = 'idle' | 'pending' | 'succeeded' | 'failed';
-export type LogicExecutionStatus = 'idle' | 'succeeded' | 'failed';
 
 export interface DisplayEndpoint {
   name?: string;
@@ -31,21 +30,41 @@ export interface DisplayLogicError {
   line: number | null;
 }
 
-export interface DisplayLogicExecution {
-  status: LogicExecutionStatus;
-  triggerInput: string | null;
-  triggerValue: boolean | number | null;
-  logicRevision: number | null;
-  effectCount: number;
-  error: DisplayLogicError | null;
+export interface DisplayExecutionTrigger {
+  endpoint: string;
+  dpt: string;
+  value: boolean | number;
+  previous: boolean | number | null;
+  changed: boolean;
+  rising: boolean;
+  falling: boolean;
 }
 
-export interface DisplayLogicEffect {
-  time: string;
+export interface DisplayExecutionInput {
   endpoint: string;
-  address: string;
   dpt: string;
   value: boolean | number | null;
+  valid: boolean;
+  ageMs: number | null;
+}
+
+export interface DisplayExecutionEffect {
+  endpoint: string;
+  destination: string;
+  dpt: string;
+  value: boolean | number;
+}
+
+export interface DisplayExecution {
+  executionId: number;
+  timeMs: number;
+  durationUs: number;
+  logicRevision: number | null;
+  status: 'succeeded' | 'failed';
+  trigger: DisplayExecutionTrigger;
+  inputs: DisplayExecutionInput[];
+  effects: DisplayExecutionEffect[];
+  error: DisplayLogicError | null;
 }
 
 export interface DisplayTelegram {
@@ -99,8 +118,7 @@ export interface DisplaySnapshot {
   activeLogicRevision: number | null;
   savedLogicRevision: number | null;
   restartRequired: boolean;
-  logicExecution: DisplayLogicExecution;
-  logicEffects: DisplayLogicEffect[];
+  executions: DisplayExecution[];
   write: DisplayWrite;
   timer: DisplayTimer;
   telegrams: DisplayTelegram[];
@@ -115,6 +133,9 @@ export interface DashboardState {
   error: string | null;
   needsResync: boolean;
   nowMs: number;
+  selectedExecutionId: number | null;
+  selectionPinned: boolean;
+  selectionNotice: string | null;
 }
 
 export type DashboardEvent =
@@ -127,6 +148,7 @@ export type DashboardAction =
   | { type: 'stream_lost'; error?: string }
   | { type: 'stream_error'; error: string }
   | { type: 'event_received'; event: DashboardEvent }
+  | { type: 'select_execution'; executionId: number }
   | { type: 'tick'; nowMs: number };
 
 export const initialDashboardState: DashboardState = {
@@ -136,11 +158,27 @@ export const initialDashboardState: DashboardState = {
   stale: true,
   error: null,
   needsResync: false,
-  nowMs: 0
+  nowMs: 0,
+  selectedExecutionId: null,
+  selectionPinned: false,
+  selectionNotice: null
 };
 
 function staleState(state: DashboardState, error: string | null = state.error): DashboardState {
   return { ...state, streamStatus: 'stale', stale: true, error };
+}
+
+function reconcileSelection(state: DashboardState, snapshot: DisplaySnapshot): Pick<DashboardState, 'selectedExecutionId' | 'selectionPinned' | 'selectionNotice'> {
+  const newest = snapshot.executions[0]?.executionId ?? null;
+  if (!state.selectionPinned) return { selectedExecutionId: newest, selectionPinned: false, selectionNotice: null };
+  if (state.selectedExecutionId !== null && snapshot.executions.some((execution) => execution.executionId === state.selectedExecutionId)) {
+    return { selectedExecutionId: state.selectedExecutionId, selectionPinned: true, selectionNotice: null };
+  }
+  return {
+    selectedExecutionId: newest,
+    selectionPinned: false,
+    selectionNotice: state.selectedExecutionId === null ? null : 'The selected execution expired from memory.'
+  };
 }
 
 export function reduceDashboardState(state: DashboardState, action: DashboardAction): DashboardState {
@@ -157,7 +195,8 @@ export function reduceDashboardState(state: DashboardState, action: DashboardAct
         stale,
         error: null,
         needsResync: false,
-        nowMs: action.nowMs ?? state.nowMs
+        nowMs: action.nowMs ?? state.nowMs,
+        ...reconcileSelection(state, action.snapshot)
       };
     }
 
@@ -190,7 +229,21 @@ export function reduceDashboardState(state: DashboardState, action: DashboardAct
         error: null,
         needsResync: false,
         streamStatus: 'connected',
-        stale: false
+        stale: false,
+        ...reconcileSelection(state, event.snapshot)
+      };
+    }
+
+    case 'select_execution': {
+      if (!state.snapshot) return state;
+      const execution = state.snapshot.executions.find((item) => item.executionId === action.executionId);
+      if (!execution) return state;
+      const newest = state.snapshot.executions[0]?.executionId;
+      return {
+        ...state,
+        selectedExecutionId: execution.executionId,
+        selectionPinned: execution.executionId !== newest,
+        selectionNotice: null
       };
     }
 
@@ -224,6 +277,23 @@ export function formatCountdown(milliseconds: number | null): string {
 
 export function formatValue(value: boolean | number | null): string {
   return value === null ? 'unknown' : String(value);
+}
+
+function trimNumber(value: number, digits: number): string {
+  return value.toFixed(digits).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
+}
+
+export function formatDuration(microseconds: number): string {
+  if (!Number.isFinite(microseconds) || microseconds < 0) return '—';
+  if (microseconds < 1_000) return `${microseconds} μs`;
+  if (microseconds < 1_000_000) return `${trimNumber(microseconds / 1_000, 2)} ms`;
+  return `${trimNumber(microseconds / 1_000_000, 2)} s`;
+}
+
+export function formatAge(milliseconds: number | null): string {
+  if (milliseconds === null || !Number.isFinite(milliseconds) || milliseconds < 0) return '—';
+  if (milliseconds < 1_000) return `${milliseconds} ms`;
+  return `${trimNumber(milliseconds / 1_000, 1)} s`;
 }
 
 export function hasPendingRestart(activeRevision: number | null, savedRevision: number | null, restartRequired = false): boolean {

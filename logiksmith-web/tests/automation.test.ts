@@ -86,9 +86,11 @@ describe('automation editor model', () => {
     expect(emptyAutomation().logic).toEqual({ source: '' });
   });
 
-  it('decodes execution status, errors, and resolved effects', () => {
+  it('uses structural revisions instead of the document revision to determine restart state', () => {
     const snapshot = decodeSnapshot({
       revision: 9,
+      active_automation_revision: 0,
+      saved_automation_revision: 1,
       connection: { state: 'connected' },
       config: { active: { inputs: document().inputs, outputs: document().outputs, knx_bindings: document().knx_bindings, logic: document().logic } },
       values: { endpoints: [{ name: 'wall_switch', observed: { kind: 'bool', value: true } }, { name: 'test_light', observed: { kind: 'bool', value: false }, requested: { kind: 'bool', value: true } }] },
@@ -98,13 +100,26 @@ describe('automation editor model', () => {
         active_logic_revision: 8,
         saved_logic_revision: 8,
         restart_required: false,
-        last_execution: { status: 'failed', trigger: { endpoint: 'wall_switch', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true } }, logic_revision: 8, effect_count: 0, error: { category: 'runtime', line: 4, message: 'attempt to index nil' } },
-        recent_effects: [{ endpoint: 'test_light', destination: '13/0/1', dpt: '1.001', value: { kind: 'bool', value: true } }]
+        executions: [{
+          execution_id: 9,
+          time_ms: 8123,
+          duration_us: 417,
+          logic_revision: 8,
+          status: 'failed',
+          trigger: { endpoint: 'wall_switch', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true }, previous: { kind: 'bool', value: false }, changed: true, rising: true, falling: false },
+          inputs: [
+            { endpoint: 'wall_switch', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true }, valid: true, age_ms: 0 },
+            { endpoint: 'enabled', dpt: { major: 1, subtype: 1 }, value: null, valid: false, age_ms: null }
+          ],
+          effects: [],
+          error: { category: 'runtime', line: 4, message: 'attempt to index nil' }
+        }]
       },
       timer: { state: 'idle' }, telegrams: [], logs: []
     });
-    expect(snapshot.logicExecution.error).toMatchObject({ category: 'runtime', line: 4 });
-    expect(snapshot.logicEffects[0]).toMatchObject({ endpoint: 'test_light', address: '13/0/1', value: true });
+    expect(snapshot.executions[0]).toMatchObject({ executionId: 9, status: 'failed', durationUs: 417, trigger: { previous: false, changed: true, rising: true } });
+    expect(snapshot.executions[0].inputs[1]).toMatchObject({ endpoint: 'enabled', value: null, valid: false, ageMs: null });
+    expect(snapshot.executions[0].error).toMatchObject({ category: 'runtime', line: 4 });
     expect(snapshot.restartRequired).toBe(false);
   });
 });

@@ -5,8 +5,8 @@ pub mod web;
 
 use diagnostics::{ConnectionState, DiagnosticStore, TelegramRecord};
 use logiksmith_core::{
-    Dpt, Effect, Endpoint, EndpointDirection, EndpointName, Engine, EngineConfig, ExecutionError,
-    InputEvent, InputObservation, TypedValue, Value,
+    Dpt, Effect, Endpoint, EndpointDirection, EndpointName, Engine, EngineConfig, InputEvent,
+    InputObservation, TypedValue, Value,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -16,7 +16,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
@@ -37,7 +37,8 @@ pub const PROTOCOL_VERSION: u64 = 1;
 /// engine, so activation is acknowledged on that same task between events.
 pub struct ActivationRequest {
     pub source: String,
-    pub revision: u64,
+    pub logic_hash: u64,
+    pub document_revision: u64,
     pub reply: oneshot::Sender<Result<(), String>>,
 }
 
@@ -144,7 +145,7 @@ pub struct AutomationRuntime {
     pub endpoint_to_address: HashMap<EndpointName, GroupAddress>,
     pub endpoint_dpts: HashMap<EndpointName, Dpt>,
     pub structural_revision: u64,
-    pub logic_revision: u64,
+    pub document_revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +163,15 @@ pub struct AutomationDocument {
     pub outputs: Vec<AutomationEndpoint>,
     pub knx_bindings: Vec<KnxBinding>,
     pub logic: LogicDocument,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct StoredAutomation {
+    #[serde(default)]
+    revision: u16,
+    #[serde(flatten)]
+    document: AutomationDocument,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -356,10 +366,6 @@ fn endpoint_name(path: &str, value: &str) -> Result<EndpointName, FieldError> {
 
 const MAX_LOGIC_SOURCE_BYTES: usize = 64 * 1024;
 
-pub fn logic_revision(source: &str) -> u64 {
-    automation_revision(source.as_bytes())
-}
-
 pub fn structural_revision(document: &AutomationDocument) -> u64 {
     let mut structure = document.clone();
     structure.logic.source.clear();
@@ -518,7 +524,7 @@ pub fn build_automation(
     }
     Ok(AutomationRuntime {
         structural_revision: structural_revision(&document),
-        logic_revision: logic_revision(&document.logic.source),
+        document_revision: 0,
         document,
         engine_config,
         address_to_endpoint,
@@ -536,16 +542,27 @@ pub fn automation_revision(source: &[u8]) -> u64 {
     hash
 }
 
-pub fn load_automation(path: &Path) -> Result<(AutomationDocument, u64), AutomationFileError> {
+pub fn load_automation(path: &Path) -> Result<(AutomationDocument, u16), AutomationFileError> {
     let source = fs::read(path).map_err(|source| AutomationFileError::Read {
         path: path.to_path_buf(),
         source,
     })?;
     let text = String::from_utf8_lossy(&source);
-    let document =
-        toml::from_str::<AutomationDocument>(&text).map_err(AutomationFileError::Toml)?;
-    build_automation(document.clone()).map_err(AutomationFileError::Invalid)?;
-    Ok((document, automation_revision(&source)))
+    let stored = toml::from_str::<StoredAutomation>(&text).map_err(AutomationFileError::Toml)?;
+    build_automation(stored.document.clone()).map_err(AutomationFileError::Invalid)?;
+    Ok((stored.document, stored.revision))
+}
+
+pub fn serialize_automation(
+    document: &AutomationDocument,
+    revision: u16,
+) -> Result<Vec<u8>, String> {
+    toml::to_string_pretty(&StoredAutomation {
+        revision,
+        document: document.clone(),
+    })
+    .map(|text| text.into_bytes())
+    .map_err(|error| error.to_string())
 }
 
 pub fn load_config(
@@ -563,9 +580,11 @@ pub fn load_config(
             source,
         })?;
     let automation_text = String::from_utf8_lossy(&automation_source);
-    let document = toml::from_str::<AutomationDocument>(&automation_text)
+    let stored = toml::from_str::<StoredAutomation>(&automation_text)
         .map_err(ConfigError::AutomationToml)?;
-    let automation = build_automation(document).map_err(ConfigError::AutomationInvalid)?;
+    let mut automation =
+        build_automation(stored.document).map_err(ConfigError::AutomationInvalid)?;
+    automation.document_revision = u64::from(stored.revision);
     if raw.knx.connection_type != "tunneling" {
         return Err(field("knx.connection_type", "must be 'tunneling'"));
     }
@@ -597,7 +616,7 @@ pub fn load_config(
         config_path: config_path.to_path_buf(),
         automation_path: automation_path.to_path_buf(),
         automation,
-        automation_revision: automation_revision(&automation_source),
+        automation_revision: u64::from(stored.revision),
         connection: ConnectionConfig {
             gateway_ip,
             gateway_port: raw.knx.gateway_port as u16,
@@ -1271,6 +1290,8 @@ async fn run_session(
     };
     store.set_connection(ConnectionState::Connected);
     tracing::info!(target: "logiksmith", gateway = %ready.gateway, "KNX connected");
+    let interrupt = signal::ctrl_c();
+    tokio::pin!(interrupt);
     let mut line = String::new();
     let mut next_request_id = 1u64;
     let mut pending = HashSet::new();
@@ -1290,13 +1311,23 @@ async fn run_session(
                         if binding.direction != EndpointDirection::Input || event.value.is_none() { continue; }
                         if event.service == "group_value_write" {
                             let input = match event.to_input_event(binding.endpoint.clone()) { Ok(input) => input, Err(error) => { tracing::warn!(target: "logiksmith", error = %error, "ignoring invalid logical input event"); continue; } };
-                            let revision = engine.active_logic_revision();
-                            let execution = match engine.handle_event(input.clone()) { Ok(execution) => execution, Err(error) => { let (category, message, line) = logic_error_details(&error); store.record_logic_failure(&input, revision, category, message, line); continue; } };
-                            store.record_logic_success(&input, revision, &execution.effects, &config.automation);
-                            dispatch_effects(store, stdin, &config.automation, execution.effects, &mut next_request_id, &mut pending).await?;
+                            let now = store.now();
+                            let started = Instant::now();
+                            let execution = match engine.process_input(input, now) {
+                                Ok(execution) => execution,
+                                Err(error) => {
+                                    tracing::warn!(target: "logiksmith", error = %error, "ignoring invalid logical input event");
+                                    continue;
+                                }
+                            };
+                            let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                            store.record_execution(&execution, duration_us, &config.automation);
+                            if let Ok(effects) = &execution.outcome {
+                                dispatch_effects(store, stdin, &config.automation, effects.clone(), &mut next_request_id, &mut pending).await?;
+                            }
                         } else if event.service == "group_value_response"
                             && let Ok(observation) = event.to_input_observation(binding.endpoint.clone())
-                            && let Err(error) = engine.observe_input(observation) { tracing::warn!(target: "logiksmith", error = %error, "ignoring invalid passive input observation"); }
+                            && let Err(error) = engine.observe_input(observation, store.now()) { tracing::warn!(target: "logiksmith", error = %error, "ignoring invalid passive input observation"); }
                     }
                     Message::CommandResult(result) => {
                         if !pending.remove(&result.request_id) { return Err(HostError::UnknownRequest(result.request_id)); }
@@ -1308,14 +1339,14 @@ async fn run_session(
             }
             Some(request) = activations.recv() => {
                 let source = request.source;
-                let result = engine.replace_logic(source.clone(), request.revision).map(|_| ()).map_err(|error| error.to_string());
-                if result.is_ok() { store.set_active_logic(request.revision, source); }
+                let result = engine.replace_logic(source.clone(), request.logic_hash).map(|_| ()).map_err(|error| error.to_string());
+                if result.is_ok() { store.set_active_logic(request.document_revision, source); }
                 let _ = request.reply.send(result);
             }
-            signal = signal::ctrl_c() => {
+            signal = &mut interrupt => {
                 signal?;
-                send_message(stdin, &shutdown_message()).await?;
-                let _ = time::timeout(Duration::from_secs(2), child.wait()).await;
+                let _ = send_message(stdin, &shutdown_message()).await;
+                terminate_child(child).await;
                 return Ok(());
             }
         }
@@ -1418,17 +1449,6 @@ async fn send_message(stdin: &mut ChildStdin, message: &Message) -> Result<(), H
     stdin.write_all(b"\n").await?;
     stdin.flush().await?;
     Ok(())
-}
-
-fn logic_error_details(error: &ExecutionError) -> (&'static str, String, Option<u32>) {
-    match error {
-        ExecutionError::Logic(error) => (
-            error.category(),
-            error.message().to_owned(),
-            error.line().and_then(|line| u32::try_from(line).ok()),
-        ),
-        ExecutionError::Event(error) => ("runtime", error.to_string(), None),
-    }
 }
 
 fn init_logging(config: LoggingConfig, store: DiagnosticStore) {

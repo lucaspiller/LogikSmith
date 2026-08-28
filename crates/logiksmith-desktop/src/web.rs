@@ -4,7 +4,7 @@ use crate::{
     ActivationRequest, AutomationDocument, AutomationEnvelope, FieldError, WebConfig,
     build_automation,
     diagnostics::{DiagnosticStore, DiagnosticUpdate, Replay, Snapshot},
-    load_automation,
+    load_automation, serialize_automation,
 };
 use axum::{
     Router,
@@ -31,6 +31,7 @@ use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
+    time,
 };
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -67,7 +68,13 @@ impl WebServer {
         if let Some(sender) = self.shutdown.take() {
             let _ = sender.send(());
         }
-        let _ = self.task.await;
+        if time::timeout(Duration::from_secs(2), &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            let _ = self.task.await;
+        }
     }
 }
 
@@ -184,7 +191,7 @@ async fn get_automation(State(state): State<AppState>) -> Response {
                 StatusCode::OK,
                 Json(AutomationEnvelope {
                     document,
-                    revision,
+                    revision: u64::from(revision),
                     active_structural_revision: snapshot.logic.active_structural_revision,
                     saved_structural_revision: snapshot.logic.saved_structural_revision,
                     active_logic_revision: snapshot.logic.active_logic_revision,
@@ -201,7 +208,7 @@ async fn get_automation(State(state): State<AppState>) -> Response {
 #[derive(Debug, Deserialize)]
 struct SaveAutomationRequest {
     document: AutomationDocument,
-    revision: u64,
+    revision: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -228,11 +235,11 @@ async fn put_automation(
 ) -> Response {
     let path = state.store.automation_path();
     let candidate_structural_revision = crate::structural_revision(&request.document);
-    let candidate_logic_revision = crate::logic_revision(&request.document.logic.source);
+    let candidate_logic_hash = crate::automation_revision(request.document.logic.source.as_bytes());
     enum SaveOutcome {
-        Conflict(AutomationDocument, u64),
+        Conflict(AutomationDocument, u16),
         Invalid(Vec<FieldError>),
-        Saved(Result<u64, String>),
+        Saved(Result<u16, String>),
     }
     // Keep the stale check and rename under one lock. The await below happens
     // only after this guard is dropped, so the axum handler remains Send.
@@ -250,7 +257,7 @@ async fn put_automation(
         } else if let Err(errors) = build_automation(request.document.clone()) {
             SaveOutcome::Invalid(errors)
         } else {
-            SaveOutcome::Saved(atomic_save(&path, &request.document))
+            SaveOutcome::Saved(atomic_save(&path, &request.document, current_revision))
         }
     };
     match save {
@@ -260,7 +267,7 @@ async fn put_automation(
                 StatusCode::CONFLICT,
                 Json(AutomationEnvelope {
                     document: current,
-                    revision: current_revision,
+                    revision: u64::from(current_revision),
                     active_structural_revision: snapshot.logic.active_structural_revision,
                     saved_structural_revision: snapshot.logic.saved_structural_revision,
                     active_logic_revision: snapshot.logic.active_logic_revision,
@@ -287,7 +294,8 @@ async fn put_automation(
                         let (reply, result) = oneshot::channel();
                         let request = ActivationRequest {
                             source: request.document.logic.source.clone(),
-                            revision: candidate_logic_revision,
+                            logic_hash: candidate_logic_hash,
+                            document_revision: u64::from(revision),
                             reply,
                         };
                         if activation.send(request).await.is_ok() {
@@ -301,14 +309,14 @@ async fn put_automation(
                     restart_required = !logic_activated;
                 }
                 state.store.set_saved_logic_state(
-                    revision,
-                    candidate_logic_revision,
+                    u64::from(revision),
+                    u64::from(revision),
                     candidate_structural_revision,
                     restart_required,
                 );
                 if logic_activated {
                     state.store.set_active_logic(
-                        candidate_logic_revision,
+                        u64::from(revision),
                         request.document.logic.source.clone(),
                     );
                 }
@@ -316,7 +324,7 @@ async fn put_automation(
                 (
                     StatusCode::OK,
                     Json(SaveAutomationResponse {
-                        revision,
+                        revision: u64::from(revision),
                         logic_activated,
                         active_logic_revision,
                         restart_required,
@@ -333,10 +341,15 @@ fn json_error(status: StatusCode, error: String) -> Response {
     (status, Json(ErrorResponse { error })).into_response()
 }
 
-fn atomic_save(path: &Path, document: &AutomationDocument) -> Result<u64, String> {
-    let bytes = toml::to_string_pretty(document)
-        .map_err(|error| error.to_string())?
-        .into_bytes();
+fn atomic_save(
+    path: &Path,
+    document: &AutomationDocument,
+    current_revision: u16,
+) -> Result<u16, String> {
+    let revision = current_revision.checked_add(1).ok_or_else(|| {
+        "automation revision is exhausted; reset it manually before saving".to_owned()
+    })?;
+    let bytes = serialize_automation(document, revision)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -361,7 +374,7 @@ fn atomic_save(path: &Path, document: &AutomationDocument) -> Result<u64, String
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result.map(|_| crate::automation_revision(&bytes))
+    result.map(|_| revision)
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,6 +515,48 @@ mod tests {
         )
     }
 
+    #[test]
+    fn saved_document_revision_is_persisted_and_incremented() {
+        let path = std::env::temp_dir().join(format!(
+            "logiksmith-automation-revision-{}-{}.toml",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let document = AutomationDocument {
+            inputs: vec![crate::AutomationEndpoint {
+                name: "switch".to_owned(),
+                dpt: "1.001".to_owned(),
+            }],
+            outputs: vec![crate::AutomationEndpoint {
+                name: "light".to_owned(),
+                dpt: "1.001".to_owned(),
+            }],
+            knx_bindings: vec![
+                crate::KnxBinding {
+                    endpoint: "switch".to_owned(),
+                    group_address: "1/1/1".to_owned(),
+                },
+                crate::KnxBinding {
+                    endpoint: "light".to_owned(),
+                    group_address: "1/1/2".to_owned(),
+                },
+            ],
+            logic: crate::LogicDocument {
+                source: "function handle() end".to_owned(),
+            },
+        };
+        fs::write(&path, serialize_automation(&document, 41).unwrap()).unwrap();
+
+        assert_eq!(load_automation(&path).unwrap().1, 41);
+        assert_eq!(atomic_save(&path, &document, 41).unwrap(), 42);
+        assert_eq!(load_automation(&path).unwrap().1, 42);
+
+        let _ = fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn missing_assets_are_a_startup_error() {
         let root =
@@ -540,6 +595,39 @@ mod tests {
         stream.read_to_end(&mut response).await.unwrap();
         assert!(String::from_utf8_lossy(&response).contains("dashboard"));
         server.shutdown().await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_an_open_sse_stream() {
+        let root =
+            std::env::temp_dir().join(format!("logiksmith-sse-shutdown-{}", std::process::id()));
+        let _ = fs::create_dir_all(&root);
+        fs::write(root.join("index.html"), "dashboard").unwrap();
+        let store = store();
+        let server = start_web_server_with_assets(
+            store.clone(),
+            WebConfig {
+                listen_ip: "127.0.0.1".parse().unwrap(),
+                listen_port: 0,
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(server.address)
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /api/events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        store.set_connection(crate::diagnostics::ConnectionState::Connected);
+        let mut response = [0; 256];
+        stream.read(&mut response).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server.shutdown())
+            .await
+            .expect("shutdown must not wait for an SSE client");
         let _ = fs::remove_dir_all(root);
     }
 

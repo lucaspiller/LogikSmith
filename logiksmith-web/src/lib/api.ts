@@ -4,9 +4,11 @@ import type {
   DisplayAutomation,
   DisplayBinding,
   DisplayEndpoint,
-  DisplayLogicEffect,
+  DisplayExecution,
+  DisplayExecutionEffect,
+  DisplayExecutionInput,
+  DisplayExecutionTrigger,
   DisplayLogicError,
-  DisplayLogicExecution,
   DisplayLog,
   DisplaySnapshot,
   DisplayTelegram,
@@ -46,6 +48,11 @@ function required(value: unknown, path: string): unknown {
   return value;
 }
 
+function nullableField(source: JsonObject, name: string, path: string): unknown {
+  if (!(name in source)) throw new ApiDecodeError(path, 'required field is missing');
+  return source[name];
+}
+
 function field(record: JsonObject, path: string, ...names: string[]): unknown {
   for (const name of names) if (name in record) return record[name];
   return undefined;
@@ -81,6 +88,12 @@ function nonNegativeNumber(value: unknown, path: string): number {
 function revision(value: unknown, path: string): number {
   const number = nonNegativeNumber(value, path);
   if (!Number.isInteger(number)) throw new ApiDecodeError(path, 'expected an integer');
+  return number;
+}
+
+function integer(value: unknown, path: string): number {
+  const number = nonNegativeNumber(value, path);
+  if (!Number.isInteger(number)) throw new ApiDecodeError(path, 'expected a non-negative integer');
   return number;
 }
 
@@ -301,37 +314,103 @@ function logicError(value: unknown, path: string): DisplayLogicError {
   return { category, message, line };
 }
 
-function logicExecution(value: unknown): DisplayLogicExecution {
-  if (value === undefined || value === null) return { status: 'idle', triggerInput: null, triggerValue: null, logicRevision: null, effectCount: 0, error: null };
-  const source = object(value, 'logic_execution');
-  const statusRaw = field(source, 'logic_execution', 'status', 'state') ?? 'idle';
-  const status = stringValue(statusRaw, 'logic_execution.status');
-  if (status !== 'idle' && status !== 'succeeded' && status !== 'failed') throw new ApiDecodeError('logic_execution.status', `unsupported status ${status}`);
-  const trigger = isObject(field(source, 'logic_execution', 'trigger')) ? object(field(source, 'logic_execution', 'trigger'), 'logic_execution.trigger') : null;
-  const triggerValueRaw = field(source, 'logic_execution', 'trigger_value', 'triggerValue', 'value') ?? (trigger ? field(trigger, 'logic_execution.trigger', 'value') : undefined);
-  const errorRaw = field(source, 'logic_execution', 'error', 'last_error');
+function executionDpt(value: unknown, path: string): string {
+  if (!isObject(value)) throw new ApiDecodeError(path, 'expected a DPT object');
+  return dpt(value, path);
+}
+
+function executionValue(value: unknown, path: string): boolean | number | null {
+  if (value === null) return null;
+  if (!isObject(value)) throw new ApiDecodeError(path, 'expected a typed value or null');
+  const kind = field(value, path, 'kind');
+  const raw = required(field(value, path, 'value'), `${path}.value`);
+  if (kind === 'bool') {
+    const boolean = nullableBoolean(raw, `${path}.value`);
+    if (boolean === null) throw new ApiDecodeError(`${path}.value`, 'typed boolean cannot be null');
+    return boolean;
+  }
+  if (kind === 'percent') {
+    const percentage = nonNegativeNumber(raw, `${path}.value`);
+    if (percentage > 100) throw new ApiDecodeError(`${path}.value`, 'percentage must be between 0 and 100');
+    return percentage;
+  }
+  throw new ApiDecodeError(`${path}.kind`, 'expected bool or percent');
+}
+
+function executionTrigger(value: unknown, path: string): DisplayExecutionTrigger {
+  const source = object(value, path);
+  const current = executionValue(required(field(source, path, 'value'), `${path}.value`), `${path}.value`);
+  if (current === null) throw new ApiDecodeError(`${path}.value`, 'trigger value cannot be null');
+  const previous = executionValue(nullableField(source, 'previous', `${path}.previous`), `${path}.previous`);
   return {
-    status,
-    triggerInput: optionalString(field(source, 'logic_execution', 'trigger_input', 'triggerInput', 'input') ?? (trigger ? field(trigger, 'logic_execution.trigger', 'endpoint', 'input', 'name') : undefined), 'logic_execution.trigger_input'),
-    triggerValue: triggerValueRaw === undefined ? null : displayValue(triggerValueRaw, 'logic_execution.trigger_value'),
-    logicRevision: optionalRevision(field(source, 'logic_execution', 'logic_revision', 'logicRevision', 'revision'), 'logic_execution.logic_revision'),
-    effectCount: nonNegativeNumber(field(source, 'logic_execution', 'effect_count', 'effectCount', 'effects_count') ?? 0, 'logic_execution.effect_count'),
-    error: errorRaw === undefined || errorRaw === null ? null : logicError(errorRaw, 'logic_execution.error')
+    endpoint: stringValue(required(field(source, path, 'endpoint'), `${path}.endpoint`), `${path}.endpoint`),
+    dpt: executionDpt(required(field(source, path, 'dpt'), `${path}.dpt`), `${path}.dpt`),
+    value: current,
+    previous,
+    changed: booleanField(source, path, 'changed'),
+    rising: booleanField(source, path, 'rising'),
+    falling: booleanField(source, path, 'falling')
   };
 }
 
-function logicEffect(value: unknown, index: number): DisplayLogicEffect {
-  const path = `logic_effects[${index}]`;
+function booleanField(source: JsonObject, path: string, name: string): boolean {
+  const value = required(field(source, path, name), `${path}.${name}`);
+  if (typeof value !== 'boolean') throw new ApiDecodeError(`${path}.${name}`, 'expected a boolean');
+  return value;
+}
+
+function executionInput(value: unknown, executionIndex: number, index: number): DisplayExecutionInput {
+  const path = `logic.executions[${executionIndex}].inputs[${index}]`;
   const source = object(value, path);
-  const endpointName = stringValue(required(field(source, path, 'endpoint', 'output', 'name'), `${path}.endpoint`), `${path}.endpoint`);
-  const addressRaw = field(source, path, 'address', 'group_address', 'groupAddress', 'destination');
-  const dptRaw = field(source, path, 'dpt');
+  const snapshotValue = executionValue(nullableField(source, 'value', `${path}.value`), `${path}.value`);
+  const valid = booleanField(source, path, 'valid');
+  const ageRaw = nullableField(source, 'age_ms', `${path}.age_ms`);
+  const ageMs = ageRaw === null ? null : integer(ageRaw, `${path}.age_ms`);
+  if (valid !== (snapshotValue !== null)) throw new ApiDecodeError(path, 'valid must match value presence');
+  if (!valid && ageMs !== null) throw new ApiDecodeError(`${path}.age_ms`, 'invalid inputs must have a null age');
+  if (valid && ageMs === null) throw new ApiDecodeError(`${path}.age_ms`, 'valid inputs must have an age');
   return {
-    time: field(source, path, 'time', 'time_ms', 'timeMs', 'timestamp') === undefined ? '—' : timeValue(field(source, path, 'time', 'time_ms', 'timeMs', 'timestamp'), `${path}.time`),
-    endpoint: endpointName,
-    address: addressRaw === undefined || addressRaw === null ? '—' : stringValue(addressRaw, `${path}.address`),
-    dpt: dptRaw === undefined || dptRaw === null ? '—' : dpt(dptRaw, `${path}.dpt`),
-    value: displayValue(field(source, path, 'value', 'data'), `${path}.value`)
+    endpoint: stringValue(required(field(source, path, 'endpoint'), `${path}.endpoint`), `${path}.endpoint`),
+    dpt: executionDpt(required(field(source, path, 'dpt'), `${path}.dpt`), `${path}.dpt`),
+    value: snapshotValue,
+    valid,
+    ageMs
+  };
+}
+
+function executionEffect(value: unknown, executionIndex: number, index: number): DisplayExecutionEffect {
+  const path = `logic.executions[${executionIndex}].effects[${index}]`;
+  const source = object(value, path);
+  const effectValue = executionValue(required(field(source, path, 'value'), `${path}.value`), `${path}.value`);
+  if (effectValue === null) throw new ApiDecodeError(`${path}.value`, 'effect value cannot be null');
+  return {
+    endpoint: stringValue(required(field(source, path, 'endpoint'), `${path}.endpoint`), `${path}.endpoint`),
+    destination: stringValue(required(field(source, path, 'destination'), `${path}.destination`), `${path}.destination`),
+    dpt: executionDpt(required(field(source, path, 'dpt'), `${path}.dpt`), `${path}.dpt`),
+    value: effectValue
+  };
+}
+
+function execution(value: unknown, index: number): DisplayExecution {
+  const path = `logic.executions[${index}]`;
+  const source = object(value, path);
+  const status = stringValue(required(field(source, path, 'status'), `${path}.status`), `${path}.status`);
+  if (status !== 'succeeded' && status !== 'failed') throw new ApiDecodeError(`${path}.status`, `unsupported status ${status}`);
+  const triggerSource = object(required(field(source, path, 'trigger'), `${path}.trigger`), `${path}.trigger`);
+  const inputs = array(required(field(source, path, 'inputs'), `${path}.inputs`), `${path}.inputs`).map((item, inputIndex) => executionInput(item, index, inputIndex));
+  const effects = array(required(field(source, path, 'effects'), `${path}.effects`), `${path}.effects`).map((item, effectIndex) => executionEffect(item, index, effectIndex));
+  const errorRaw = field(source, path, 'error');
+  if (status === 'failed' && effects.length > 0) throw new ApiDecodeError(`${path}.effects`, 'failed executions cannot contain effects');
+  return {
+    executionId: integer(required(field(source, path, 'execution_id'), `${path}.execution_id`), `${path}.execution_id`),
+    timeMs: integer(required(field(source, path, 'time_ms'), `${path}.time_ms`), `${path}.time_ms`),
+    durationUs: integer(required(field(source, path, 'duration_us'), `${path}.duration_us`), `${path}.duration_us`),
+    logicRevision: optionalRevision(required(field(source, path, 'logic_revision'), `${path}.logic_revision`), `${path}.logic_revision`),
+    status: status as DisplayExecution['status'],
+    trigger: executionTrigger(triggerSource, `${path}.trigger`),
+    inputs,
+    effects,
+    error: errorRaw === undefined || errorRaw === null ? null : logicError(errorRaw, `${path}.error`)
   };
 }
 
@@ -367,8 +446,9 @@ export function decodeSnapshot(input: unknown, receivedAtMs = Date.now()): Displ
   const outputObserved = outputValuesRaw === undefined && firstOutput?.name ? endpointValuesByName.get(firstOutput.name)?.observed ?? null : valueFrom(outputValues, 'values.output', 'observed');
   const outputRequested = outputValuesRaw === undefined && firstOutput?.name ? endpointValuesByName.get(firstOutput.name)?.requested ?? null : valueFrom(outputValues, 'values.output', 'requested');
 
-  const logicExecutionRaw = field(root, 'snapshot', 'logic_execution', 'logicExecution', 'last_logic_execution', 'lastLogicExecution') ?? (logicStatus ? field(logicStatus, 'logic', 'last_execution', 'lastExecution') : undefined);
-  const effectsRaw = field(root, 'snapshot', 'logic_effects', 'logicEffects', 'recent_logic_effects', 'recentLogicEffects', 'effects') ?? (logicStatus ? field(logicStatus, 'logic', 'recent_effects', 'recentEffects') : undefined);
+  const executions = logicStatus
+    ? array(required(field(logicStatus, 'logic', 'executions'), 'logic.executions'), 'logic.executions').map(execution)
+    : [];
   const activeAutomationRevision = optionalRevision(activeRevisionRaw, 'active_automation_revision');
   const savedAutomationRevision = optionalRevision(savedRevisionRaw, 'saved_automation_revision');
   const activeStructuralRevision = optionalRevision(activeStructuralRevisionRaw, 'active_structural_revision');
@@ -376,8 +456,10 @@ export function decodeSnapshot(input: unknown, receivedAtMs = Date.now()): Displ
   const activeLogicRevision = optionalRevision(activeLogicRevisionRaw, 'active_logic_revision');
   const savedLogicRevision = optionalRevision(savedLogicRevisionRaw, 'saved_logic_revision');
   const explicitRestart = field(root, 'snapshot', 'restart_required', 'restartRequired') ?? (logicStatus ? field(logicStatus, 'logic', 'restart_required', 'restartRequired') : undefined) ?? field(config, 'config', 'restart_required', 'restartRequired');
-  const restartRequired = explicitRestart === true || (activeStructuralRevision !== null && savedStructuralRevision !== null && activeStructuralRevision !== savedStructuralRevision) || (activeAutomationRevision !== null && savedAutomationRevision !== null && activeAutomationRevision !== savedAutomationRevision);
-  const logicEffects = effectsRaw === undefined || effectsRaw === null ? [] : array(effectsRaw, 'logic_effects').map(logicEffect);
+  const hasStructuralRevisions = activeStructuralRevision !== null && savedStructuralRevision !== null;
+  const restartRequired = explicitRestart === true || (hasStructuralRevisions
+    ? activeStructuralRevision !== savedStructuralRevision
+    : activeAutomationRevision !== null && savedAutomationRevision !== null && activeAutomationRevision !== savedAutomationRevision);
   return {
     revision: revision(required(field(root, 'snapshot', 'revision'), 'revision'), 'revision'),
     connection: connection(required(field(root, 'snapshot', 'connection'), 'connection')),
@@ -401,8 +483,7 @@ export function decodeSnapshot(input: unknown, receivedAtMs = Date.now()): Displ
     activeLogicRevision,
     savedLogicRevision,
     restartRequired,
-    logicExecution: logicExecution(logicExecutionRaw),
-    logicEffects,
+    executions,
     write: write(field(root, 'write', 'write_status', 'last_write')),
     timer: field(root, 'snapshot', 'timer') === undefined ? { state: 'idle', deadlineMs: null, remainingMs: null, sampledAtMs: receivedAtMs } : timer(field(root, 'snapshot', 'timer'), receivedAtMs),
     telegrams: telegrams as DisplayTelegram[],
