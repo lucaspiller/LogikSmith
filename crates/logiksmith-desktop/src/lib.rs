@@ -612,6 +612,24 @@ pub fn load_config(
     config_path: &Path,
     automation_path: &Path,
 ) -> Result<RuntimeConfig, ConfigError> {
+    load_config_with_bridge_validation(config_path, automation_path, true)
+}
+
+/// Loads the browser/simulation runtime configuration without requiring an
+/// installed Python bridge executable. KNX details remain parsed so the same
+/// local configuration works when normal mode resumes.
+pub fn load_simulation_config(
+    config_path: &Path,
+    automation_path: &Path,
+) -> Result<RuntimeConfig, ConfigError> {
+    load_config_with_bridge_validation(config_path, automation_path, false)
+}
+
+fn load_config_with_bridge_validation(
+    config_path: &Path,
+    automation_path: &Path,
+    validate_bridge: bool,
+) -> Result<RuntimeConfig, ConfigError> {
     let source = fs::read_to_string(config_path).map_err(|source| ConfigError::Read {
         path: config_path.to_path_buf(),
         source,
@@ -645,7 +663,7 @@ pub fn load_config(
         return Err(field("bridge.python", "must not be empty"));
     }
     let python = PathBuf::from(&raw.bridge.python);
-    if !python.is_file() {
+    if validate_bridge && !python.is_file() {
         return Err(field(
             "bridge.python",
             format!("executable does not exist: {}", python.display()),
@@ -1369,6 +1387,41 @@ pub async fn run(config: RuntimeConfig) -> Result<(), HostError> {
     .await
 }
 
+/// Runs the browser editor and Lua simulator without spawning the KNX bridge.
+/// Normal [`run`] startup keeps its fatal bridge-failure behaviour.
+pub async fn run_simulation_only(config: RuntimeConfig) -> Result<(), HostError> {
+    let store = DiagnosticStore::new(
+        &config.automation,
+        config.automation_path.clone(),
+        config.automation_revision,
+    );
+    init_logging(config.logging, store.clone());
+    store.set_connection(ConnectionState::Disconnected);
+    let mut engine = Engine::try_new(config.automation.engine_config.clone()).map_err(|error| {
+        HostError::Protocol(ProtocolError::Field("automation", error.to_string()))
+    })?;
+    let (activation_sender, activation_receiver) = mpsc::channel(8);
+    let (simulation_sender, simulation_receiver) = mpsc::channel(8);
+    let web_server = web::start_web_server_with_runtime(
+        store.clone(),
+        config.web,
+        activation_sender,
+        simulation_sender,
+    )
+    .await?;
+    tracing::info!(target: "logiksmith", "simulation-only mode ready; KNX bridge disabled");
+    let result = run_simulation_session(
+        &config,
+        &store,
+        &mut engine,
+        activation_receiver,
+        simulation_receiver,
+    )
+    .await;
+    web_server.shutdown().await;
+    result
+}
+
 pub async fn run_with_bridge(
     config: RuntimeConfig,
     bridge_command: BridgeCommand,
@@ -1442,6 +1495,32 @@ async fn forward_bridge_stderr<R: AsyncRead + Unpin>(stderr: R) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         tracing::debug!(target: "bridge.xknx", "{line}");
+    }
+}
+
+async fn run_simulation_session(
+    config: &RuntimeConfig,
+    store: &DiagnosticStore,
+    engine: &mut Engine,
+    mut activations: mpsc::Receiver<ActivationRequest>,
+    mut simulations: mpsc::Receiver<SimulationRequest>,
+) -> Result<(), HostError> {
+    let interrupt = signal::ctrl_c();
+    tokio::pin!(interrupt);
+    let mut active_logic_revision = config.automation.document_revision;
+    loop {
+        tokio::select! {
+            Some(request) = activations.recv() => {
+                apply_activation(engine, store, &mut active_logic_revision, request);
+            }
+            Some(request) = simulations.recv() => {
+                apply_simulation(engine, config, active_logic_revision, request);
+            }
+            signal = &mut interrupt => {
+                signal?;
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -1541,42 +1620,10 @@ async fn run_session(
                 }
             }
             Some(request) = activations.recv() => {
-                let source = request.source;
-                let result = engine.replace_logic(source.clone(), request.logic_hash).map(|_| ()).map_err(|error| error.to_string());
-                if result.is_ok() {
-                    active_logic_revision = request.document_revision;
-                    store.set_active_logic(request.document_revision, source);
-                }
-                let _ = request.reply.send(result);
+                apply_activation(engine, store, &mut active_logic_revision, request);
             }
             Some(request) = simulations.recv() => {
-                let SimulationRequest { payload, reply } = request;
-                let outcome = if payload.expected_logic_revision != active_logic_revision {
-                    SimulationOutcome::Conflict { current_revision: active_logic_revision }
-                } else {
-                    match simulation_scenario(payload.clone(), &config.automation) {
-                        Err(errors) => SimulationOutcome::Invalid(errors),
-                        Ok(scenario) => {
-                            let started = Instant::now();
-                            let execution = engine.simulate_input(scenario);
-                            let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                            match execution {
-                                Ok(execution) => SimulationOutcome::Complete(
-                                    diagnostics::simulation_response(
-                                        &execution,
-                                        duration_us,
-                                        active_logic_revision,
-                                        &config.automation,
-                                    ),
-                                ),
-                                Err(error) => SimulationOutcome::Invalid(
-                                    simulation_error_fields(&error, &payload),
-                                ),
-                            }
-                        }
-                    }
-                };
-                let _ = reply.send(outcome);
+                apply_simulation(engine, config, active_logic_revision, request);
             }
             signal = &mut interrupt => {
                 signal?;
@@ -1586,6 +1633,57 @@ async fn run_session(
             }
         }
     }
+}
+
+fn apply_activation(
+    engine: &mut Engine,
+    store: &DiagnosticStore,
+    active_logic_revision: &mut u64,
+    request: ActivationRequest,
+) {
+    let source = request.source;
+    let result = engine
+        .replace_logic(source.clone(), request.logic_hash)
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    if result.is_ok() {
+        *active_logic_revision = request.document_revision;
+        store.set_active_logic(request.document_revision, source);
+    }
+    let _ = request.reply.send(result);
+}
+
+fn apply_simulation(
+    engine: &Engine,
+    config: &RuntimeConfig,
+    active_logic_revision: u64,
+    request: SimulationRequest,
+) {
+    let SimulationRequest { payload, reply } = request;
+    let outcome = if payload.expected_logic_revision != active_logic_revision {
+        SimulationOutcome::Conflict {
+            current_revision: active_logic_revision,
+        }
+    } else {
+        match simulation_scenario(payload.clone(), &config.automation) {
+            Err(errors) => SimulationOutcome::Invalid(errors),
+            Ok(scenario) => {
+                let started = Instant::now();
+                match engine.simulate_input(scenario) {
+                    Ok(execution) => SimulationOutcome::Complete(diagnostics::simulation_response(
+                        &execution,
+                        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        active_logic_revision,
+                        &config.automation,
+                    )),
+                    Err(error) => {
+                        SimulationOutcome::Invalid(simulation_error_fields(&error, &payload))
+                    }
+                }
+            }
+        }
+    };
+    let _ = reply.send(outcome);
 }
 
 fn configure_message(config: &RuntimeConfig) -> Message {
