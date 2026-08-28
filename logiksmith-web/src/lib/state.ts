@@ -67,6 +67,39 @@ export interface DisplayExecution {
   error: DisplayLogicError | null;
 }
 
+export type SimulationTypedValue =
+  | { kind: 'bool'; value: boolean }
+  | { kind: 'percent'; value: number };
+
+export interface SimulationTriggerRequest {
+  endpoint: string;
+  value: SimulationTypedValue;
+  previous: SimulationTypedValue | null;
+}
+
+export interface SimulationInputRequest {
+  endpoint: string;
+  value: SimulationTypedValue | null;
+  valid: boolean;
+  ageMs: number | null;
+}
+
+export interface SimulationScenario {
+  expectedLogicRevision: number;
+  trigger: SimulationTriggerRequest;
+  inputs: SimulationInputRequest[];
+}
+
+export interface DisplaySimulation {
+  logicRevision: number;
+  durationUs: number;
+  status: 'succeeded' | 'failed';
+  trigger: DisplayExecutionTrigger;
+  inputs: DisplayExecutionInput[];
+  effects: DisplayExecutionEffect[];
+  error: DisplayLogicError | null;
+}
+
 export interface DisplayTelegram {
   time: string;
   source: string | null;

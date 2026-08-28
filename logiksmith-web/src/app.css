@@ -80,6 +80,31 @@ small { color: #607080; }
 .runtime-facts { margin-bottom: 14px; }
 .execution-detail { border-top: 1px solid #e1e5e8; margin-top: 14px; padding-top: 14px; }
 .execution-detail h3 { margin: 16px 0 8px; font-size: 0.82rem; letter-spacing: 0.04em; text-transform: uppercase; }
+.simulation-panel { border-top: 4px solid #16835a; }
+.simulation-panel h3 { margin: 16px 0 8px; font-size: 0.82rem; letter-spacing: 0.04em; text-transform: uppercase; }
+.simulation-safety { color: #075b3a; background: #d5f2e5; border-left: 4px solid #16835a; padding: 8px 10px; font-size: 0.8rem; }
+.simulation-trigger-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.simulation-trigger-fields label { display: grid; gap: 5px; color: #40515f; font-size: 0.78rem; }
+.simulation-trigger-fields select, .simulation-trigger-fields input, .simulation-table select, .simulation-table input { width: 100%; min-width: 90px; border: 1px solid #b7c1c8; border-radius: 2px; color: #17202a; background: #fff; font: inherit; font-size: 0.78rem; padding: 6px 7px; }
+.simulation-table td { white-space: normal; }
+.simulation-table select:disabled, .simulation-table input:disabled { color: #607080; background: #f3f6f8; }
+.simulation-trigger-row { background: #f3f8f5; }
+.simulation-trigger-row td:first-child { box-shadow: inset 3px 0 #16835a; }
+.simulation-trigger-note { margin: 8px 0 0; }
+.checkbox-label { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+.checkbox-label input { min-width: auto; width: auto; }
+.simulation-actions { margin-top: 16px; }
+.simulation-error { display: grid; gap: 7px; }
+.simulation-error ul, .validation-summary ul { margin: 5px 0 0; padding-left: 20px; }
+.simulation-error button { width: max-content; }
+.simulation-result { border: 1px solid #c4ccd2; border-left: 4px solid #16835a; margin-top: 18px; padding: 12px; background: #f8fafb; }
+.simulation-result.simulation-failed { border-left-color: #b42318; background: #fffafa; }
+.simulation-result .section-heading { margin-bottom: 4px; }
+.simulation-result .section-heading h3 { margin: 0; }
+.simulation-effects { display: grid; gap: 8px; margin-top: 12px; }
+.simulation-effects h3 { margin: 0; }
+.simulation-effects strong { color: #075b3a; }
+.no-write-note { margin: 12px 0 0; }
 .section-heading { margin-bottom: 10px; }
 .section-heading h2 { margin-bottom: 0; }
 .section-heading > span { color: #607080; font-size: 0.8rem; }
@@ -101,6 +126,7 @@ footer { color: #607080; font-size: 0.75rem; padding: 0 2px 16px; }
   .status-cluster { justify-content: flex-start; }
   .two-columns { grid-template-columns: 1fr; }
   .editor-columns { grid-template-columns: 1fr; }
+  .simulation-trigger-fields { grid-template-columns: 1fr; }
   .reference-grid { grid-template-columns: 1fr; gap: 2px; }
   .editor-actions, .conflict, .restart-notice { align-items: flex-start; flex-direction: column; }
 }

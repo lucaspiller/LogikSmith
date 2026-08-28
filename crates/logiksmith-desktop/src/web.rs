@@ -1,20 +1,20 @@
 //! Internal HTTP/SSE dashboard API and static asset server.
 
 use crate::{
-    ActivationRequest, AutomationDocument, AutomationEnvelope, FieldError, WebConfig,
-    build_automation,
+    ActivationRequest, AutomationDocument, AutomationEnvelope, FieldError, SimulationOutcome,
+    SimulationPayload, SimulationRequest, WebConfig, build_automation,
     diagnostics::{DiagnosticStore, DiagnosticUpdate, Replay, Snapshot},
     load_automation, serialize_automation,
 };
 use axum::{
     Router,
-    extract::{Query, State},
+    extract::{Query, State, rejection::JsonRejection},
     http::StatusCode,
     response::{
         IntoResponse, Json, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::get,
+    routing::{get, post},
 };
 use futures_util::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,7 @@ struct AppState {
     store: DiagnosticStore,
     automation_lock: Arc<Mutex<()>>,
     activation: Option<mpsc::Sender<ActivationRequest>>,
+    simulation: Option<mpsc::Sender<SimulationRequest>>,
 }
 
 pub struct WebServer {
@@ -104,7 +105,7 @@ pub async fn start_web_server_with_assets(
     config: WebConfig,
     root: &Path,
 ) -> Result<WebServer, WebError> {
-    start_web_server_with_assets_and_activation(store, config, root, None).await
+    start_web_server_with_assets_and_activation(store, config, root, None, None).await
 }
 
 /// Starts the dashboard with the runtime activation channel used for
@@ -123,7 +124,33 @@ pub async fn start_web_server_with_activation(
             .join("../..")
             .join(STATIC_ASSET_ROOT)
     };
-    start_web_server_with_assets_and_activation(store, config, &root, Some(activation)).await
+    start_web_server_with_assets_and_activation(store, config, &root, Some(activation), None).await
+}
+
+/// Starts the dashboard with the runtime-owned source activation and
+/// immutable simulation request channels.
+pub async fn start_web_server_with_runtime(
+    store: DiagnosticStore,
+    config: WebConfig,
+    activation: mpsc::Sender<ActivationRequest>,
+    simulation: mpsc::Sender<SimulationRequest>,
+) -> Result<WebServer, WebError> {
+    let relative = Path::new(STATIC_ASSET_ROOT);
+    let root = if relative.is_dir() {
+        relative.to_path_buf()
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(STATIC_ASSET_ROOT)
+    };
+    start_web_server_with_assets_and_activation(
+        store,
+        config,
+        &root,
+        Some(activation),
+        Some(simulation),
+    )
+    .await
 }
 
 async fn start_web_server_with_assets_and_activation(
@@ -131,6 +158,7 @@ async fn start_web_server_with_assets_and_activation(
     config: WebConfig,
     root: &Path,
     activation: Option<mpsc::Sender<ActivationRequest>>,
+    simulation: Option<mpsc::Sender<SimulationRequest>>,
 ) -> Result<WebServer, WebError> {
     let root = root.to_path_buf();
     let index = root.join("index.html");
@@ -154,12 +182,14 @@ async fn start_web_server_with_assets_and_activation(
     let router = Router::new()
         .route("/api/snapshot", get(snapshot))
         .route("/api/automation", get(get_automation).put(put_automation))
+        .route("/api/simulate", post(simulate))
         .route("/api/events", get(events))
         .fallback_service(ServeDir::new(&root).not_found_service(ServeFile::new(index)))
         .with_state(AppState {
             store,
             automation_lock: Arc::new(Mutex::new(())),
             activation,
+            simulation,
         });
     let (sender, receiver) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -181,6 +211,76 @@ async fn start_web_server_with_assets_and_activation(
 
 async fn snapshot(State(state): State<AppState>) -> Json<Snapshot> {
     Json(state.store.snapshot())
+}
+
+#[derive(Debug, Serialize)]
+struct SimulationConflictResponse {
+    error: String,
+    current_logic_revision: u64,
+}
+
+async fn simulate(
+    State(state): State<AppState>,
+    payload: Result<Json<SimulationPayload>, JsonRejection>,
+) -> Response {
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(FieldErrorsResponse {
+                    errors: vec![FieldError {
+                        path: "request".to_owned(),
+                        message: error.to_string(),
+                    }],
+                }),
+            )
+                .into_response();
+        }
+    };
+    let Some(simulation) = state.simulation else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "simulation runtime is unavailable".to_owned(),
+        );
+    };
+    let (reply, result) = oneshot::channel();
+    if simulation
+        .send(SimulationRequest { payload, reply })
+        .await
+        .is_err()
+    {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "simulation runtime is unavailable".to_owned(),
+        );
+    }
+    let result = match time::timeout(Duration::from_secs(2), result).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) | Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "simulation runtime did not respond".to_owned(),
+            );
+        }
+    };
+    match result {
+        SimulationOutcome::Complete(result) => (StatusCode::OK, Json(result)).into_response(),
+        SimulationOutcome::Invalid(errors) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(FieldErrorsResponse { errors }),
+        )
+            .into_response(),
+        SimulationOutcome::Conflict { current_revision } => (
+            StatusCode::CONFLICT,
+            Json(SimulationConflictResponse {
+                error: "active logic revision changed; refresh and run the simulation again"
+                    .to_owned(),
+                current_logic_revision: current_revision,
+            }),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_automation(State(state): State<AppState>) -> Response {
@@ -460,6 +560,7 @@ fn resync_event(revision: u64) -> Event {
 mod tests {
     use super::*;
     use crate::diagnostics::JOURNAL_CAPACITY;
+    use logiksmith_core::Engine;
     use std::{fs, net::IpAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -687,6 +788,262 @@ mod tests {
         let resync = raw_get_prefix(server.address, "/api/events?since=0").await;
         assert!(resync.contains("event: resync"));
         server.shutdown().await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn simulation_runtime(source: &str) -> crate::AutomationRuntime {
+        crate::build_automation(crate::AutomationDocument {
+            inputs: vec![
+                crate::AutomationEndpoint {
+                    name: "wall_switch".to_owned(),
+                    dpt: "1.001".to_owned(),
+                },
+                crate::AutomationEndpoint {
+                    name: "enabled".to_owned(),
+                    dpt: "1.001".to_owned(),
+                },
+            ],
+            outputs: vec![crate::AutomationEndpoint {
+                name: "test_light".to_owned(),
+                dpt: "1.001".to_owned(),
+            }],
+            knx_bindings: vec![
+                crate::KnxBinding {
+                    endpoint: "wall_switch".to_owned(),
+                    group_address: "2/2/52".to_owned(),
+                },
+                crate::KnxBinding {
+                    endpoint: "enabled".to_owned(),
+                    group_address: "2/2/53".to_owned(),
+                },
+                crate::KnxBinding {
+                    endpoint: "test_light".to_owned(),
+                    group_address: "2/3/52".to_owned(),
+                },
+            ],
+            logic: crate::LogicDocument {
+                source: source.to_owned(),
+            },
+        })
+        .unwrap()
+    }
+
+    async fn simulation_actor(
+        mut receiver: mpsc::Receiver<crate::SimulationRequest>,
+        runtime: crate::AutomationRuntime,
+        active_revision: u64,
+    ) {
+        let engine = Engine::new(runtime.engine_config.clone());
+        while let Some(request) = receiver.recv().await {
+            let crate::SimulationRequest { payload, reply } = request;
+            let outcome = if payload.expected_logic_revision != active_revision {
+                crate::SimulationOutcome::Conflict {
+                    current_revision: active_revision,
+                }
+            } else {
+                match crate::simulation_scenario(payload.clone(), &runtime) {
+                    Err(errors) => crate::SimulationOutcome::Invalid(errors),
+                    Ok(scenario) => match engine.simulate_input(scenario) {
+                        Ok(execution) => crate::SimulationOutcome::Complete(
+                            crate::diagnostics::simulation_response(
+                                &execution,
+                                1,
+                                active_revision,
+                                &runtime,
+                            ),
+                        ),
+                        Err(error) => crate::SimulationOutcome::Invalid(
+                            crate::simulation_error_fields(&error, &payload),
+                        ),
+                    },
+                }
+            };
+            let _ = reply.send(outcome);
+        }
+    }
+
+    fn simulation_payload() -> serde_json::Value {
+        serde_json::json!({
+            "expected_logic_revision": 7,
+            "trigger": {
+                "endpoint": "wall_switch",
+                "value": { "kind": "bool", "value": true },
+                "previous": { "kind": "bool", "value": false }
+            },
+            "inputs": [
+                { "endpoint": "wall_switch", "value": { "kind": "bool", "value": true }, "valid": true, "age_ms": 0 },
+                { "endpoint": "enabled", "value": null, "valid": false, "age_ms": null }
+            ]
+        })
+    }
+
+    async fn raw_post(
+        address: std::net::SocketAddr,
+        body: serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        let body = body.to_string();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "POST /api/simulate HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        let status = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap()
+            .parse()
+            .unwrap();
+        (status, serde_json::from_str(body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn simulation_endpoint_returns_result_without_diagnostic_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "logiksmith-simulation-api-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("index.html"), "dashboard").unwrap();
+        let mut runtime = simulation_runtime(
+            "function handle(event, input)\n  return { outputs = { test_light = event.rising } }\nend",
+        );
+        runtime.document_revision = 7;
+        let store = DiagnosticStore::new(&runtime, root.join("automation.toml"), 7);
+        let before = store.snapshot();
+        let (sender, receiver) = mpsc::channel(4);
+        let actor = tokio::spawn(simulation_actor(receiver, runtime.clone(), 7));
+        let server = start_web_server_with_assets_and_activation(
+            store.clone(),
+            WebConfig {
+                listen_ip: "127.0.0.1".parse().unwrap(),
+                listen_port: 0,
+            },
+            &root,
+            None,
+            Some(sender),
+        )
+        .await
+        .unwrap();
+
+        let (status, result) = raw_post(server.address, simulation_payload()).await;
+        assert_eq!(status, 200);
+        assert_eq!(result["logic_revision"], 7);
+        assert_eq!(result["status"], "succeeded");
+        assert_eq!(result["trigger"]["rising"], true);
+        assert_eq!(result["effects"][0]["endpoint"], "test_light");
+        assert_eq!(result["effects"][0]["destination"], "2/3/52");
+        assert_eq!(store.snapshot(), before);
+
+        let (status, result) = raw_post(
+            server.address,
+            serde_json::json!({ "expected_logic_revision": 6 }),
+        )
+        .await;
+        assert_eq!(status, 422);
+        assert!(result["errors"].is_array());
+
+        let (status, result) = raw_post(server.address, {
+            let mut payload = simulation_payload();
+            payload["expected_logic_revision"] = serde_json::json!(6);
+            payload
+        })
+        .await;
+        assert_eq!(status, 409);
+        assert_eq!(result["current_logic_revision"], 7);
+
+        server.shutdown().await;
+        actor.abort();
+        let _ = actor.await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn simulation_endpoint_returns_zero_effect_and_contained_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "logiksmith-simulation-outcomes-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("index.html"), "dashboard").unwrap();
+        let mut runtime = simulation_runtime("function handle(event) return nil end");
+        runtime.document_revision = 7;
+        let store = DiagnosticStore::new(&runtime, root.join("automation.toml"), 7);
+        let (sender, receiver) = mpsc::channel(4);
+        let actor = tokio::spawn(simulation_actor(receiver, runtime.clone(), 7));
+        let server = start_web_server_with_assets_and_activation(
+            store,
+            WebConfig {
+                listen_ip: "127.0.0.1".parse().unwrap(),
+                listen_port: 0,
+            },
+            &root,
+            None,
+            Some(sender),
+        )
+        .await
+        .unwrap();
+        let (status, result) = raw_post(server.address, simulation_payload()).await;
+        assert_eq!(status, 200);
+        assert_eq!(result["status"], "succeeded");
+        assert_eq!(result["effects"].as_array().unwrap().len(), 0);
+        server.shutdown().await;
+        actor.abort();
+        let _ = actor.await;
+
+        let root = std::env::temp_dir().join(format!(
+            "logiksmith-simulation-failure-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("index.html"), "dashboard").unwrap();
+        let mut runtime = simulation_runtime("function handle(event) error('contained boom') end");
+        runtime.document_revision = 7;
+        let store = DiagnosticStore::new(&runtime, root.join("automation.toml"), 7);
+        let (sender, receiver) = mpsc::channel(4);
+        let actor = tokio::spawn(simulation_actor(receiver, runtime.clone(), 7));
+        let server = start_web_server_with_assets_and_activation(
+            store,
+            WebConfig {
+                listen_ip: "127.0.0.1".parse().unwrap(),
+                listen_port: 0,
+            },
+            &root,
+            None,
+            Some(sender),
+        )
+        .await
+        .unwrap();
+        let (status, result) = raw_post(server.address, simulation_payload()).await;
+        assert_eq!(status, 200);
+        assert_eq!(result["status"], "failed");
+        assert_eq!(result["effects"].as_array().unwrap().len(), 0);
+        assert_eq!(result["error"]["category"], "runtime");
+        server.shutdown().await;
+        actor.abort();
+        let _ = actor.await;
         let _ = fs::remove_dir_all(root);
     }
 

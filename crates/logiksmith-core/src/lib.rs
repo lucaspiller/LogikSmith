@@ -608,6 +608,132 @@ impl fmt::Display for EventError {
 
 impl Error for EventError {}
 
+/// The triggering input supplied for a simulation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimulationTrigger {
+    pub endpoint: EndpointName,
+    pub value: TypedValue,
+    pub previous: Option<TypedValue>,
+}
+
+/// One complete input value supplied for a simulation.
+///
+/// A valid input must include both a typed value and its age. An invalid input
+/// is unknown and therefore includes neither.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimulationInput {
+    pub endpoint: EndpointName,
+    pub value: Option<TypedValue>,
+    pub valid: bool,
+    pub age_ms: Option<u64>,
+}
+
+/// A complete, immutable input scenario for one simulated execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimulationScenario {
+    pub trigger: SimulationTrigger,
+    pub inputs: Vec<SimulationInput>,
+}
+
+/// Errors caused by a malformed browser-supplied simulation scenario.
+///
+/// Lua failures are deliberately not represented here: they are contained in
+/// [`Execution::outcome`], just as they are for live input events.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SimulationError {
+    UnknownEndpoint(EndpointName),
+    EndpointNotInput {
+        endpoint: EndpointName,
+        actual: EndpointDirection,
+    },
+    DuplicateInput(EndpointName),
+    MissingInput(EndpointName),
+    DptMismatch {
+        endpoint: EndpointName,
+        expected: Dpt,
+        actual: Dpt,
+    },
+    InvalidValue(ValueError),
+    MissingValue(EndpointName),
+    UnexpectedValue(EndpointName),
+    MissingAge(EndpointName),
+    UnexpectedAge(EndpointName),
+    TriggerValueMismatch {
+        endpoint: EndpointName,
+        expected: TypedValue,
+        actual: TypedValue,
+    },
+    TriggerAgeMismatch {
+        endpoint: EndpointName,
+        actual: Option<u64>,
+    },
+}
+
+impl fmt::Display for SimulationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownEndpoint(endpoint) => {
+                write!(formatter, "unknown input endpoint {endpoint}")
+            }
+            Self::EndpointNotInput { endpoint, actual } => {
+                write!(formatter, "endpoint {endpoint} is {actual}, not an input")
+            }
+            Self::DuplicateInput(endpoint) => {
+                write!(
+                    formatter,
+                    "simulation input {endpoint} was supplied more than once"
+                )
+            }
+            Self::MissingInput(endpoint) => {
+                write!(formatter, "simulation input {endpoint} was not supplied")
+            }
+            Self::DptMismatch {
+                endpoint,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "input endpoint {endpoint} expects DPT {expected}, got {actual}"
+            ),
+            Self::InvalidValue(error) => error.fmt(formatter),
+            Self::MissingValue(endpoint) => {
+                write!(
+                    formatter,
+                    "valid simulation input {endpoint} is missing its value"
+                )
+            }
+            Self::UnexpectedValue(endpoint) => write!(
+                formatter,
+                "invalid simulation input {endpoint} must not include a value"
+            ),
+            Self::MissingAge(endpoint) => {
+                write!(
+                    formatter,
+                    "valid simulation input {endpoint} is missing its age"
+                )
+            }
+            Self::UnexpectedAge(endpoint) => write!(
+                formatter,
+                "invalid simulation input {endpoint} must not include an age"
+            ),
+            Self::TriggerValueMismatch {
+                endpoint,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "simulation trigger {endpoint} value {actual:?} does not match its input snapshot {expected:?}"
+            ),
+            Self::TriggerAgeMismatch { endpoint, actual } => write!(
+                formatter,
+                "simulation trigger {endpoint} must have age 0, got {actual:?}"
+            ),
+        }
+    }
+}
+
+impl Error for SimulationError {}
+
 /// The immutable transition metadata for one accepted triggering input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InputTrigger {
@@ -847,21 +973,126 @@ impl Engine {
             value: Some(event.value),
             observed_at: Some(now),
         };
-        let trigger = InputTrigger {
-            endpoint: event.endpoint,
-            value: event.value,
-            previous,
-            changed: previous.is_some_and(|value| value != event.value),
-            rising: matches!(
-                (previous.map(|value| value.value), event.value.value),
-                (Some(Value::Bool(false)), Value::Bool(true))
-            ),
-            falling: matches!(
-                (previous.map(|value| value.value), event.value.value),
-                (Some(Value::Bool(true)), Value::Bool(false))
-            ),
-        };
+        let trigger = input_trigger(event.endpoint, event.value, previous);
         let snapshots = self.input_snapshots(now);
+        let outcome = execute_logic(
+            &self.config.endpoints,
+            &self.config.logic,
+            &snapshots,
+            &trigger,
+        );
+        Ok(Execution {
+            logic_revision: self.active_logic_revision(),
+            trigger,
+            inputs: snapshots,
+            outcome,
+        })
+    }
+
+    /// Evaluates the active source against a complete browser-supplied input
+    /// scenario without changing any live input state or timestamps.
+    pub fn simulate_input(
+        &self,
+        scenario: SimulationScenario,
+    ) -> Result<Execution, SimulationError> {
+        // Store references by configured endpoint index. This both rejects
+        // duplicates and makes the returned snapshot follow declaration order.
+        let mut supplied: Vec<Option<&SimulationInput>> = vec![None; self.config.endpoints.len()];
+        for input in &scenario.inputs {
+            let Some(index) = self
+                .config
+                .endpoints
+                .iter()
+                .position(|endpoint| endpoint.name == input.endpoint)
+            else {
+                return Err(SimulationError::UnknownEndpoint(input.endpoint.clone()));
+            };
+            let endpoint = &self.config.endpoints[index];
+            if endpoint.direction != EndpointDirection::Input {
+                return Err(SimulationError::EndpointNotInput {
+                    endpoint: input.endpoint.clone(),
+                    actual: endpoint.direction,
+                });
+            }
+            if supplied[index].is_some() {
+                return Err(SimulationError::DuplicateInput(input.endpoint.clone()));
+            }
+            validate_simulation_input(endpoint, input)?;
+            supplied[index] = Some(input);
+        }
+
+        for (index, endpoint) in self.config.endpoints.iter().enumerate() {
+            if endpoint.direction == EndpointDirection::Input && supplied[index].is_none() {
+                return Err(SimulationError::MissingInput(endpoint.name.clone()));
+            }
+        }
+
+        let trigger_index = self
+            .config
+            .endpoints
+            .iter()
+            .position(|endpoint| endpoint.name == scenario.trigger.endpoint)
+            .ok_or_else(|| SimulationError::UnknownEndpoint(scenario.trigger.endpoint.clone()))?;
+        let trigger_endpoint = &self.config.endpoints[trigger_index];
+        if trigger_endpoint.direction != EndpointDirection::Input {
+            return Err(SimulationError::EndpointNotInput {
+                endpoint: scenario.trigger.endpoint.clone(),
+                actual: trigger_endpoint.direction,
+            });
+        }
+        validate_simulation_value(trigger_endpoint, scenario.trigger.value)?;
+        if let Some(previous) = scenario.trigger.previous {
+            validate_simulation_value(trigger_endpoint, previous)?;
+        }
+
+        let trigger_input =
+            supplied[trigger_index].expect("configured input presence was validated above");
+        if !trigger_input.valid {
+            return Err(SimulationError::MissingValue(
+                scenario.trigger.endpoint.clone(),
+            ));
+        }
+        let actual_trigger_value = trigger_input
+            .value
+            .expect("valid trigger input value was validated above");
+        if actual_trigger_value != scenario.trigger.value {
+            return Err(SimulationError::TriggerValueMismatch {
+                endpoint: scenario.trigger.endpoint.clone(),
+                expected: scenario.trigger.value,
+                actual: actual_trigger_value,
+            });
+        }
+        if trigger_input.age_ms != Some(0) {
+            return Err(SimulationError::TriggerAgeMismatch {
+                endpoint: scenario.trigger.endpoint.clone(),
+                actual: trigger_input.age_ms,
+            });
+        }
+
+        let snapshots = self
+            .config
+            .endpoints
+            .iter()
+            .enumerate()
+            .filter_map(|(index, endpoint)| {
+                (endpoint.direction == EndpointDirection::Input).then(|| {
+                    let input =
+                        supplied[index].expect("configured input presence was validated above");
+                    InputSnapshot {
+                        endpoint: endpoint.name.clone(),
+                        dpt: endpoint.dpt,
+                        value: input.value,
+                        valid: input.valid,
+                        age_ms: input.age_ms,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let trigger = input_trigger(
+            scenario.trigger.endpoint,
+            scenario.trigger.value,
+            scenario.trigger.previous,
+        );
         let outcome = execute_logic(
             &self.config.endpoints,
             &self.config.logic,
@@ -939,6 +1170,65 @@ impl Engine {
                 })
             })
             .collect()
+    }
+}
+
+fn validate_simulation_input(
+    endpoint: &Endpoint,
+    input: &SimulationInput,
+) -> Result<(), SimulationError> {
+    if input.valid {
+        let value = input
+            .value
+            .ok_or_else(|| SimulationError::MissingValue(input.endpoint.clone()))?;
+        if input.age_ms.is_none() {
+            return Err(SimulationError::MissingAge(input.endpoint.clone()));
+        }
+        validate_simulation_value(endpoint, value)
+    } else {
+        if input.value.is_some() {
+            return Err(SimulationError::UnexpectedValue(input.endpoint.clone()));
+        }
+        if input.age_ms.is_some() {
+            return Err(SimulationError::UnexpectedAge(input.endpoint.clone()));
+        }
+        Ok(())
+    }
+}
+
+fn validate_simulation_value(
+    endpoint: &Endpoint,
+    value: TypedValue,
+) -> Result<(), SimulationError> {
+    value.validate().map_err(SimulationError::InvalidValue)?;
+    if endpoint.dpt != value.dpt {
+        return Err(SimulationError::DptMismatch {
+            endpoint: endpoint.name.clone(),
+            expected: endpoint.dpt,
+            actual: value.dpt,
+        });
+    }
+    Ok(())
+}
+
+fn input_trigger(
+    endpoint: EndpointName,
+    value: TypedValue,
+    previous: Option<TypedValue>,
+) -> InputTrigger {
+    InputTrigger {
+        endpoint,
+        value,
+        previous,
+        changed: previous.is_some_and(|previous| previous != value),
+        rising: matches!(
+            (previous.map(|previous| previous.value), value.value),
+            (Some(Value::Bool(false)), Value::Bool(true))
+        ),
+        falling: matches!(
+            (previous.map(|previous| previous.value), value.value),
+            (Some(Value::Bool(true)), Value::Bool(false))
+        ),
     }
 }
 
@@ -1481,6 +1771,35 @@ mod tests {
         InputEvent::new(name("wall_switch"), TypedValue::bool(value))
     }
 
+    fn simulation_input(
+        endpoint: &str,
+        value: Option<TypedValue>,
+        valid: bool,
+        age_ms: Option<u64>,
+    ) -> SimulationInput {
+        SimulationInput {
+            endpoint: name(endpoint),
+            value,
+            valid,
+            age_ms,
+        }
+    }
+
+    fn simulation_scenario(
+        value: bool,
+        previous: Option<bool>,
+        inputs: Vec<SimulationInput>,
+    ) -> SimulationScenario {
+        SimulationScenario {
+            trigger: SimulationTrigger {
+                endpoint: name("wall_switch"),
+                value: TypedValue::bool(value),
+                previous: previous.map(TypedValue::bool),
+            },
+            inputs,
+        }
+    }
+
     fn at(now: u64) -> MonotonicMs {
         MonotonicMs(now)
     }
@@ -1579,6 +1898,380 @@ mod tests {
         );
         assert_eq!(execution.inputs[0].age_ms, Some(0));
         assert_eq!(execution.inputs[1].age_ms, Some(10));
+    }
+
+    #[test]
+    fn valid_simulation_uses_complete_ordered_snapshot_and_does_not_mutate_engine() {
+        let engine = Engine::new(config());
+        let before = engine.snapshot();
+        let scenario = simulation_scenario(
+            true,
+            Some(false),
+            vec![
+                simulation_input("unused_input", None, false, None),
+                simulation_input(
+                    "dimmer_level",
+                    Some(TypedValue::percent(42).unwrap()),
+                    true,
+                    Some(25),
+                ),
+                simulation_input("wall_switch", Some(TypedValue::bool(true)), true, Some(0)),
+            ],
+        );
+        let first = engine.simulate_input(scenario.clone()).unwrap();
+        let repeated = engine.simulate_input(scenario).unwrap();
+
+        assert_eq!(first, repeated);
+        assert_eq!(engine.snapshot(), before);
+        assert_eq!(
+            first
+                .inputs
+                .iter()
+                .map(|input| input.endpoint.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wall_switch", "dimmer_level", "unused_input"]
+        );
+        assert_eq!(first.inputs[0].age_ms, Some(0));
+        assert_eq!(first.inputs[1].age_ms, Some(25));
+        assert_eq!(first.inputs[2].value, None);
+        assert_eq!(effects(&first).len(), 2);
+    }
+
+    #[test]
+    fn simulation_derives_boolean_edges_from_optional_previous_value() {
+        let engine = Engine::new(EngineConfig::new(
+            vec![
+                endpoint("wall_switch", EndpointDirection::Input, Dpt::BOOL),
+                endpoint("enabled", EndpointDirection::Input, Dpt::BOOL),
+                endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
+            ],
+            "function handle(event, input) return nil end",
+        ));
+        let inputs = |value| {
+            vec![
+                simulation_input("wall_switch", Some(TypedValue::bool(value)), true, Some(0)),
+                simulation_input("enabled", None, false, None),
+            ]
+        };
+
+        let unknown = engine
+            .simulate_input(simulation_scenario(false, None, inputs(false)))
+            .unwrap();
+        assert!(!unknown.trigger.changed);
+        assert!(!unknown.trigger.rising);
+        assert!(!unknown.trigger.falling);
+
+        let rising = engine
+            .simulate_input(simulation_scenario(true, Some(false), inputs(true)))
+            .unwrap();
+        assert!(rising.trigger.changed);
+        assert!(rising.trigger.rising);
+        assert!(!rising.trigger.falling);
+
+        let falling = engine
+            .simulate_input(simulation_scenario(false, Some(true), inputs(false)))
+            .unwrap();
+        assert!(falling.trigger.changed);
+        assert!(!falling.trigger.rising);
+        assert!(falling.trigger.falling);
+
+        let repeated = engine
+            .simulate_input(simulation_scenario(true, Some(true), inputs(true)))
+            .unwrap();
+        assert!(!repeated.trigger.changed);
+        assert!(!repeated.trigger.rising);
+        assert!(!repeated.trigger.falling);
+    }
+
+    #[test]
+    fn simulation_preserves_percentage_values_and_output_order() {
+        let engine = Engine::new(EngineConfig::new(
+            vec![
+                endpoint("wall_switch", EndpointDirection::Input, Dpt::BOOL),
+                endpoint("level", EndpointDirection::Input, Dpt::PERCENT),
+                endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
+                endpoint("dimmer_output", EndpointDirection::Output, Dpt::PERCENT),
+            ],
+            "function handle(event, input)\n  if event.rising then return { outputs = { dimmer_output = input.level, test_light = true } } end\nend",
+        ));
+        let execution = engine
+            .simulate_input(simulation_scenario(
+                true,
+                Some(false),
+                vec![
+                    simulation_input(
+                        "level",
+                        Some(TypedValue::percent(73).unwrap()),
+                        true,
+                        Some(8),
+                    ),
+                    simulation_input("wall_switch", Some(TypedValue::bool(true)), true, Some(0)),
+                ],
+            ))
+            .unwrap();
+        assert_eq!(
+            effects(&execution),
+            &vec![
+                Effect::SetOutput {
+                    endpoint: name("test_light"),
+                    value: TypedValue::bool(true),
+                },
+                Effect::SetOutput {
+                    endpoint: name("dimmer_output"),
+                    value: TypedValue::percent(73).unwrap(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn simulation_rejects_incomplete_duplicate_unknown_and_malformed_inputs() {
+        let engine = Engine::new(config());
+        let valid_wall =
+            || simulation_input("wall_switch", Some(TypedValue::bool(true)), true, Some(0));
+        let valid_dimmer = || {
+            simulation_input(
+                "dimmer_level",
+                Some(TypedValue::percent(50).unwrap()),
+                true,
+                Some(1),
+            )
+        };
+        let invalid_unused = || simulation_input("unused_input", None, false, None);
+
+        let unknown = simulation_scenario(
+            true,
+            None,
+            vec![
+                valid_wall(),
+                valid_dimmer(),
+                invalid_unused(),
+                simulation_input("unknown", None, false, None),
+            ],
+        );
+        assert!(matches!(
+            engine.simulate_input(unknown),
+            Err(SimulationError::UnknownEndpoint(endpoint)) if endpoint == name("unknown")
+        ));
+
+        let duplicate = simulation_scenario(
+            true,
+            None,
+            vec![valid_wall(), valid_wall(), valid_dimmer(), invalid_unused()],
+        );
+        assert!(matches!(
+            engine.simulate_input(duplicate),
+            Err(SimulationError::DuplicateInput(endpoint)) if endpoint == name("wall_switch")
+        ));
+
+        let missing = simulation_scenario(true, None, vec![valid_wall(), valid_dimmer()]);
+        assert!(matches!(
+            engine.simulate_input(missing),
+            Err(SimulationError::MissingInput(endpoint)) if endpoint == name("unused_input")
+        ));
+
+        let missing_value = simulation_scenario(
+            true,
+            None,
+            vec![
+                simulation_input("wall_switch", None, true, Some(0)),
+                valid_dimmer(),
+                invalid_unused(),
+            ],
+        );
+        assert!(matches!(
+            engine.simulate_input(missing_value),
+            Err(SimulationError::MissingValue(endpoint)) if endpoint == name("wall_switch")
+        ));
+
+        let unexpected_value = simulation_scenario(
+            true,
+            None,
+            vec![
+                valid_wall(),
+                valid_dimmer(),
+                simulation_input("unused_input", Some(TypedValue::bool(false)), false, None),
+            ],
+        );
+        assert!(matches!(
+            engine.simulate_input(unexpected_value),
+            Err(SimulationError::UnexpectedValue(endpoint)) if endpoint == name("unused_input")
+        ));
+
+        let missing_age = simulation_scenario(
+            true,
+            None,
+            vec![
+                simulation_input("wall_switch", Some(TypedValue::bool(true)), true, None),
+                valid_dimmer(),
+                invalid_unused(),
+            ],
+        );
+        assert!(matches!(
+            engine.simulate_input(missing_age),
+            Err(SimulationError::MissingAge(endpoint)) if endpoint == name("wall_switch")
+        ));
+
+        let unexpected_age = simulation_scenario(
+            true,
+            None,
+            vec![
+                valid_wall(),
+                valid_dimmer(),
+                simulation_input("unused_input", None, false, Some(2)),
+            ],
+        );
+        assert!(matches!(
+            engine.simulate_input(unexpected_age),
+            Err(SimulationError::UnexpectedAge(endpoint)) if endpoint == name("unused_input")
+        ));
+
+        let wrong_dpt = simulation_scenario(
+            true,
+            None,
+            vec![
+                simulation_input(
+                    "wall_switch",
+                    Some(TypedValue::percent(20).unwrap()),
+                    true,
+                    Some(0),
+                ),
+                valid_dimmer(),
+                invalid_unused(),
+            ],
+        );
+        assert!(matches!(
+            engine.simulate_input(wrong_dpt),
+            Err(SimulationError::DptMismatch { endpoint, .. }) if endpoint == name("wall_switch")
+        ));
+    }
+
+    #[test]
+    fn simulation_rejects_invalid_trigger_contract() {
+        let engine = Engine::new(config());
+        let complete_inputs = |wall_value, wall_age| {
+            vec![
+                simulation_input(
+                    "wall_switch",
+                    Some(TypedValue::bool(wall_value)),
+                    true,
+                    wall_age,
+                ),
+                simulation_input(
+                    "dimmer_level",
+                    Some(TypedValue::percent(10).unwrap()),
+                    true,
+                    Some(1),
+                ),
+                simulation_input("unused_input", None, false, None),
+            ]
+        };
+
+        let mut trigger_unknown = simulation_scenario(true, None, complete_inputs(true, Some(0)));
+        trigger_unknown.trigger.endpoint = name("not_configured");
+        assert!(matches!(
+            engine.simulate_input(trigger_unknown),
+            Err(SimulationError::UnknownEndpoint(endpoint)) if endpoint == name("not_configured")
+        ));
+
+        let mut trigger_value = simulation_scenario(true, None, complete_inputs(false, Some(0)));
+        trigger_value.trigger.value = TypedValue::bool(true);
+        assert!(matches!(
+            engine.simulate_input(trigger_value),
+            Err(SimulationError::TriggerValueMismatch { endpoint, .. }) if endpoint == name("wall_switch")
+        ));
+
+        let trigger_age = simulation_scenario(true, None, complete_inputs(true, Some(9)));
+        assert!(matches!(
+            engine.simulate_input(trigger_age),
+            Err(SimulationError::TriggerAgeMismatch { endpoint, actual: Some(9) }) if endpoint == name("wall_switch")
+        ));
+
+        let mut previous_dpt = simulation_scenario(true, None, complete_inputs(true, Some(0)));
+        previous_dpt.trigger.previous = Some(TypedValue::percent(5).unwrap());
+        assert!(matches!(
+            engine.simulate_input(previous_dpt),
+            Err(SimulationError::DptMismatch { endpoint, .. }) if endpoint == name("wall_switch")
+        ));
+
+        let invalid_trigger = simulation_scenario(
+            true,
+            None,
+            vec![
+                simulation_input("wall_switch", None, false, None),
+                simulation_input(
+                    "dimmer_level",
+                    Some(TypedValue::percent(10).unwrap()),
+                    true,
+                    Some(1),
+                ),
+                simulation_input("unused_input", None, false, None),
+            ],
+        );
+        assert!(matches!(
+            engine.simulate_input(invalid_trigger),
+            Err(SimulationError::MissingValue(endpoint)) if endpoint == name("wall_switch")
+        ));
+    }
+
+    #[test]
+    fn contained_lua_failures_are_returned_as_normal_simulation_executions() {
+        let engine = Engine::new(EngineConfig::new(
+            vec![
+                endpoint("wall_switch", EndpointDirection::Input, Dpt::BOOL),
+                endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
+            ],
+            "function handle(event, input) error('simulated failure') end",
+        ));
+        let execution = engine
+            .simulate_input(simulation_scenario(
+                true,
+                None,
+                vec![simulation_input(
+                    "wall_switch",
+                    Some(TypedValue::bool(true)),
+                    true,
+                    Some(0),
+                )],
+            ))
+            .unwrap();
+        assert!(matches!(execution.outcome, Err(LogicError::Runtime { .. })));
+    }
+
+    #[test]
+    fn equivalent_live_and_simulated_snapshots_produce_equivalent_effects() {
+        let logic = "function handle(event, input)\n  if event.rising and input.enabled == true then return { outputs = { test_light = true } } end\nend";
+        let endpoints = vec![
+            endpoint("wall_switch", EndpointDirection::Input, Dpt::BOOL),
+            endpoint("enabled", EndpointDirection::Input, Dpt::BOOL),
+            endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
+        ];
+        let mut live = Engine::new(EngineConfig::new(endpoints.clone(), logic));
+        live.observe_input(
+            InputObservation::new(name("wall_switch"), TypedValue::bool(false)),
+            at(10),
+        )
+        .unwrap();
+        live.observe_input(
+            InputObservation::new(name("enabled"), TypedValue::bool(true)),
+            at(10),
+        )
+        .unwrap();
+        let live_execution = live.process_input(trigger(true), at(20)).unwrap();
+
+        let simulated = Engine::new(EngineConfig::new(endpoints, logic))
+            .simulate_input(simulation_scenario(
+                true,
+                Some(false),
+                vec![
+                    simulation_input("wall_switch", Some(TypedValue::bool(true)), true, Some(0)),
+                    simulation_input("enabled", Some(TypedValue::bool(true)), true, Some(10)),
+                ],
+            ))
+            .unwrap();
+
+        assert_eq!(live_execution.trigger, simulated.trigger);
+        assert_eq!(live_execution.outcome, simulated.outcome);
     }
 
     #[test]

@@ -14,7 +14,7 @@
     type AutomationFieldError,
     type Dpt
   } from './lib/automation';
-  import { DashboardClient } from './lib/api';
+  import { DashboardClient, simulateScenario, SimulationApiError } from './lib/api';
   import {
     formatAge,
     formatValue,
@@ -23,8 +23,18 @@
     initialDashboardState,
     reduceDashboardState,
     type DashboardState,
-    type DisplayEndpoint
+    type DisplayEndpoint,
+    type DisplayExecutionTrigger,
+    type DisplaySimulation
   } from './lib/state';
+  import {
+    createSimulationDraft,
+    forceTriggerInput,
+    toSimulationScenario,
+    validateSimulationDraft,
+    type SimulationDraft,
+    type SimulationValue
+  } from './lib/simulation';
 
   let state: DashboardState = initialDashboardState;
   let automation: AutomationEnvelope | null = null;
@@ -36,6 +46,11 @@
   let conflictLatest: AutomationEnvelope | null = null;
   let restartRequired = false;
   let saveNotice: string | null = null;
+  let simulationDraft: SimulationDraft | null = null;
+  let simulationResult: DisplaySimulation | null = null;
+  let simulationRunning = false;
+  let simulationError: string | null = null;
+  let simulationFieldErrors: string[] = [];
 
   $: snapshot = state.snapshot;
   $: connectionState = snapshot?.connection.state ?? 'starting';
@@ -49,6 +64,10 @@
   $: pendingRestart = Boolean(snapshot?.restartRequired || automation?.restartRequired || restartRequired || legacyRevisionPending || envelopeStructuralPending || (activeStructural !== null && savedStructural !== null && activeStructural !== savedStructural));
   $: source = draft.logic?.source ?? '';
   $: selectedExecution = snapshot?.executions.find((execution) => execution.executionId === state.selectedExecutionId) ?? null;
+  $: simulationErrors = simulationDraft ? validateSimulationDraft(simulationDraft) : [];
+  $: simulationRevision = snapshot?.activeLogicRevision ?? automation?.activeLogicRevision ?? null;
+  $: canSimulate = Boolean(simulationDraft && simulationRevision !== null && simulationErrors.length === 0 && !simulationRunning);
+  $: simulationTriggerInput = simulationDraft ? simulationDraft.inputs.find((input) => input.endpoint === simulationDraft!.triggerEndpoint) ?? null : null;
 
   const dispatch = (action: Parameters<typeof reduceDashboardState>[1]) => { state = reduceDashboardState(state, action); };
 
@@ -165,7 +184,11 @@
     void refreshAutomation();
     const client = new DashboardClient({
       handlers: {
-        onSnapshot: (next) => { observeSnapshot(next); dispatch({ type: 'snapshot_loaded', snapshot: next, nowMs: Date.now() }); },
+        onSnapshot: (next) => {
+          observeSnapshot(next);
+          if (!simulationDraft) simulationDraft = createSimulationDraft(next);
+          dispatch({ type: 'snapshot_loaded', snapshot: next, nowMs: Date.now() });
+        },
         onEvent: (event) => { if (event.kind === 'update') observeSnapshot(event.snapshot); dispatch({ type: 'event_received', event }); },
         onStreamOpen: () => dispatch({ type: 'stream_open' }),
         onStreamLost: (error) => dispatch({ type: 'stream_lost', error }),
@@ -187,13 +210,101 @@
   function selectValue(event: Event): string { return (event.currentTarget as HTMLSelectElement).value; }
   function endpointValue(endpoint: DisplayEndpoint): string { return formatValue(endpoint.observed ?? null); }
   function executionTime(milliseconds: number): string { return `${milliseconds} ms`; }
-  function transition(execution: NonNullable<typeof selectedExecution>): string {
-    const previous = formatValue(execution.trigger.previous);
-    const current = formatValue(execution.trigger.value);
-    const flags = [execution.trigger.changed ? 'changed' : null, execution.trigger.rising ? 'rising' : null, execution.trigger.falling ? 'falling' : null].filter(Boolean).join(', ');
+  function transitionForTrigger(trigger: DisplayExecutionTrigger): string {
+    const previous = formatValue(trigger.previous);
+    const current = formatValue(trigger.value);
+    const flags = [trigger.changed ? 'changed' : null, trigger.rising ? 'rising' : null, trigger.falling ? 'falling' : null].filter(Boolean).join(', ');
     return `${previous} → ${current}${flags ? ` (${flags})` : ''}`;
   }
+  function transition(execution: NonNullable<typeof selectedExecution>): string { return transitionForTrigger(execution.trigger); }
   function selectExecution(executionId: number): void { dispatch({ type: 'select_execution', executionId }); }
+
+  function clearSimulationFeedback(): void {
+    simulationResult = null;
+    simulationError = null;
+    simulationFieldErrors = [];
+  }
+
+  function useForSimulation(execution: NonNullable<typeof selectedExecution> | null = selectedExecution): void {
+    if (!snapshot) return;
+    simulationDraft = createSimulationDraft(snapshot, execution);
+    clearSimulationFeedback();
+  }
+
+  function updateSimulationDraft(next: SimulationDraft): void {
+    simulationDraft = forceTriggerInput(next);
+    clearSimulationFeedback();
+  }
+
+  function simulationBoolean(event: Event): SimulationValue {
+    const value = selectValue(event);
+    return value === '' ? null : value === 'true';
+  }
+
+  function simulationNumber(event: Event): SimulationValue {
+    const value = inputValue(event).trim();
+    if (!value) return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function simulationAge(event: Event): number | null {
+    const value = simulationNumber(event);
+    return typeof value === 'number' ? value : null;
+  }
+
+  function updateSimulationTriggerEndpoint(endpoint: string): void {
+    if (!simulationDraft) return;
+    const selected = simulationDraft.inputs.find((input) => input.endpoint === endpoint);
+    updateSimulationDraft({
+      ...simulationDraft,
+      triggerEndpoint: endpoint,
+      triggerValue: selected?.value ?? null,
+      previousValue: null
+    });
+  }
+
+  function updateSimulationTriggerValue(value: SimulationValue): void {
+    if (!simulationDraft) return;
+    updateSimulationDraft({ ...simulationDraft, triggerValue: value });
+  }
+
+  function updateSimulationPreviousValue(value: SimulationValue): void {
+    if (!simulationDraft) return;
+    updateSimulationDraft({ ...simulationDraft, previousValue: value });
+  }
+
+  function updateSimulationInput(index: number, changes: Partial<SimulationDraft['inputs'][number]>): void {
+    if (!simulationDraft) return;
+    const inputs = simulationDraft.inputs.map((input, current) => current === index ? { ...input, ...changes } : input);
+    updateSimulationDraft({ ...simulationDraft, inputs });
+  }
+
+  function updateSimulationValidity(index: number, valid: boolean): void {
+    updateSimulationInput(index, valid ? { valid } : { valid, value: null, ageMs: null });
+  }
+
+  async function runSimulation(): Promise<void> {
+    if (!simulationDraft || simulationRevision === null || simulationErrors.length > 0 || simulationRunning) return;
+    const prepared = forceTriggerInput(simulationDraft);
+    const scenario = toSimulationScenario(prepared, simulationRevision);
+    if (!scenario) return;
+    simulationDraft = prepared;
+    simulationRunning = true;
+    clearSimulationFeedback();
+    try {
+      simulationResult = await simulateScenario(scenario);
+    } catch (error) {
+      if (error instanceof SimulationApiError) {
+        simulationError = error.message;
+        simulationFieldErrors = error.fieldErrors.map((field) => `${field.path}: ${field.message}`);
+      } else simulationError = error instanceof Error ? error.message : String(error);
+    } finally {
+      simulationRunning = false;
+    }
+  }
+
+  function refreshDashboard(): void { window.location.reload(); }
 </script>
 
 <svelte:head><meta name="description" content="Live LogikSmith KNX runtime dashboard" /></svelte:head>
@@ -308,7 +419,7 @@
         </tbody></table></div>
         {#if selectedExecution}
           <article class="execution-detail" aria-label="Selected execution details">
-            <div class="section-heading"><h3>Execution {selectedExecution.executionId}</h3><span>{state.selectionPinned ? 'pinned selection' : 'following newest'}</span></div>
+            <div class="section-heading"><div><h3>Execution {selectedExecution.executionId}</h3><span>{state.selectionPinned ? 'pinned selection' : 'following newest'}</span></div><button type="button" class="small-button" on:click={() => useForSimulation(selectedExecution)}>Use for simulation</button></div>
             <dl class="facts">
               <dt>Status</dt><dd><span class="status-pill logic-{selectedExecution.status}">{selectedExecution.status}</span></dd>
               <dt>Time</dt><dd>{executionTime(selectedExecution.timeMs)}</dd>
@@ -325,6 +436,95 @@
           </article>
         {/if}
       {:else}<p class="empty">No executions yet. Trigger a configured input to inspect its decision.</p>{/if}
+    </section>
+
+    <section class="panel simulation-panel" aria-label="Simulation">
+      <div class="section-heading">
+        <div><h2>Simulation</h2><p class="subtle">Run the active logic against an editable input snapshot.</p></div>
+        {#if simulationRevision !== null}<span class="revision-badge">Active revision {simulationRevision}</span>{/if}
+      </div>
+      <p class="simulation-safety" role="note"><strong>Safe test:</strong> simulation sends no KNX write and does not change live values, history, or runtime state.</p>
+      {#if !simulationDraft}
+        <p class="empty">Loading simulation inputs…</p>
+      {:else if !simulationDraft.inputs.length}
+        <p class="empty">No active configured inputs are available for simulation.</p>
+      {:else}
+        <div class="simulation-form">
+          <div class="simulation-trigger-fields">
+            <label>Triggering input
+              <select aria-label="Simulation triggering input" value={simulationDraft.triggerEndpoint} on:change={(event) => updateSimulationTriggerEndpoint(selectValue(event))}>
+                <option value="">Choose input</option>
+                {#each simulationDraft.inputs as input}<option value={input.endpoint}>{input.endpoint} ({input.dpt})</option>{/each}
+              </select>
+            </label>
+            <label>Current value
+              {#if simulationTriggerInput?.dpt === '1.001'}
+                <select aria-label="Simulation current trigger value" value={simulationDraft.triggerValue === null ? '' : String(simulationDraft.triggerValue)} on:change={(event) => updateSimulationTriggerValue(simulationBoolean(event))}>
+                  <option value="">Choose value</option><option value="false">false</option><option value="true">true</option>
+                </select>
+              {:else if simulationTriggerInput?.dpt === '5.001'}
+                <input aria-label="Simulation current trigger value" type="number" min="0" max="100" step="1" placeholder="0–100" value={simulationDraft.triggerValue ?? ''} on:input={(event) => updateSimulationTriggerValue(simulationNumber(event))} />
+              {:else}<span class="subtle">Choose an input first.</span>{/if}
+            </label>
+            <label>Previous value <span class="subtle">(optional)</span>
+              {#if simulationTriggerInput?.dpt === '1.001'}
+                <select aria-label="Simulation previous trigger value" value={simulationDraft.previousValue === null ? '' : String(simulationDraft.previousValue)} on:change={(event) => updateSimulationPreviousValue(simulationBoolean(event))}>
+                  <option value="">unknown</option><option value="false">false</option><option value="true">true</option>
+                </select>
+              {:else if simulationTriggerInput?.dpt === '5.001'}
+                <input aria-label="Simulation previous trigger value" type="number" min="0" max="100" step="1" placeholder="unknown" value={simulationDraft.previousValue ?? ''} on:input={(event) => updateSimulationPreviousValue(simulationNumber(event))} />
+              {:else}<span class="subtle">Choose an input first.</span>{/if}
+            </label>
+          </div>
+
+          <h3>Input snapshot</h3>
+          <div class="table-wrap"><table class="simulation-table"><thead><tr><th>Input</th><th>DPT</th><th>Value</th><th>Valid</th><th>Age (ms)</th></tr></thead><tbody>
+            {#each simulationDraft.inputs as input, index}
+              {@const isTrigger = input.endpoint === simulationDraft.triggerEndpoint}
+              <tr class:simulation-trigger-row={isTrigger}>
+                <td><code>{input.endpoint}</code>{#if isTrigger}<small> trigger</small>{/if}</td>
+                <td>{input.dpt}</td>
+                <td>
+                  {#if input.dpt === '1.001'}
+                    <select aria-label={'Simulation ' + input.endpoint + ' value'} disabled={!input.valid || isTrigger} value={input.value === null ? '' : String(input.value)} on:change={(event) => updateSimulationInput(index, { value: simulationBoolean(event) })}>
+                      <option value="">Choose value</option><option value="false">false</option><option value="true">true</option>
+                    </select>
+                  {:else}
+                    <input aria-label={'Simulation ' + input.endpoint + ' value'} disabled={!input.valid || isTrigger} type="number" min="0" max="100" step="1" placeholder="0–100" value={input.value ?? ''} on:input={(event) => updateSimulationInput(index, { value: simulationNumber(event) })} />
+                  {/if}
+                </td>
+                <td><label class="checkbox-label"><input aria-label={'Simulation ' + input.endpoint + ' validity'} type="checkbox" checked={input.valid} disabled={isTrigger} on:change={(event) => updateSimulationValidity(index, (event.currentTarget as HTMLInputElement).checked)} /> valid</label></td>
+                <td><input aria-label={'Simulation ' + input.endpoint + ' age'} disabled={!input.valid || isTrigger} type="number" min="0" step="1" placeholder="unknown" value={input.ageMs ?? ''} on:input={(event) => updateSimulationInput(index, { ageMs: simulationAge(event) })} /></td>
+              </tr>
+            {/each}
+          </tbody></table></div>
+          <p class="subtle simulation-trigger-note">The selected trigger is always submitted as valid with its current value and age 0.</p>
+
+          {#if simulationErrors.length}
+            <div class="validation-summary" role="alert"><strong>Complete the scenario before running:</strong><ul>{#each simulationErrors as error}<li>{error}</li>{/each}</ul></div>
+          {/if}
+          {#if simulationError}
+            <div class="logic-error simulation-error" role="alert">{simulationError}
+              {#if simulationFieldErrors.length}<ul>{#each simulationFieldErrors as error}<li>{error}</li>{/each}</ul>{/if}
+              {#if simulationError.includes('active logic source changed')}<button type="button" class="small-button" on:click={refreshDashboard}>Refresh dashboard, then re-run</button>{/if}
+            </div>
+          {/if}
+          <div class="editor-actions simulation-actions"><button type="button" class="save-button" disabled={!canSimulate} on:click={runSimulation}>{simulationRunning ? 'Running…' : 'Run simulation'}</button><span class="subtle">Uses active revision {simulationRevision ?? 'unknown'}.</span></div>
+
+          {#if simulationResult}
+            <article class:simulation-failed={simulationResult.status === 'failed'} class:simulation-succeeded={simulationResult.status === 'succeeded'} class="simulation-result" aria-label="Simulation result" aria-live="polite">
+              <div class="section-heading"><h3>Simulation {simulationResult.status}</h3><span>{formatDuration(simulationResult.durationUs)} · revision {simulationResult.logicRevision}</span></div>
+              <p>Trigger <code>{simulationResult.trigger.endpoint}</code> = {formatValue(simulationResult.trigger.value)}; previous {formatValue(simulationResult.trigger.previous)}; {transitionForTrigger(simulationResult.trigger)}</p>
+              {#if simulationResult.status === 'failed' && simulationResult.error}
+                <div class="logic-error" role="alert"><strong>{simulationResult.error.category}</strong>{#if simulationResult.error.line !== null} line {simulationResult.error.line}:{/if} {simulationResult.error.message}</div>
+              {:else if simulationResult.effects.length}
+                <div class="simulation-effects" aria-label="Proposed effects"><h3>Proposed effects</h3>{#each simulationResult.effects as effect}<div><strong>Would emit</strong> <code>{effect.endpoint}</code> = <span class="value">{formatValue(effect.value)}</span> ({effect.dpt}) to <code>{effect.destination}</code></div>{/each}</div>
+              {:else}<p class="empty">No effects — the active logic would not emit anything.</p>{/if}
+              <p class="subtle no-write-note">Simulation sends no KNX write.</p>
+            </article>
+          {/if}
+        </div>
+      {/if}
     </section>
 
     <section class="grid two-columns" aria-label="Current values">

@@ -148,6 +148,19 @@ pub struct LogicalEffectRecord {
     pub value: ValueMessage,
 }
 
+/// Browser-facing result for an immutable simulation. It intentionally omits
+/// live execution IDs and timestamps because no live diagnostic record exists.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SimulationResponse {
+    pub logic_revision: u64,
+    pub duration_us: u64,
+    pub status: LogicExecutionStatus,
+    pub trigger: LogicalTriggerRecord,
+    pub inputs: Vec<LogicalInputSnapshot>,
+    pub effects: Vec<LogicalEffectRecord>,
+    pub error: Option<LogicErrorRecord>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WriteStatus {
@@ -578,6 +591,38 @@ fn trigger_record(trigger: &logiksmith_core::InputTrigger) -> LogicalTriggerReco
         changed: trigger.changed,
         rising: trigger.rising,
         falling: trigger.falling,
+    }
+}
+
+pub fn simulation_response(
+    execution: &Execution,
+    duration_us: u64,
+    logic_revision: u64,
+    automation: &AutomationRuntime,
+) -> SimulationResponse {
+    let (status, effects, error) = match &execution.outcome {
+        Ok(effects) => (
+            LogicExecutionStatus::Succeeded,
+            effects
+                .iter()
+                .filter_map(|effect| effect_record(effect, automation))
+                .collect(),
+            None,
+        ),
+        Err(error) => (
+            LogicExecutionStatus::Failed,
+            Vec::new(),
+            Some(logic_error_record(error)),
+        ),
+    };
+    SimulationResponse {
+        logic_revision,
+        duration_us,
+        status,
+        trigger: trigger_record(&execution.trigger),
+        inputs: execution.inputs.iter().map(input_snapshot_record).collect(),
+        effects,
+        error,
     }
 }
 

@@ -6,7 +6,8 @@ pub mod web;
 use diagnostics::{ConnectionState, DiagnosticStore, TelegramRecord};
 use logiksmith_core::{
     Dpt, Effect, Endpoint, EndpointDirection, EndpointName, Engine, EngineConfig, InputEvent,
-    InputObservation, TypedValue, Value,
+    InputObservation, SimulationError, SimulationInput, SimulationScenario, SimulationTrigger,
+    TypedValue, Value,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -40,6 +41,48 @@ pub struct ActivationRequest {
     pub logic_hash: u64,
     pub document_revision: u64,
     pub reply: oneshot::Sender<Result<(), String>>,
+}
+
+/// Browser payload for one immutable input simulation. Values carry their
+/// semantic kind; the configured endpoint supplies the DPT.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimulationPayload {
+    pub expected_logic_revision: u64,
+    pub trigger: SimulationTriggerPayload,
+    pub inputs: Vec<SimulationInputPayload>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimulationTriggerPayload {
+    pub endpoint: String,
+    pub value: ValueMessage,
+    #[serde(default)]
+    pub previous: Option<ValueMessage>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimulationInputPayload {
+    pub endpoint: String,
+    pub value: Option<ValueMessage>,
+    pub valid: bool,
+    pub age_ms: Option<u64>,
+}
+
+/// A request sent to the runtime owner. The HTTP handler never evaluates Lua
+/// itself, so bridge events, activation, and simulation remain serialized by
+/// the session actor.
+pub struct SimulationRequest {
+    pub payload: SimulationPayload,
+    pub reply: oneshot::Sender<SimulationOutcome>,
+}
+
+pub enum SimulationOutcome {
+    Conflict { current_revision: u64 },
+    Invalid(Vec<FieldError>),
+    Complete(diagnostics::SimulationResponse),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -720,6 +763,157 @@ impl ValueMessage {
     }
 }
 
+fn simulation_value(value: &ValueMessage, dpt: Dpt, path: &str) -> Result<TypedValue, FieldError> {
+    value.core(dpt, "value").map_err(|error| FieldError {
+        path: path.to_owned(),
+        message: error.to_string(),
+    })
+}
+
+/// Converts the browser wire representation into the core-owned scenario.
+/// Endpoint and value checks that depend on the active configuration are kept
+/// here, before the immutable core operation is called.
+pub(crate) fn simulation_scenario(
+    payload: SimulationPayload,
+    automation: &AutomationRuntime,
+) -> Result<SimulationScenario, Vec<FieldError>> {
+    let mut errors = Vec::new();
+    let trigger_endpoint = match endpoint_name("trigger.endpoint", &payload.trigger.endpoint) {
+        Ok(endpoint) => Some(endpoint),
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    };
+    let trigger_dpt = trigger_endpoint
+        .as_ref()
+        .and_then(|endpoint| automation.endpoint_dpts.get(endpoint).copied());
+    if trigger_endpoint.is_some() && trigger_dpt.is_none() {
+        errors.push(FieldError {
+            path: "trigger.endpoint".to_owned(),
+            message: "must reference an existing input endpoint".to_owned(),
+        });
+    }
+    let trigger_value = trigger_dpt.and_then(|dpt| {
+        simulation_value(&payload.trigger.value, dpt, "trigger.value")
+            .map_err(|error| errors.push(error))
+            .ok()
+    });
+    let previous = match (trigger_dpt, payload.trigger.previous.as_ref()) {
+        (Some(dpt), Some(value)) => simulation_value(value, dpt, "trigger.previous")
+            .map_err(|error| errors.push(error))
+            .ok(),
+        (_, None) => None,
+        (None, Some(_)) => None,
+    };
+
+    let inputs = payload
+        .inputs
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, input)| {
+            let path = format!("inputs[{index}]");
+            let endpoint = match endpoint_name(&format!("{path}.endpoint"), &input.endpoint) {
+                Ok(endpoint) => Some(endpoint),
+                Err(error) => {
+                    errors.push(error);
+                    None
+                }
+            };
+            let dpt = endpoint
+                .as_ref()
+                .and_then(|endpoint| automation.endpoint_dpts.get(endpoint).copied());
+            if endpoint.is_some() && dpt.is_none() {
+                errors.push(FieldError {
+                    path: format!("{path}.endpoint"),
+                    message: "must reference an existing input endpoint".to_owned(),
+                });
+            }
+            let value = match (dpt, input.value.as_ref()) {
+                (Some(dpt), Some(value)) => simulation_value(value, dpt, &format!("{path}.value"))
+                    .map_err(|error| errors.push(error))
+                    .ok(),
+                (_, None) => None,
+                (None, Some(_)) => None,
+            };
+            let endpoint = endpoint?;
+            Some(SimulationInput {
+                endpoint,
+                value,
+                valid: input.valid,
+                age_ms: input.age_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(SimulationScenario {
+        trigger: SimulationTrigger {
+            endpoint: trigger_endpoint.expect("validated trigger endpoint"),
+            value: trigger_value.expect("validated trigger value"),
+            previous,
+        },
+        inputs,
+    })
+}
+
+pub(crate) fn simulation_error_fields(
+    error: &SimulationError,
+    payload: &SimulationPayload,
+) -> Vec<FieldError> {
+    let endpoint_path = |endpoint: &EndpointName| {
+        if payload.trigger.endpoint == endpoint.as_str() {
+            "trigger.endpoint".to_owned()
+        } else {
+            payload
+                .inputs
+                .iter()
+                .enumerate()
+                .find(|(_, input)| input.endpoint == endpoint.as_str())
+                .map(|(index, _)| format!("inputs[{index}].endpoint"))
+                .unwrap_or_else(|| "inputs".to_owned())
+        }
+    };
+    let input_field = |endpoint: &EndpointName, field_name: &str| {
+        payload
+            .inputs
+            .iter()
+            .enumerate()
+            .find(|(_, input)| input.endpoint == endpoint.as_str())
+            .map(|(index, _)| format!("inputs[{index}].{field_name}"))
+            .unwrap_or_else(|| "inputs".to_owned())
+    };
+    let path = match error {
+        SimulationError::UnknownEndpoint(endpoint)
+        | SimulationError::EndpointNotInput { endpoint, .. } => endpoint_path(endpoint),
+        SimulationError::DuplicateInput(endpoint) | SimulationError::MissingInput(endpoint) => {
+            input_field(endpoint, "endpoint")
+        }
+        SimulationError::DptMismatch { endpoint, .. } => {
+            if payload.trigger.endpoint == endpoint.as_str() {
+                "trigger.value".to_owned()
+            } else {
+                input_field(endpoint, "value")
+            }
+        }
+        SimulationError::InvalidValue(_) => "inputs".to_owned(),
+        SimulationError::TriggerValueMismatch { .. } => "trigger.value".to_owned(),
+        SimulationError::MissingValue(endpoint) | SimulationError::UnexpectedValue(endpoint) => {
+            input_field(endpoint, "value")
+        }
+        SimulationError::MissingAge(endpoint) | SimulationError::UnexpectedAge(endpoint) => {
+            input_field(endpoint, "age_ms")
+        }
+        SimulationError::TriggerAgeMismatch { endpoint, .. } => input_field(endpoint, "age_ms"),
+    };
+    vec![FieldError {
+        path,
+        message: error.to_string(),
+    }]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupAddressDpt {
@@ -1189,8 +1383,14 @@ pub async fn run_with_bridge(
         HostError::Protocol(ProtocolError::Field("automation", error.to_string()))
     })?;
     let (activation_sender, activation_receiver) = mpsc::channel(8);
-    let web_server =
-        web::start_web_server_with_activation(store.clone(), config.web, activation_sender).await?;
+    let (simulation_sender, simulation_receiver) = mpsc::channel(8);
+    let web_server = web::start_web_server_with_runtime(
+        store.clone(),
+        config.web,
+        activation_sender,
+        simulation_sender,
+    )
+    .await?;
     let mut child = match Command::new(&bridge_command.executable)
         .args(&bridge_command.args)
         .stdin(std::process::Stdio::piped())
@@ -1227,6 +1427,7 @@ pub async fn run_with_bridge(
         &mut stdin,
         &mut reader,
         activation_receiver,
+        simulation_receiver,
     )
     .await;
     if result.is_err() {
@@ -1252,6 +1453,7 @@ async fn run_session(
     stdin: &mut ChildStdin,
     reader: &mut BufReader<ChildStdout>,
     mut activations: mpsc::Receiver<ActivationRequest>,
+    mut simulations: mpsc::Receiver<SimulationRequest>,
 ) -> Result<(), HostError> {
     let hello = match read_message(reader).await? {
         Message::BridgeHello(hello) => hello,
@@ -1295,6 +1497,7 @@ async fn run_session(
     let mut line = String::new();
     let mut next_request_id = 1u64;
     let mut pending = HashSet::new();
+    let mut active_logic_revision = config.automation.document_revision;
     loop {
         tokio::select! {
             read = reader.read_line(&mut line) => {
@@ -1340,8 +1543,40 @@ async fn run_session(
             Some(request) = activations.recv() => {
                 let source = request.source;
                 let result = engine.replace_logic(source.clone(), request.logic_hash).map(|_| ()).map_err(|error| error.to_string());
-                if result.is_ok() { store.set_active_logic(request.document_revision, source); }
+                if result.is_ok() {
+                    active_logic_revision = request.document_revision;
+                    store.set_active_logic(request.document_revision, source);
+                }
                 let _ = request.reply.send(result);
+            }
+            Some(request) = simulations.recv() => {
+                let SimulationRequest { payload, reply } = request;
+                let outcome = if payload.expected_logic_revision != active_logic_revision {
+                    SimulationOutcome::Conflict { current_revision: active_logic_revision }
+                } else {
+                    match simulation_scenario(payload.clone(), &config.automation) {
+                        Err(errors) => SimulationOutcome::Invalid(errors),
+                        Ok(scenario) => {
+                            let started = Instant::now();
+                            let execution = engine.simulate_input(scenario);
+                            let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                            match execution {
+                                Ok(execution) => SimulationOutcome::Complete(
+                                    diagnostics::simulation_response(
+                                        &execution,
+                                        duration_us,
+                                        active_logic_revision,
+                                        &config.automation,
+                                    ),
+                                ),
+                                Err(error) => SimulationOutcome::Invalid(
+                                    simulation_error_fields(&error, &payload),
+                                ),
+                            }
+                        }
+                    }
+                };
+                let _ = reply.send(outcome);
             }
             signal = &mut interrupt => {
                 signal?;

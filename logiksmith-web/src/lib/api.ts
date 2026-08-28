@@ -14,6 +14,9 @@ import type {
   DisplayTelegram,
   DisplayTimer,
   DisplayWrite,
+  DisplaySimulation,
+  SimulationScenario,
+  SimulationTypedValue,
   TimerState,
   WriteStatus
 } from './state';
@@ -33,6 +36,20 @@ export class ApiDecodeError extends Error {
   constructor(path: string, message: string) {
     super(`Malformed dashboard data at ${path}: ${message}`);
     this.name = 'ApiDecodeError';
+  }
+}
+
+export interface SimulationFieldError { path: string; message: string; }
+
+export class SimulationApiError extends Error {
+  readonly status: number;
+  readonly fieldErrors: SimulationFieldError[];
+
+  constructor(status: number, message: string, fieldErrors: SimulationFieldError[] = []) {
+    super(message);
+    this.name = 'SimulationApiError';
+    this.status = status;
+    this.fieldErrors = fieldErrors;
   }
 }
 
@@ -315,26 +332,28 @@ function logicError(value: unknown, path: string): DisplayLogicError {
 }
 
 function executionDpt(value: unknown, path: string): string {
-  if (!isObject(value)) throw new ApiDecodeError(path, 'expected a DPT object');
   return dpt(value, path);
 }
 
-function executionValue(value: unknown, path: string): boolean | number | null {
-  if (value === null) return null;
-  if (!isObject(value)) throw new ApiDecodeError(path, 'expected a typed value or null');
-  const kind = field(value, path, 'kind');
-  const raw = required(field(value, path, 'value'), `${path}.value`);
+function typedValue(value: unknown, path: string): SimulationTypedValue {
+  const source = object(value, path);
+  const kind = field(source, path, 'kind');
+  const raw = required(field(source, path, 'value'), `${path}.value`);
   if (kind === 'bool') {
-    const boolean = nullableBoolean(raw, `${path}.value`);
-    if (boolean === null) throw new ApiDecodeError(`${path}.value`, 'typed boolean cannot be null');
-    return boolean;
+    if (typeof raw !== 'boolean') throw new ApiDecodeError(`${path}.value`, 'expected a boolean');
+    return { kind: 'bool', value: raw };
   }
   if (kind === 'percent') {
     const percentage = nonNegativeNumber(raw, `${path}.value`);
     if (percentage > 100) throw new ApiDecodeError(`${path}.value`, 'percentage must be between 0 and 100');
-    return percentage;
+    return { kind: 'percent', value: percentage };
   }
   throw new ApiDecodeError(`${path}.kind`, 'expected bool or percent');
+}
+
+function executionValue(value: unknown, path: string): boolean | number | null {
+  if (value === null) return null;
+  return typedValue(value, path).value;
 }
 
 function executionTrigger(value: unknown, path: string): DisplayExecutionTrigger {
@@ -411,6 +430,59 @@ function execution(value: unknown, index: number): DisplayExecution {
     inputs,
     effects,
     error: errorRaw === undefined || errorRaw === null ? null : logicError(errorRaw, `${path}.error`)
+  };
+}
+
+function simulationInput(value: unknown, index: number): DisplayExecutionInput {
+  const path = `inputs[${index}]`;
+  const source = object(value, path);
+  const snapshotValue = executionValue(nullableField(source, 'value', `${path}.value`), `${path}.value`);
+  const valid = booleanField(source, path, 'valid');
+  const ageRaw = nullableField(source, 'age_ms', `${path}.age_ms`);
+  const ageMs = ageRaw === null ? null : integer(ageRaw, `${path}.age_ms`);
+  if (valid !== (snapshotValue !== null)) throw new ApiDecodeError(path, 'valid must match value presence');
+  if (!valid && ageMs !== null) throw new ApiDecodeError(`${path}.age_ms`, 'invalid inputs must have a null age');
+  if (valid && ageMs === null) throw new ApiDecodeError(`${path}.age_ms`, 'valid inputs must have an age');
+  return {
+    endpoint: stringValue(required(field(source, path, 'endpoint'), `${path}.endpoint`), `${path}.endpoint`),
+    dpt: executionDpt(required(field(source, path, 'dpt'), `${path}.dpt`), `${path}.dpt`),
+    value: snapshotValue,
+    valid,
+    ageMs
+  };
+}
+
+function simulationEffect(value: unknown, index: number): DisplayExecutionEffect {
+  const path = `effects[${index}]`;
+  const source = object(value, path);
+  const effectValue = executionValue(required(field(source, path, 'value'), `${path}.value`), `${path}.value`);
+  if (effectValue === null) throw new ApiDecodeError(`${path}.value`, 'effect value cannot be null');
+  return {
+    endpoint: stringValue(required(field(source, path, 'endpoint'), `${path}.endpoint`), `${path}.endpoint`),
+    destination: stringValue(required(field(source, path, 'destination'), `${path}.destination`), `${path}.destination`),
+    dpt: executionDpt(required(field(source, path, 'dpt'), `${path}.dpt`), `${path}.dpt`),
+    value: effectValue
+  };
+}
+
+/** Decodes the execution-shaped, effect-only result returned by /api/simulate. */
+export function decodeSimulation(input: unknown): DisplaySimulation {
+  const root = object(input, 'simulation');
+  const status = stringValue(required(field(root, 'simulation', 'status'), 'status'), 'status');
+  if (status !== 'succeeded' && status !== 'failed') throw new ApiDecodeError('status', `unsupported status ${status}`);
+  const trigger = executionTrigger(required(field(root, 'simulation', 'trigger'), 'trigger'), 'trigger');
+  const inputs = array(required(field(root, 'simulation', 'inputs'), 'inputs'), 'inputs').map(simulationInput);
+  const effects = array(required(field(root, 'simulation', 'effects'), 'effects'), 'effects').map(simulationEffect);
+  if (status === 'failed' && effects.length > 0) throw new ApiDecodeError('effects', 'failed simulations cannot contain effects');
+  const errorRaw = field(root, 'simulation', 'error');
+  return {
+    logicRevision: revision(required(field(root, 'simulation', 'logic_revision', 'logicRevision'), 'logic_revision'), 'logic_revision'),
+    durationUs: integer(required(field(root, 'simulation', 'duration_us', 'durationUs'), 'duration_us'), 'duration_us'),
+    status: status as DisplaySimulation['status'],
+    trigger,
+    inputs,
+    effects,
+    error: errorRaw === undefined || errorRaw === null ? null : logicError(errorRaw, 'error')
   };
 }
 
@@ -509,6 +581,48 @@ export function decodeEvent(input: unknown, eventName = 'update', eventId?: stri
   const snapshot = decodeSnapshot(required(rawSnapshot, 'event.snapshot'));
   if (snapshot.revision !== eventRevision) throw new ApiDecodeError('event.revision', 'does not match event.snapshot.revision');
   return { kind: 'update', revision: eventRevision, snapshot };
+}
+
+async function jsonOrNull(response: Response): Promise<unknown> {
+  try { return await response.json(); } catch { return null; }
+}
+
+function simulationFieldErrors(value: unknown): SimulationFieldError[] {
+  if (!isObject(value)) return [];
+  const raw = value.errors ?? value.field_errors ?? value.fields;
+  if (Array.isArray(raw)) return raw.flatMap((item) => {
+    if (!isObject(item) || (typeof item.path !== 'string' && typeof item.field !== 'string') || typeof item.message !== 'string') return [];
+    return [{ path: (item.path ?? item.field) as string, message: item.message }];
+  });
+  if (isObject(raw)) return Object.entries(raw).flatMap(([path, message]) => typeof message === 'string' ? [{ path, message }] : []);
+  return [];
+}
+
+function simulationErrorMessage(status: number, body: unknown): string {
+  if (status === 409) return 'The active logic source changed. Refresh the dashboard and re-run the simulation.';
+  if (status === 422) return 'The simulation scenario is invalid. Fix the highlighted fields and re-run.';
+  if (isObject(body) && typeof body.error === 'string') return body.error;
+  return `Simulation request failed (${status})`;
+}
+
+export async function simulateScenario(scenario: SimulationScenario, fetchImpl: FetchLike = fetch): Promise<DisplaySimulation> {
+  const response = await fetchImpl('/api/simulate', {
+    method: 'POST',
+    headers: { accept: 'application/json', 'content-type': 'application/json' },
+    body: JSON.stringify({
+      expected_logic_revision: scenario.expectedLogicRevision,
+      trigger: scenario.trigger,
+      inputs: scenario.inputs.map((input) => ({
+        endpoint: input.endpoint,
+        value: input.value,
+        valid: input.valid,
+        age_ms: input.ageMs
+      }))
+    })
+  });
+  if (response.ok) return decodeSimulation(await response.json());
+  const body = await jsonOrNull(response);
+  throw new SimulationApiError(response.status, simulationErrorMessage(response.status, body), simulationFieldErrors(body));
 }
 
 export async function loadSnapshot(fetchImpl: FetchLike = fetch): Promise<DisplaySnapshot> {
