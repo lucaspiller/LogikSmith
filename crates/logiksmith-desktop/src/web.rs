@@ -1,8 +1,8 @@
 //! Internal HTTP/SSE dashboard API and static asset server.
 
 use crate::{
-    ActivationRequest, AutomationDocument, AutomationEnvelope, FieldError, SimulationOutcome,
-    SimulationPayload, SimulationRequest, WebConfig, build_automation,
+    ActivationRequest, AutomationBlockStatus, AutomationDocument, AutomationEnvelope, FieldError,
+    SimulationOutcome, SimulationPayload, SimulationRequest, WebConfig, build_automation,
     diagnostics::{DiagnosticStore, DiagnosticUpdate, Replay, Snapshot},
     load_automation, serialize_automation,
 };
@@ -56,6 +56,22 @@ struct AppState {
     automation_lock: Arc<Mutex<()>>,
     activation: Option<mpsc::Sender<ActivationRequest>>,
     simulation: Option<mpsc::Sender<SimulationRequest>>,
+}
+
+fn block_statuses(snapshot: &Snapshot) -> Vec<AutomationBlockStatus> {
+    snapshot
+        .blocks
+        .iter()
+        .map(|block| AutomationBlockStatus {
+            id: block.id.clone(),
+            active_enabled: block.active_enabled,
+            saved_enabled: block.saved_enabled,
+            active_revision: block.active_logic_revision,
+            saved_revision: block.saved_logic_revision,
+            active_logic_revision: block.active_logic_revision,
+            saved_logic_revision: block.saved_logic_revision,
+        })
+        .collect()
 }
 
 pub struct WebServer {
@@ -216,6 +232,7 @@ async fn snapshot(State(state): State<AppState>) -> Json<Snapshot> {
 #[derive(Debug, Serialize)]
 struct SimulationConflictResponse {
     error: String,
+    #[serde(serialize_with = "crate::wire_revision::serialize")]
     current_logic_revision: u64,
 }
 
@@ -266,6 +283,9 @@ async fn simulate(
     };
     match result {
         SimulationOutcome::Complete(result) => (StatusCode::OK, Json(result)).into_response(),
+        SimulationOutcome::NotFound => {
+            json_error(StatusCode::NOT_FOUND, "unknown logic block".to_owned())
+        }
         SimulationOutcome::Invalid(errors) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(FieldErrorsResponse { errors }),
@@ -297,6 +317,7 @@ async fn get_automation(State(state): State<AppState>) -> Response {
                     active_logic_revision: snapshot.logic.active_logic_revision,
                     saved_logic_revision: snapshot.logic.saved_logic_revision,
                     restart_required: snapshot.logic.restart_required,
+                    blocks: block_statuses(&snapshot),
                 }),
             )
                 .into_response()
@@ -308,16 +329,22 @@ async fn get_automation(State(state): State<AppState>) -> Response {
 #[derive(Debug, Deserialize)]
 struct SaveAutomationRequest {
     document: AutomationDocument,
-    revision: u16,
+    #[serde(default, rename = "revision")]
+    _revision: Option<u16>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct SaveAutomationResponse {
+    #[serde(skip_serializing)]
     revision: u64,
     logic_activated: bool,
+    #[serde(serialize_with = "crate::wire_revision::serialize")]
     active_logic_revision: u64,
     restart_required: bool,
     cancelled_timers: Vec<String>,
+    changed_block_ids: Vec<String>,
+    blocks: Vec<AutomationBlockStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -336,11 +363,10 @@ async fn put_automation(
 ) -> Response {
     let path = state.store.automation_path();
     let candidate_structural_revision = crate::structural_revision(&request.document);
-    let candidate_logic_hash = crate::automation_revision(request.document.logic.source.as_bytes());
     enum SaveOutcome {
-        Conflict(AutomationDocument, u16),
+        Conflict(AutomationDocument),
         Invalid(Vec<FieldError>),
-        Saved(Result<u16, String>),
+        Saved(Result<(u16, AutomationDocument), String>),
     }
     // Keep the stale check and rename under one lock. The await below happens
     // only after this guard is dropped, so the axum handler remains Send.
@@ -349,31 +375,33 @@ async fn put_automation(
             .automation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (current, current_revision) = match load_automation(&path) {
+        let (current, _current_revision) = match load_automation(&path) {
             Ok(value) => value,
             Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         };
-        if request.revision != current_revision {
-            SaveOutcome::Conflict(current, current_revision)
-        } else if let Err(errors) = build_automation(request.document.clone()) {
+        let mut document = request.document.clone();
+        if merge_block_revisions(&current, &mut document).is_err() {
+            SaveOutcome::Conflict(current)
+        } else if let Err(errors) = build_automation(document.clone()) {
             SaveOutcome::Invalid(errors)
         } else {
-            SaveOutcome::Saved(atomic_save(&path, &request.document, current_revision))
+            SaveOutcome::Saved(atomic_save(&path, &document).map(|revision| (revision, document)))
         }
     };
     match save {
-        SaveOutcome::Conflict(current, current_revision) => {
+        SaveOutcome::Conflict(current) => {
             let snapshot = state.store.snapshot();
             (
                 StatusCode::CONFLICT,
                 Json(AutomationEnvelope {
                     document: current,
-                    revision: u64::from(current_revision),
+                    revision: state.store.latest_revision(),
                     active_structural_revision: snapshot.logic.active_structural_revision,
                     saved_structural_revision: snapshot.logic.saved_structural_revision,
                     active_logic_revision: snapshot.logic.active_logic_revision,
                     saved_logic_revision: snapshot.logic.saved_logic_revision,
                     restart_required: snapshot.logic.restart_required,
+                    blocks: block_statuses(&snapshot),
                 }),
             )
                 .into_response()
@@ -384,7 +412,7 @@ async fn put_automation(
         )
             .into_response(),
         SaveOutcome::Saved(save_result) => match save_result {
-            Ok(revision) => {
+            Ok((revision, document)) => {
                 let active_structural_revision =
                     state.store.snapshot().logic.active_structural_revision;
                 let mut logic_activated = false;
@@ -394,9 +422,19 @@ async fn put_automation(
                 if !restart_required {
                     if let Some(activation) = &state.activation {
                         let (reply, result) = oneshot::channel();
+                        let updates = document
+                            .blocks
+                            .iter()
+                            .map(|block| {
+                                logiksmith_core::BlockActivation::new(
+                                    block.id.parse().expect("validated block ID"),
+                                    Some(block.source.clone()),
+                                    Some(block.enabled),
+                                )
+                            })
+                            .collect::<Vec<_>>();
                         let request = ActivationRequest {
-                            source: request.document.logic.source.clone(),
-                            logic_hash: candidate_logic_hash,
+                            updates,
                             document_revision: u64::from(revision),
                             reply,
                         };
@@ -409,19 +447,29 @@ async fn put_automation(
                                     .and_then(Result::ok)
                             {
                                 logic_activated = true;
-                                cancelled_timers = activation.cancelled_timers;
+                                cancelled_timers = activation
+                                    .result
+                                    .blocks
+                                    .into_iter()
+                                    .flat_map(|block| {
+                                        block.cancelled_timers.into_iter().map(move |timer| {
+                                            format!("{}.{}", block.block_id, timer)
+                                        })
+                                    })
+                                    .collect();
                             }
                         }
                     }
                     restart_required = !logic_activated;
                 }
-                state.store.set_saved_logic_state(
-                    u64::from(revision),
+                state.store.set_saved_document_state(
                     u64::from(revision),
                     candidate_structural_revision,
                     restart_required,
+                    &document,
                 );
                 let active_logic_revision = state.store.snapshot().logic.active_logic_revision;
+                let snapshot = state.store.snapshot();
                 (
                     StatusCode::OK,
                     Json(SaveAutomationResponse {
@@ -430,6 +478,12 @@ async fn put_automation(
                         active_logic_revision,
                         restart_required,
                         cancelled_timers,
+                        changed_block_ids: document
+                            .blocks
+                            .iter()
+                            .map(|block| block.id.clone())
+                            .collect(),
+                        blocks: block_statuses(&snapshot),
                     }),
                 )
                     .into_response()
@@ -443,15 +497,8 @@ fn json_error(status: StatusCode, error: String) -> Response {
     (status, Json(ErrorResponse { error })).into_response()
 }
 
-fn atomic_save(
-    path: &Path,
-    document: &AutomationDocument,
-    current_revision: u16,
-) -> Result<u16, String> {
-    let revision = current_revision.checked_add(1).ok_or_else(|| {
-        "automation revision is exhausted; reset it manually before saving".to_owned()
-    })?;
-    let bytes = serialize_automation(document, revision)?;
+fn atomic_save(path: &Path, document: &AutomationDocument) -> Result<u16, String> {
+    let bytes = serialize_automation(document, 0)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -476,7 +523,33 @@ fn atomic_save(
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result.map(|_| revision)
+    result.map(|_| 0)
+}
+
+fn merge_block_revisions(
+    current: &AutomationDocument,
+    candidate: &mut AutomationDocument,
+) -> Result<(), ()> {
+    for block in &mut candidate.blocks {
+        if let Some(previous) = current.blocks.iter().find(|item| item.id == block.id) {
+            let changed = block.enabled != previous.enabled
+                || block.inputs != previous.inputs
+                || block.outputs != previous.outputs
+                || block.knx_bindings != previous.knx_bindings
+                || block.source != previous.source;
+            if changed {
+                if block.revision.max(1) != previous.revision.max(1) {
+                    return Err(());
+                }
+                block.revision = previous.revision.max(1).saturating_add(1);
+            } else {
+                block.revision = previous.revision.max(1);
+            }
+        } else {
+            block.revision = block.revision.max(1);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -562,53 +635,56 @@ fn resync_event(revision: u64) -> Event {
 mod tests {
     use super::*;
     use crate::diagnostics::JOURNAL_CAPACITY;
-    use logiksmith_core::Engine;
+    use logiksmith_core::Runtime;
     use std::{fs, net::IpAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn store() -> DiagnosticStore {
         let runtime = crate::build_automation(crate::AutomationDocument {
-            inputs: vec![
-                crate::AutomationEndpoint {
-                    name: "wall_switch".to_owned(),
-                    dpt: "1.001".to_owned(),
-                },
-                crate::AutomationEndpoint {
-                    name: "dimmer_level".to_owned(),
-                    dpt: "5.001".to_owned(),
-                },
-            ],
-            outputs: vec![
-                crate::AutomationEndpoint {
-                    name: "test_light".to_owned(),
-                    dpt: "1.001".to_owned(),
-                },
-                crate::AutomationEndpoint {
-                    name: "dimmer_output".to_owned(),
-                    dpt: "5.001".to_owned(),
-                },
-            ],
-            knx_bindings: vec![
-                crate::KnxBinding {
-                    endpoint: "wall_switch".to_owned(),
-                    group_address: "2/2/52".to_owned(),
-                },
-                crate::KnxBinding {
-                    endpoint: "dimmer_level".to_owned(),
-                    group_address: "2/2/53".to_owned(),
-                },
-                crate::KnxBinding {
-                    endpoint: "test_light".to_owned(),
-                    group_address: "2/3/52".to_owned(),
-                },
-                crate::KnxBinding {
-                    endpoint: "dimmer_output".to_owned(),
-                    group_address: "2/3/53".to_owned(),
-                },
-            ],
-            logic: crate::LogicDocument {
+            blocks: vec![crate::AutomationBlock {
+                id: "test".to_owned(),
+                revision: 1,
+                enabled: true,
+                inputs: vec![
+                    crate::AutomationEndpoint {
+                        name: "wall_switch".to_owned(),
+                        dpt: "1.001".to_owned(),
+                    },
+                    crate::AutomationEndpoint {
+                        name: "dimmer_level".to_owned(),
+                        dpt: "5.001".to_owned(),
+                    },
+                ],
+                outputs: vec![
+                    crate::AutomationEndpoint {
+                        name: "test_light".to_owned(),
+                        dpt: "1.001".to_owned(),
+                    },
+                    crate::AutomationEndpoint {
+                        name: "dimmer_output".to_owned(),
+                        dpt: "5.001".to_owned(),
+                    },
+                ],
+                knx_bindings: vec![
+                    crate::KnxBinding {
+                        endpoint: "wall_switch".to_owned(),
+                        group_address: "2/2/52".to_owned(),
+                    },
+                    crate::KnxBinding {
+                        endpoint: "dimmer_level".to_owned(),
+                        group_address: "2/2/53".to_owned(),
+                    },
+                    crate::KnxBinding {
+                        endpoint: "test_light".to_owned(),
+                        group_address: "2/3/52".to_owned(),
+                    },
+                    crate::KnxBinding {
+                        endpoint: "dimmer_output".to_owned(),
+                        group_address: "2/3/53".to_owned(),
+                    },
+                ],
                 source: "function handle(event, input) return nil end".to_owned(),
-            },
+            }],
         })
         .unwrap();
         DiagnosticStore::new(
@@ -629,35 +705,69 @@ mod tests {
                 .as_nanos()
         ));
         let document = AutomationDocument {
-            inputs: vec![crate::AutomationEndpoint {
-                name: "switch".to_owned(),
-                dpt: "1.001".to_owned(),
-            }],
-            outputs: vec![crate::AutomationEndpoint {
-                name: "light".to_owned(),
-                dpt: "1.001".to_owned(),
-            }],
-            knx_bindings: vec![
-                crate::KnxBinding {
-                    endpoint: "switch".to_owned(),
-                    group_address: "1/1/1".to_owned(),
-                },
-                crate::KnxBinding {
-                    endpoint: "light".to_owned(),
-                    group_address: "1/1/2".to_owned(),
-                },
-            ],
-            logic: crate::LogicDocument {
+            blocks: vec![crate::AutomationBlock {
+                id: "test".to_owned(),
+                revision: 1,
+                enabled: true,
+                inputs: vec![crate::AutomationEndpoint {
+                    name: "switch".to_owned(),
+                    dpt: "1.001".to_owned(),
+                }],
+                outputs: vec![crate::AutomationEndpoint {
+                    name: "light".to_owned(),
+                    dpt: "1.001".to_owned(),
+                }],
+                knx_bindings: vec![
+                    crate::KnxBinding {
+                        endpoint: "switch".to_owned(),
+                        group_address: "1/1/1".to_owned(),
+                    },
+                    crate::KnxBinding {
+                        endpoint: "light".to_owned(),
+                        group_address: "1/1/2".to_owned(),
+                    },
+                ],
                 source: "function handle() end".to_owned(),
-            },
+            }],
         };
         fs::write(&path, serialize_automation(&document, 41).unwrap()).unwrap();
 
-        assert_eq!(load_automation(&path).unwrap().1, 41);
-        assert_eq!(atomic_save(&path, &document, 41).unwrap(), 42);
-        assert_eq!(load_automation(&path).unwrap().1, 42);
+        assert_eq!(load_automation(&path).unwrap().1, 0);
+        assert_eq!(atomic_save(&path, &document).unwrap(), 0);
+        assert_eq!(load_automation(&path).unwrap().1, 0);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn block_revisions_increment_only_for_changed_blocks() {
+        let current = AutomationDocument {
+            blocks: vec![
+                crate::AutomationBlock {
+                    id: "first".to_owned(),
+                    revision: 4,
+                    enabled: true,
+                    inputs: vec![],
+                    outputs: vec![],
+                    knx_bindings: vec![],
+                    source: "return 1".to_owned(),
+                },
+                crate::AutomationBlock {
+                    id: "second".to_owned(),
+                    revision: 9,
+                    enabled: true,
+                    inputs: vec![],
+                    outputs: vec![],
+                    knx_bindings: vec![],
+                    source: "return 2".to_owned(),
+                },
+            ],
+        };
+        let mut candidate = current.clone();
+        candidate.blocks[0].source = "return 3".to_owned();
+        merge_block_revisions(&current, &mut candidate).unwrap();
+        assert_eq!(candidate.blocks[0].revision, 5);
+        assert_eq!(candidate.blocks[1].revision, 9);
     }
 
     #[tokio::test]
@@ -795,37 +905,40 @@ mod tests {
 
     fn simulation_runtime(source: &str) -> crate::AutomationRuntime {
         crate::build_automation(crate::AutomationDocument {
-            inputs: vec![
-                crate::AutomationEndpoint {
-                    name: "wall_switch".to_owned(),
+            blocks: vec![crate::AutomationBlock {
+                id: "test".to_owned(),
+                revision: 1,
+                enabled: true,
+                inputs: vec![
+                    crate::AutomationEndpoint {
+                        name: "wall_switch".to_owned(),
+                        dpt: "1.001".to_owned(),
+                    },
+                    crate::AutomationEndpoint {
+                        name: "enabled".to_owned(),
+                        dpt: "1.001".to_owned(),
+                    },
+                ],
+                outputs: vec![crate::AutomationEndpoint {
+                    name: "test_light".to_owned(),
                     dpt: "1.001".to_owned(),
-                },
-                crate::AutomationEndpoint {
-                    name: "enabled".to_owned(),
-                    dpt: "1.001".to_owned(),
-                },
-            ],
-            outputs: vec![crate::AutomationEndpoint {
-                name: "test_light".to_owned(),
-                dpt: "1.001".to_owned(),
-            }],
-            knx_bindings: vec![
-                crate::KnxBinding {
-                    endpoint: "wall_switch".to_owned(),
-                    group_address: "2/2/52".to_owned(),
-                },
-                crate::KnxBinding {
-                    endpoint: "enabled".to_owned(),
-                    group_address: "2/2/53".to_owned(),
-                },
-                crate::KnxBinding {
-                    endpoint: "test_light".to_owned(),
-                    group_address: "2/3/52".to_owned(),
-                },
-            ],
-            logic: crate::LogicDocument {
+                }],
+                knx_bindings: vec![
+                    crate::KnxBinding {
+                        endpoint: "wall_switch".to_owned(),
+                        group_address: "2/2/52".to_owned(),
+                    },
+                    crate::KnxBinding {
+                        endpoint: "enabled".to_owned(),
+                        group_address: "2/2/53".to_owned(),
+                    },
+                    crate::KnxBinding {
+                        endpoint: "test_light".to_owned(),
+                        group_address: "2/3/52".to_owned(),
+                    },
+                ],
                 source: source.to_owned(),
-            },
+            }],
         })
         .unwrap()
     }
@@ -835,7 +948,7 @@ mod tests {
         runtime: crate::AutomationRuntime,
         active_revision: u64,
     ) {
-        let engine = Engine::new(runtime.engine_config.clone());
+        let core_runtime = Runtime::new(runtime.core_config.clone());
         while let Some(request) = receiver.recv().await {
             let crate::SimulationRequest { payload, reply } = request;
             let outcome = if payload.expected_logic_revision != active_revision {
@@ -843,20 +956,28 @@ mod tests {
                     current_revision: active_revision,
                 }
             } else {
-                match crate::simulation_scenario(payload.clone(), &runtime) {
+                let block = runtime.block(&payload.block_id).expect("known block");
+                match crate::simulation_scenario(payload.clone(), block) {
                     Err(errors) => crate::SimulationOutcome::Invalid(errors),
-                    Ok(scenario) => match engine.simulate_input(scenario) {
+                    Ok(scenario) => match core_runtime
+                        .simulate_input(&payload.block_id.parse().unwrap(), scenario)
+                    {
                         Ok(execution) => crate::SimulationOutcome::Complete(
-                            crate::diagnostics::simulation_response(
+                            crate::diagnostics::simulation_response_for_block(
                                 &execution,
                                 1,
                                 active_revision,
                                 &runtime,
                             ),
                         ),
-                        Err(error) => crate::SimulationOutcome::Invalid(
-                            crate::simulation_error_fields(&error, &payload),
-                        ),
+                        Err(logiksmith_core::RuntimeSimulationError::Block { error, .. }) => {
+                            crate::SimulationOutcome::Invalid(crate::simulation_error_fields(
+                                &error, &payload,
+                            ))
+                        }
+                        Err(logiksmith_core::RuntimeSimulationError::UnknownBlock(_)) => {
+                            crate::SimulationOutcome::NotFound
+                        }
                     },
                 }
             };
@@ -864,9 +985,10 @@ mod tests {
         }
     }
 
-    fn simulation_payload() -> serde_json::Value {
+    fn simulation_payload_for_revision(revision: u64) -> serde_json::Value {
         serde_json::json!({
-            "expected_logic_revision": 7,
+            "block_id": "test",
+            "expected_logic_revision": revision.to_string(),
             "trigger": {
                 "endpoint": "wall_switch",
                 "value": { "kind": "bool", "value": true },
@@ -877,6 +999,10 @@ mod tests {
                 { "endpoint": "enabled", "value": null, "valid": false, "age_ms": null }
             ]
         })
+    }
+
+    fn simulation_payload() -> serde_json::Value {
+        simulation_payload_for_revision(7)
     }
 
     async fn raw_post(
@@ -944,7 +1070,7 @@ mod tests {
 
         let (status, result) = raw_post(server.address, simulation_payload()).await;
         assert_eq!(status, 200);
-        assert_eq!(result["logic_revision"], 7);
+        assert_eq!(result["logic_revision"], "7");
         assert_eq!(result["status"], "succeeded");
         assert_eq!(result["trigger"]["rising"], true);
         assert_eq!(result["effects"][0]["endpoint"], "test_light");
@@ -961,12 +1087,57 @@ mod tests {
 
         let (status, result) = raw_post(server.address, {
             let mut payload = simulation_payload();
-            payload["expected_logic_revision"] = serde_json::json!(6);
+            payload["expected_logic_revision"] = serde_json::json!("6");
             payload
         })
         .await;
         assert_eq!(status, 409);
-        assert_eq!(result["current_logic_revision"], 7);
+        assert_eq!(result["current_logic_revision"], "7");
+
+        server.shutdown().await;
+        actor.abort();
+        let _ = actor.await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn simulation_round_trips_large_logic_revision_as_a_string() {
+        let root = std::env::temp_dir().join(format!(
+            "logiksmith-simulation-large-revision-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("index.html"), "dashboard").unwrap();
+        let runtime = simulation_runtime(
+            "function handle(event, input)\n  return { outputs = { test_light = event.rising } }\nend",
+        );
+        let revision = 1;
+        let store = DiagnosticStore::new(&runtime, root.join("automation.toml"), 7);
+        let (sender, receiver) = mpsc::channel(4);
+        let actor = tokio::spawn(simulation_actor(receiver, runtime.clone(), revision));
+        let server = start_web_server_with_assets_and_activation(
+            store,
+            WebConfig {
+                listen_ip: "127.0.0.1".parse().unwrap(),
+                listen_port: 0,
+            },
+            &root,
+            None,
+            Some(sender),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = raw_get(server.address, "/api/snapshot").await;
+        assert!(snapshot.contains("\"active_logic_revision\":\"1\""));
+        let (status, result) =
+            raw_post(server.address, simulation_payload_for_revision(revision)).await;
+        assert_eq!(status, 200);
+        assert_eq!(result["logic_revision"], revision.to_string());
 
         server.shutdown().await;
         actor.abort();

@@ -256,6 +256,103 @@ impl fmt::Display for EndpointNameError {
 
 impl Error for EndpointNameError {}
 
+/// A stable identity for one configured logic block.
+///
+/// Block identifiers deliberately use a smaller grammar than endpoint names:
+/// they are lowercase ASCII machine labels and may contain digits and `_`.
+/// The byte limit is checked explicitly so the portable core has the same
+/// bound on every host.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BlockId(String);
+
+impl BlockId {
+    pub fn new(value: impl Into<String>) -> Result<Self, BlockIdError> {
+        let value = value.into();
+        validate_block_id(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn parse(value: &str) -> Result<Self, BlockIdError> {
+        value.parse()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for BlockId {
+    type Err = BlockIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for BlockId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlockIdError {
+    Empty,
+    TooLong { actual: usize, maximum: usize },
+    InvalidStart(char),
+    InvalidCharacter(char),
+}
+
+impl fmt::Display for BlockIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("block ID must not be empty"),
+            Self::TooLong { actual, maximum } => {
+                write!(
+                    formatter,
+                    "block ID is {actual} bytes; maximum is {maximum}"
+                )
+            }
+            Self::InvalidStart(character) => write!(
+                formatter,
+                "block ID must start with a lowercase ASCII letter, got {character:?}"
+            ),
+            Self::InvalidCharacter(character) => write!(
+                formatter,
+                "block ID contains invalid character {character:?}; only lowercase ASCII letters, digits, and '_' are allowed"
+            ),
+        }
+    }
+}
+
+impl Error for BlockIdError {}
+
+pub const MAX_BLOCK_ID_BYTES: usize = 64;
+pub const MAX_BLOCKS: usize = 64;
+
+fn validate_block_id(value: &str) -> Result<(), BlockIdError> {
+    if value.is_empty() {
+        return Err(BlockIdError::Empty);
+    }
+    if value.len() > MAX_BLOCK_ID_BYTES {
+        return Err(BlockIdError::TooLong {
+            actual: value.len(),
+            maximum: MAX_BLOCK_ID_BYTES,
+        });
+    }
+    let mut chars = value.chars();
+    let first = chars.next().expect("empty block ID handled above");
+    if !first.is_ascii_lowercase() {
+        return Err(BlockIdError::InvalidStart(first));
+    }
+    for character in chars {
+        if !(character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_') {
+            return Err(BlockIdError::InvalidCharacter(character));
+        }
+    }
+    Ok(())
+}
+
 /// The direction in which an endpoint participates in the automation model.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum EndpointDirection {
@@ -2073,6 +2170,806 @@ impl Engine {
                 })
             })
             .collect()
+    }
+}
+
+/// Configuration for one independent logic block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockConfig {
+    pub id: BlockId,
+    pub enabled: bool,
+    pub endpoints: Vec<Endpoint>,
+    pub logic: LogicProgram,
+}
+
+impl BlockConfig {
+    pub fn new(
+        id: BlockId,
+        enabled: bool,
+        endpoints: Vec<Endpoint>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            enabled,
+            endpoints,
+            logic: LogicProgram::new(source),
+        }
+    }
+
+    pub fn with_program(
+        id: BlockId,
+        enabled: bool,
+        endpoints: Vec<Endpoint>,
+        logic: LogicProgram,
+    ) -> Self {
+        Self {
+            id,
+            enabled,
+            endpoints,
+            logic,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), BlockConfigError> {
+        if !self
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.direction == EndpointDirection::Input)
+        {
+            return Err(BlockConfigError::NoInputs);
+        }
+        EngineConfig::with_program(self.endpoints.clone(), self.logic.clone())
+            .validate()
+            .map_err(BlockConfigError::Engine)
+    }
+
+    pub fn source(&self) -> &str {
+        self.logic.source()
+    }
+
+    pub fn logic_program(&self) -> &LogicProgram {
+        &self.logic
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlockConfigError {
+    NoInputs,
+    Engine(ConfigError),
+}
+
+impl fmt::Display for BlockConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoInputs => formatter.write_str("logic block must define at least one input"),
+            Self::Engine(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for BlockConfigError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Engine(error) => Some(error),
+            Self::NoInputs => None,
+        }
+    }
+}
+
+/// The complete configured set of logic blocks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeConfig {
+    pub blocks: Vec<BlockConfig>,
+}
+
+impl RuntimeConfig {
+    pub fn new(blocks: Vec<BlockConfig>) -> Self {
+        Self { blocks }
+    }
+
+    pub fn try_new(blocks: Vec<BlockConfig>) -> Result<Self, RuntimeConfigError> {
+        let config = Self::new(blocks);
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), RuntimeConfigError> {
+        if self.blocks.is_empty() {
+            return Err(RuntimeConfigError::Empty);
+        }
+        if self.blocks.len() > MAX_BLOCKS {
+            return Err(RuntimeConfigError::TooMany {
+                actual: self.blocks.len(),
+                maximum: MAX_BLOCKS,
+            });
+        }
+        for (index, block) in self.blocks.iter().enumerate() {
+            if self
+                .blocks
+                .iter()
+                .take(index)
+                .any(|other| other.id == block.id)
+            {
+                return Err(RuntimeConfigError::DuplicateId(block.id.clone()));
+            }
+            block
+                .validate()
+                .map_err(|error| RuntimeConfigError::InvalidBlock {
+                    block_id: block.id.clone(),
+                    error,
+                })?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeConfigError {
+    Empty,
+    TooMany {
+        actual: usize,
+        maximum: usize,
+    },
+    DuplicateId(BlockId),
+    InvalidBlock {
+        block_id: BlockId,
+        error: BlockConfigError,
+    },
+}
+
+impl fmt::Display for RuntimeConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("runtime must contain at least one logic block"),
+            Self::TooMany { actual, maximum } => {
+                write!(
+                    formatter,
+                    "runtime contains {actual} blocks; maximum is {maximum}"
+                )
+            }
+            Self::DuplicateId(id) => write!(formatter, "duplicate logic block ID {id}"),
+            Self::InvalidBlock { block_id, error } => {
+                write!(formatter, "block {block_id}: {error}")
+            }
+        }
+    }
+}
+
+impl Error for RuntimeConfigError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidBlock { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// A public view of one block's current semantic state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockSnapshot {
+    pub id: BlockId,
+    pub enabled: bool,
+    pub logic_revision: LogicRevision,
+    pub inputs: Vec<InputSnapshot>,
+    pub known_inputs: Vec<(EndpointName, TypedValue)>,
+    pub state: TransientState,
+    pub pending_timers: Vec<PendingTimer>,
+}
+
+/// A public view of every block in declaration order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeSnapshot {
+    pub blocks: Vec<BlockSnapshot>,
+    pub last_accepted_at: Option<MonotonicMs>,
+}
+
+/// An execution tagged with its owning block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockExecution {
+    pub block_id: BlockId,
+    pub execution: Execution,
+}
+
+impl BlockExecution {
+    pub fn block_id(&self) -> &BlockId {
+        &self.block_id
+    }
+
+    pub fn execution(&self) -> &Execution {
+        &self.execution
+    }
+
+    pub fn into_execution(self) -> Execution {
+        self.execution
+    }
+}
+
+/// Errors from routing an event to the multi-block runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeEventError {
+    UnknownBlock(BlockId),
+    Block {
+        block_id: BlockId,
+        error: EventError,
+    },
+    TimeWentBackwards {
+        block_id: Option<BlockId>,
+        previous: MonotonicMs,
+        current: MonotonicMs,
+    },
+}
+
+impl fmt::Display for RuntimeEventError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownBlock(id) => write!(formatter, "unknown logic block {id}"),
+            Self::Block { block_id, error } => write!(formatter, "block {block_id}: {error}"),
+            Self::TimeWentBackwards {
+                block_id,
+                previous,
+                current,
+            } => {
+                if let Some(block_id) = block_id {
+                    write!(formatter, "block {block_id}: ")?;
+                }
+                write!(
+                    formatter,
+                    "event time {current:?} is earlier than the last accepted time {previous:?}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for RuntimeEventError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Block { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Errors from block-local simulation routing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeSimulationError {
+    UnknownBlock(BlockId),
+    Block {
+        block_id: BlockId,
+        error: SimulationError,
+    },
+}
+
+impl fmt::Display for RuntimeSimulationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownBlock(id) => write!(formatter, "unknown logic block {id}"),
+            Self::Block { block_id, error } => write!(formatter, "block {block_id}: {error}"),
+        }
+    }
+}
+
+impl Error for RuntimeSimulationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Block { error, .. } => Some(error),
+            Self::UnknownBlock(_) => None,
+        }
+    }
+}
+
+/// One source/enabled update in an atomic runtime activation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockActivation {
+    pub block_id: BlockId,
+    pub source: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+impl BlockActivation {
+    pub fn new(block_id: BlockId, source: Option<String>, enabled: Option<bool>) -> Self {
+        Self {
+            block_id,
+            source,
+            enabled,
+        }
+    }
+
+    pub fn source(block_id: BlockId, source: impl Into<String>) -> Self {
+        Self::new(block_id, Some(source.into()), None)
+    }
+
+    pub fn enabled(block_id: BlockId, enabled: bool) -> Self {
+        Self::new(block_id, None, Some(enabled))
+    }
+}
+
+/// A validated-before-mutation batch of block updates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeActivation {
+    pub blocks: Vec<BlockActivation>,
+}
+
+impl RuntimeActivation {
+    pub fn new(blocks: Vec<BlockActivation>) -> Self {
+        Self { blocks }
+    }
+
+    pub fn single(update: BlockActivation) -> Self {
+        Self::new(vec![update])
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockActivationResult {
+    pub block_id: BlockId,
+    pub logic_revision: LogicRevision,
+    pub enabled: bool,
+    pub source_changed: bool,
+    pub enabled_changed: bool,
+    pub cancelled_timers: Vec<TimerName>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub struct ActivationResult {
+    pub blocks: Vec<BlockActivationResult>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActivationError {
+    UnknownBlock(BlockId),
+    DuplicateBlock(BlockId),
+    InvalidSource {
+        block_id: BlockId,
+        error: LogicError,
+    },
+    EmptyUpdate(BlockId),
+}
+
+impl fmt::Display for ActivationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownBlock(id) => write!(formatter, "unknown logic block {id}"),
+            Self::DuplicateBlock(id) => write!(formatter, "block {id} appears more than once"),
+            Self::InvalidSource { block_id, error } => {
+                write!(formatter, "block {block_id} source: {error}")
+            }
+            Self::EmptyUpdate(id) => write!(formatter, "activation for block {id} changes nothing"),
+        }
+    }
+}
+
+impl Error for ActivationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidSource { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// The isolated block-level engine owned by [`Runtime`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogicBlock {
+    config: BlockConfig,
+    engine: Engine,
+}
+
+impl LogicBlock {
+    fn try_new(config: BlockConfig) -> Result<Self, RuntimeConfigError> {
+        let id = config.id.clone();
+        config
+            .validate()
+            .map_err(|error| RuntimeConfigError::InvalidBlock {
+                block_id: id,
+                error,
+            })?;
+        let engine_config =
+            EngineConfig::with_program(config.endpoints.clone(), config.logic.clone());
+        let engine =
+            Engine::try_new(engine_config).map_err(|error| RuntimeConfigError::InvalidBlock {
+                block_id: config.id.clone(),
+                error: BlockConfigError::Engine(error),
+            })?;
+        Ok(Self { config, engine })
+    }
+
+    pub fn id(&self) -> &BlockId {
+        &self.config.id
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    pub fn config(&self) -> &BlockConfig {
+        &self.config
+    }
+
+    pub fn logic_program(&self) -> &LogicProgram {
+        self.engine.logic_program()
+    }
+
+    pub fn active_logic_revision(&self) -> LogicRevision {
+        self.engine.active_logic_revision()
+    }
+
+    pub fn snapshot_at(&self, now: MonotonicMs) -> BlockSnapshot {
+        let snapshot = self.engine.snapshot();
+        BlockSnapshot {
+            id: self.config.id.clone(),
+            enabled: self.config.enabled,
+            logic_revision: snapshot.logic_revision,
+            inputs: self.engine.input_snapshots(now),
+            known_inputs: snapshot.known_inputs,
+            state: snapshot.state,
+            pending_timers: snapshot.pending_timers,
+        }
+    }
+}
+
+/// Portable serial runtime for up to 64 isolated logic blocks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Runtime {
+    blocks: Vec<LogicBlock>,
+    last_accepted_at: Option<MonotonicMs>,
+}
+
+impl Runtime {
+    pub fn new(config: RuntimeConfig) -> Self {
+        Self::try_new(config).expect("invalid LogikSmith core runtime configuration")
+    }
+
+    pub fn try_new(config: RuntimeConfig) -> Result<Self, RuntimeConfigError> {
+        config.validate()?;
+        let blocks = config
+            .blocks
+            .into_iter()
+            .map(LogicBlock::try_new)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            blocks,
+            last_accepted_at: None,
+        })
+    }
+
+    pub fn block(&self, id: &BlockId) -> Option<&LogicBlock> {
+        self.blocks.iter().find(|block| block.id() == id)
+    }
+
+    pub fn blocks(&self) -> &[LogicBlock] {
+        &self.blocks
+    }
+
+    pub fn config(&self) -> RuntimeConfig {
+        RuntimeConfig::new(
+            self.blocks
+                .iter()
+                .map(|block| block.config.clone())
+                .collect(),
+        )
+    }
+
+    pub fn block_ids(&self) -> Vec<BlockId> {
+        self.blocks.iter().map(|block| block.id().clone()).collect()
+    }
+
+    pub fn last_accepted_at(&self) -> Option<MonotonicMs> {
+        self.last_accepted_at
+    }
+
+    pub fn snapshot(&self) -> RuntimeSnapshot {
+        self.snapshot_at(self.last_accepted_at.unwrap_or_default())
+    }
+
+    pub fn snapshot_at(&self, now: MonotonicMs) -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            blocks: self
+                .blocks
+                .iter()
+                .map(|block| block.snapshot_at(now))
+                .collect(),
+            last_accepted_at: self.last_accepted_at,
+        }
+    }
+
+    /// Records an input without invoking Lua. This is intended for passive
+    /// observations, including observations received while a block is
+    /// disabled.
+    pub fn observe_input(
+        &mut self,
+        block_id: &BlockId,
+        observation: InputObservation,
+        now: MonotonicMs,
+    ) -> Result<(), RuntimeEventError> {
+        let index = self.block_index(block_id)?;
+        self.blocks[index]
+            .engine
+            .validate_input(&observation.endpoint, observation.value)
+            .map_err(|error| RuntimeEventError::Block {
+                block_id: block_id.clone(),
+                error,
+            })?;
+        self.ensure_time(Some(block_id), now)?;
+        self.blocks[index]
+            .engine
+            .observe_input(observation, now)
+            .map_err(|error| RuntimeEventError::Block {
+                block_id: block_id.clone(),
+                error,
+            })?;
+        self.last_accepted_at = Some(now);
+        Ok(())
+    }
+
+    /// Delivers one triggering input to one block. A disabled block accepts
+    /// the observation but returns no semantic execution.
+    pub fn process_input(
+        &mut self,
+        block_id: &BlockId,
+        event: InputEvent,
+        now: MonotonicMs,
+    ) -> Result<Option<BlockExecution>, RuntimeEventError> {
+        let index = self.block_index(block_id)?;
+        self.blocks[index]
+            .engine
+            .validate_input(&event.endpoint, event.value)
+            .map_err(|error| RuntimeEventError::Block {
+                block_id: block_id.clone(),
+                error,
+            })?;
+        self.ensure_time(Some(block_id), now)?;
+        if !self.blocks[index].config.enabled {
+            self.blocks[index]
+                .engine
+                .observe_input(InputObservation::new(event.endpoint, event.value), now)
+                .map_err(|error| RuntimeEventError::Block {
+                    block_id: block_id.clone(),
+                    error,
+                })?;
+            self.last_accepted_at = Some(now);
+            return Ok(None);
+        }
+        let execution = self.blocks[index]
+            .engine
+            .process_input(event, now)
+            .map_err(|error| RuntimeEventError::Block {
+                block_id: block_id.clone(),
+                error,
+            })?;
+        self.last_accepted_at = Some(now);
+        Ok(Some(BlockExecution {
+            block_id: block_id.clone(),
+            execution,
+        }))
+    }
+
+    pub fn next_timer_deadline(&self) -> Option<MonotonicMs> {
+        self.blocks
+            .iter()
+            .filter(|block| block.enabled())
+            .flat_map(|block| block.engine.pending_timers())
+            .map(|timer| timer.due_at)
+            .min()
+    }
+
+    /// Consumes and evaluates at most one due timer using global deterministic
+    /// ordering `(deadline, block ID, timer name)`.
+    pub fn process_next_due_timer(
+        &mut self,
+        now: MonotonicMs,
+    ) -> Result<Option<BlockExecution>, RuntimeEventError> {
+        self.ensure_time(None, now)?;
+        let selected = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.enabled())
+            .flat_map(|(index, block)| {
+                block
+                    .engine
+                    .pending_timers()
+                    .into_iter()
+                    .filter(move |timer| timer.due_at <= now)
+                    .map(move |timer| (index, timer))
+            })
+            .min_by(|(left_index, left), (right_index, right)| {
+                left.due_at
+                    .cmp(&right.due_at)
+                    .then_with(|| {
+                        self.blocks[*left_index]
+                            .id()
+                            .cmp(self.blocks[*right_index].id())
+                    })
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+        let Some((index, _timer)) = selected else {
+            self.last_accepted_at = Some(now);
+            return Ok(None);
+        };
+        let block_id = self.blocks[index].id().clone();
+        let execution = self.blocks[index]
+            .engine
+            .process_next_due_timer(now)
+            .map_err(|error| RuntimeEventError::Block {
+                block_id: block_id.clone(),
+                error,
+            })?;
+        self.last_accepted_at = Some(now);
+        Ok(execution.map(|execution| BlockExecution {
+            block_id,
+            execution,
+        }))
+    }
+
+    pub fn process_due_timer(
+        &mut self,
+        now: MonotonicMs,
+    ) -> Result<Option<BlockExecution>, RuntimeEventError> {
+        self.process_next_due_timer(now)
+    }
+
+    pub fn simulate_input(
+        &self,
+        block_id: &BlockId,
+        scenario: SimulationScenario,
+    ) -> Result<BlockExecution, RuntimeSimulationError> {
+        let block = self
+            .block(block_id)
+            .ok_or_else(|| RuntimeSimulationError::UnknownBlock(block_id.clone()))?;
+        let execution = block.engine.simulate_input(scenario).map_err(|error| {
+            RuntimeSimulationError::Block {
+                block_id: block_id.clone(),
+                error,
+            }
+        })?;
+        Ok(BlockExecution {
+            block_id: block_id.clone(),
+            execution,
+        })
+    }
+
+    pub fn simulate_input_with_state(
+        &self,
+        block_id: &BlockId,
+        scenario: SimulationScenario,
+        state: TransientState,
+        pending_timers: Vec<PendingTimer>,
+        now: MonotonicMs,
+    ) -> Result<BlockExecution, RuntimeSimulationError> {
+        let block = self
+            .block(block_id)
+            .ok_or_else(|| RuntimeSimulationError::UnknownBlock(block_id.clone()))?;
+        let execution = block
+            .engine
+            .simulate_input_with_state(scenario, state, pending_timers, now)
+            .map_err(|error| RuntimeSimulationError::Block {
+                block_id: block_id.clone(),
+                error,
+            })?;
+        Ok(BlockExecution {
+            block_id: block_id.clone(),
+            execution,
+        })
+    }
+
+    pub fn simulate_timer(
+        &self,
+        block_id: &BlockId,
+        scenario: TimerSimulationScenario,
+    ) -> Result<BlockExecution, RuntimeSimulationError> {
+        let block = self
+            .block(block_id)
+            .ok_or_else(|| RuntimeSimulationError::UnknownBlock(block_id.clone()))?;
+        let execution = block.engine.simulate_timer(scenario).map_err(|error| {
+            RuntimeSimulationError::Block {
+                block_id: block_id.clone(),
+                error,
+            }
+        })?;
+        Ok(BlockExecution {
+            block_id: block_id.clone(),
+            execution,
+        })
+    }
+
+    /// Validates every source in the batch before changing any active block.
+    pub fn activate(
+        &mut self,
+        candidate: RuntimeActivation,
+    ) -> Result<ActivationResult, ActivationError> {
+        let mut indexes = Vec::with_capacity(candidate.blocks.len());
+        let mut programs = Vec::with_capacity(candidate.blocks.len());
+        for update in &candidate.blocks {
+            if update.source.is_none() && update.enabled.is_none() {
+                return Err(ActivationError::EmptyUpdate(update.block_id.clone()));
+            }
+            let index = self
+                .blocks
+                .iter()
+                .position(|block| block.id() == &update.block_id)
+                .ok_or_else(|| ActivationError::UnknownBlock(update.block_id.clone()))?;
+            if indexes.contains(&index) {
+                return Err(ActivationError::DuplicateBlock(update.block_id.clone()));
+            }
+            indexes.push(index);
+            programs.push(
+                update
+                    .source
+                    .as_deref()
+                    .map(LogicProgram::try_new)
+                    .transpose()
+                    .map_err(|error| ActivationError::InvalidSource {
+                        block_id: update.block_id.clone(),
+                        error,
+                    })?,
+            );
+        }
+
+        let mut results = Vec::with_capacity(candidate.blocks.len());
+        for ((update, index), program) in candidate.blocks.into_iter().zip(indexes).zip(programs) {
+            let block = &mut self.blocks[index];
+            let mut cancelled_timers = Vec::new();
+            let source_changed = if let Some(program) = program {
+                if program.revision == block.active_logic_revision() {
+                    false
+                } else {
+                    cancelled_timers = block.engine.pending_timers.keys().cloned().collect();
+                    block.engine.config.logic = program.clone();
+                    block.engine.pending_timers.clear();
+                    block.config.logic = program;
+                    true
+                }
+            } else {
+                false
+            };
+            let enabled_changed = update
+                .enabled
+                .is_some_and(|enabled| enabled != block.config.enabled);
+            if enabled_changed {
+                if !update.enabled.unwrap_or(block.config.enabled) {
+                    cancelled_timers.extend(block.engine.pending_timers.keys().cloned());
+                    block.engine.pending_timers.clear();
+                }
+                block.config.enabled = update.enabled.expect("enabled_changed implies value");
+            }
+            cancelled_timers.sort();
+            cancelled_timers.dedup();
+            results.push(BlockActivationResult {
+                block_id: block.id().clone(),
+                logic_revision: block.active_logic_revision(),
+                enabled: block.enabled(),
+                source_changed,
+                enabled_changed,
+                cancelled_timers,
+            });
+        }
+        Ok(ActivationResult { blocks: results })
+    }
+
+    fn block_index(&self, id: &BlockId) -> Result<usize, RuntimeEventError> {
+        self.blocks
+            .iter()
+            .position(|block| block.id() == id)
+            .ok_or_else(|| RuntimeEventError::UnknownBlock(id.clone()))
+    }
+
+    fn ensure_time(
+        &self,
+        block_id: Option<&BlockId>,
+        now: MonotonicMs,
+    ) -> Result<(), RuntimeEventError> {
+        if let Some(previous) = self.last_accepted_at
+            && now < previous
+        {
+            return Err(RuntimeEventError::TimeWentBackwards {
+                block_id: block_id.cloned(),
+                previous,
+                current: now,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -3953,5 +4850,373 @@ mod tests {
         ));
         let execution = run(&mut engine, false, 11);
         assert_eq!(execution.trigger.previous, Some(TypedValue::bool(true)));
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    fn id(value: &str) -> BlockId {
+        value.parse().unwrap()
+    }
+
+    fn endpoint_name(value: &str) -> EndpointName {
+        value.parse().unwrap()
+    }
+
+    fn block(id_value: &str, source: &str, enabled: bool) -> BlockConfig {
+        BlockConfig::new(
+            id(id_value),
+            enabled,
+            vec![
+                Endpoint::input(endpoint_name("input"), Dpt::BOOL),
+                Endpoint::output(endpoint_name("light"), Dpt::BOOL),
+            ],
+            source,
+        )
+    }
+
+    fn event(value: bool) -> InputEvent {
+        InputEvent::new(endpoint_name("input"), TypedValue::bool(value))
+    }
+
+    fn schedule_source() -> &'static str {
+        "function handle(event) if event.type == 'input' then return { timers = { off = { after = 10 } } } end end"
+    }
+
+    #[test]
+    fn block_ids_validate_ascii_grammar_and_byte_limit() {
+        assert!("a".parse::<BlockId>().is_ok());
+        assert!("a_2".parse::<BlockId>().is_ok());
+        assert!("a".repeat(MAX_BLOCK_ID_BYTES).parse::<BlockId>().is_ok());
+        assert!(
+            "a".repeat(MAX_BLOCK_ID_BYTES + 1)
+                .parse::<BlockId>()
+                .is_err()
+        );
+        for invalid in ["", "A", "1abc", "a-b", "a.b", "a B", "ą"] {
+            assert!(invalid.parse::<BlockId>().is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn runtime_requires_unique_nonempty_and_at_most_64_blocks() {
+        assert!(matches!(
+            RuntimeConfig::new(Vec::new()).validate(),
+            Err(RuntimeConfigError::Empty)
+        ));
+        assert!(matches!(
+            RuntimeConfig::new(vec![
+                block("same", "function handle() end", true),
+                block("same", "function handle() end", true)
+            ])
+            .validate(),
+            Err(RuntimeConfigError::DuplicateId(_))
+        ));
+        let blocks = (0..MAX_BLOCKS)
+            .map(|index| block(&format!("b{index}"), "function handle() end", true))
+            .collect();
+        assert!(RuntimeConfig::new(blocks).validate().is_ok());
+        let blocks = (0..=MAX_BLOCKS)
+            .map(|index| block(&format!("b{index}"), "function handle() end", true))
+            .collect();
+        assert!(matches!(
+            RuntimeConfig::new(blocks).validate(),
+            Err(RuntimeConfigError::TooMany {
+                actual: 65,
+                maximum: 64
+            })
+        ));
+    }
+
+    #[test]
+    fn local_endpoint_names_and_timer_names_are_isolated() {
+        let mut runtime = Runtime::new(RuntimeConfig::new(vec![
+            block("alpha", schedule_source(), true),
+            block("beta", schedule_source(), true),
+        ]));
+        runtime
+            .process_input(&id("alpha"), event(true), MonotonicMs(1))
+            .unwrap();
+        runtime
+            .process_input(&id("beta"), event(true), MonotonicMs(1))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .block(&id("alpha"))
+                .unwrap()
+                .snapshot_at(MonotonicMs(1))
+                .pending_timers
+                .len(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .block(&id("beta"))
+                .unwrap()
+                .snapshot_at(MonotonicMs(1))
+                .pending_timers
+                .len(),
+            1
+        );
+        assert_eq!(runtime.next_timer_deadline(), Some(MonotonicMs(11)));
+    }
+
+    #[test]
+    fn equal_deadline_timers_are_ordered_by_block_id_then_timer_name() {
+        let source = "function handle(event) if event.type == 'input' then return { timers = { z = { after = 10 }, a = { after = 10 } } } end end";
+        let mut runtime = Runtime::new(RuntimeConfig::new(vec![
+            block("zeta", source, true),
+            block("alpha", source, true),
+        ]));
+        runtime
+            .process_input(&id("zeta"), event(true), MonotonicMs(1))
+            .unwrap();
+        runtime
+            .process_input(&id("alpha"), event(true), MonotonicMs(1))
+            .unwrap();
+
+        // alpha wins over zeta despite being declared second; within alpha,
+        // timer `a` wins over `z`.
+        let first = runtime
+            .process_next_due_timer(MonotonicMs(11))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.block_id, id("alpha"));
+        assert!(
+            matches!(first.execution.trigger, Trigger::Timer(TimerTrigger { name, .. }) if name == TimerName::new("a").unwrap())
+        );
+        let second = runtime
+            .process_next_due_timer(MonotonicMs(11))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.block_id, id("alpha"));
+        assert!(
+            matches!(second.execution.trigger, Trigger::Timer(TimerTrigger { name, .. }) if name == TimerName::new("z").unwrap())
+        );
+        let third = runtime
+            .process_next_due_timer(MonotonicMs(11))
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.block_id, id("zeta"));
+    }
+
+    #[test]
+    fn failed_block_execution_is_contained_and_next_block_succeeds() {
+        let mut runtime = Runtime::new(RuntimeConfig::new(vec![
+            block("broken", "function handle() while true do end end", true),
+            block(
+                "healthy",
+                "function handle() return { outputs = { light = true } } end",
+                true,
+            ),
+        ]));
+        let failed = runtime
+            .process_input(&id("broken"), event(true), MonotonicMs(1))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            failed.execution.outcome,
+            Err(LogicError::InstructionLimit { .. })
+        ));
+        let healthy = runtime
+            .process_input(&id("healthy"), event(true), MonotonicMs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(healthy.block_id, id("healthy"));
+        assert!(healthy.execution.outcome.is_ok());
+    }
+
+    #[test]
+    fn disabled_blocks_observe_without_execution_and_reenable_quietly() {
+        let source = "function handle(event, input) return { state = { seen = input.input }, timers = { off = { after = 10 } } } end";
+        let mut runtime = Runtime::new(RuntimeConfig::new(vec![block("quiet", source, true)]));
+        runtime
+            .process_input(&id("quiet"), event(true), MonotonicMs(1))
+            .unwrap();
+        let disabled = runtime
+            .activate(RuntimeActivation::single(BlockActivation::enabled(
+                id("quiet"),
+                false,
+            )))
+            .unwrap();
+        assert_eq!(
+            disabled.blocks[0].cancelled_timers,
+            vec![TimerName::new("off").unwrap()]
+        );
+        let snapshot = runtime
+            .block(&id("quiet"))
+            .unwrap()
+            .snapshot_at(MonotonicMs(2));
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.state["seen"], StateValue::Bool(true));
+        assert!(snapshot.pending_timers.is_empty());
+        assert_eq!(
+            runtime
+                .process_input(&id("quiet"), event(false), MonotonicMs(2))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            runtime
+                .block(&id("quiet"))
+                .unwrap()
+                .snapshot_at(MonotonicMs(2))
+                .known_inputs,
+            vec![(endpoint_name("input"), TypedValue::bool(false))]
+        );
+        runtime
+            .activate(RuntimeActivation::single(BlockActivation::enabled(
+                id("quiet"),
+                true,
+            )))
+            .unwrap();
+        // Enabling itself does not invoke Lua or restore the cancelled timer.
+        assert!(runtime.next_timer_deadline().is_none());
+    }
+
+    #[test]
+    fn source_activation_is_atomic_and_cancels_only_own_timers() {
+        let mut runtime = Runtime::new(RuntimeConfig::new(vec![
+            block("alpha", schedule_source(), true),
+            block("beta", schedule_source(), true),
+        ]));
+        runtime
+            .process_input(&id("alpha"), event(true), MonotonicMs(1))
+            .unwrap();
+        runtime
+            .process_input(&id("beta"), event(true), MonotonicMs(1))
+            .unwrap();
+        let before_alpha = runtime.block(&id("alpha")).unwrap().active_logic_revision();
+        let before_beta = runtime.block(&id("beta")).unwrap().active_logic_revision();
+        let error = runtime.activate(RuntimeActivation::new(vec![
+            BlockActivation::source(id("alpha"), "function handle() return nil end"),
+            BlockActivation::source(id("beta"), "function handle( "),
+        ]));
+        assert!(
+            matches!(error, Err(ActivationError::InvalidSource { block_id, .. }) if block_id == id("beta"))
+        );
+        assert_eq!(
+            runtime.block(&id("alpha")).unwrap().active_logic_revision(),
+            before_alpha
+        );
+        assert_eq!(
+            runtime.block(&id("beta")).unwrap().active_logic_revision(),
+            before_beta
+        );
+        assert_eq!(
+            runtime
+                .block(&id("alpha"))
+                .unwrap()
+                .snapshot_at(MonotonicMs(1))
+                .pending_timers
+                .len(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .block(&id("beta"))
+                .unwrap()
+                .snapshot_at(MonotonicMs(1))
+                .pending_timers
+                .len(),
+            1
+        );
+
+        let result = runtime
+            .activate(RuntimeActivation::single(BlockActivation::source(
+                id("alpha"),
+                "function handle() return nil end",
+            )))
+            .unwrap();
+        assert_eq!(result.blocks[0].cancelled_timers.len(), 1);
+        assert!(
+            runtime
+                .block(&id("alpha"))
+                .unwrap()
+                .snapshot_at(MonotonicMs(1))
+                .pending_timers
+                .is_empty()
+        );
+        assert_eq!(
+            runtime
+                .block(&id("beta"))
+                .unwrap()
+                .snapshot_at(MonotonicMs(1))
+                .pending_timers
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn simulation_is_immutable_and_allowed_for_disabled_blocks() {
+        let runtime = Runtime::new(RuntimeConfig::new(vec![block(
+            "sim",
+            "function handle(event) return { state = { value = true }, outputs = { light = true } } end",
+            false,
+        )]));
+        let before = runtime.snapshot();
+        let simulation = runtime
+            .simulate_input(
+                &id("sim"),
+                SimulationScenario {
+                    trigger: SimulationTrigger {
+                        endpoint: endpoint_name("input"),
+                        value: TypedValue::bool(true),
+                        previous: None,
+                    },
+                    inputs: vec![SimulationInput {
+                        endpoint: endpoint_name("input"),
+                        value: Some(TypedValue::bool(true)),
+                        valid: true,
+                        age_ms: Some(0),
+                    }],
+                },
+            )
+            .unwrap();
+        assert_eq!(simulation.block_id, id("sim"));
+        assert!(simulation.execution.outcome.is_ok());
+        assert_eq!(runtime.snapshot(), before);
+    }
+
+    #[test]
+    fn equal_runtime_timestamps_are_valid_but_lower_timestamps_are_rejected() {
+        let mut runtime = Runtime::new(RuntimeConfig::new(vec![
+            block("alpha", "function handle() end", true),
+            block("beta", "function handle() end", true),
+        ]));
+        runtime
+            .observe_input(
+                &id("alpha"),
+                InputObservation::new(endpoint_name("input"), TypedValue::bool(true)),
+                MonotonicMs(10),
+            )
+            .unwrap();
+        runtime
+            .observe_input(
+                &id("beta"),
+                InputObservation::new(endpoint_name("input"), TypedValue::bool(true)),
+                MonotonicMs(10),
+            )
+            .unwrap();
+        assert!(matches!(
+            runtime.observe_input(
+                &id("alpha"),
+                InputObservation::new(endpoint_name("input"), TypedValue::bool(false)),
+                MonotonicMs(9),
+            ),
+            Err(RuntimeEventError::TimeWentBackwards { .. })
+        ));
+        assert_eq!(
+            runtime
+                .block(&id("alpha"))
+                .unwrap()
+                .snapshot_at(MonotonicMs(10))
+                .known_inputs[0]
+                .1,
+            TypedValue::bool(true)
+        );
     }
 }

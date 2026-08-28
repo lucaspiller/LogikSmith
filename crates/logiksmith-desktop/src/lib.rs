@@ -5,10 +5,11 @@ pub mod web;
 
 use diagnostics::{ConnectionState, DiagnosticStore, TelegramRecord};
 use logiksmith_core::{
-    Dpt, Endpoint, EndpointDirection, EndpointName, Engine, EngineConfig, InputEvent,
-    InputObservation, MonotonicMs, OutputEffect, PendingTimer, SimulationError, SimulationInput,
-    SimulationScenario, SimulationTrigger, StateValue, TimerName, TimerSimulationScenario,
-    TypedValue, Value,
+    BlockActivation as CoreBlockActivation, BlockConfig as CoreBlockConfig, BlockId, Dpt, Endpoint,
+    EndpointDirection, EndpointName, EngineConfig, InputEvent, InputObservation, MonotonicMs,
+    OutputEffect, PendingTimer, Runtime as CoreRuntime, RuntimeConfig as CoreRuntimeConfig,
+    RuntimeSimulationError, SimulationError, SimulationInput, SimulationScenario,
+    SimulationTrigger, StateValue, TimerName, TimerSimulationScenario, TypedValue, Value,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -34,21 +35,57 @@ use tracing_subscriber::{
 use web::WebError;
 
 pub const PROTOCOL_VERSION: u64 = 1;
+/// Maximum number of independently configured logic blocks in the desktop
+/// document.  This mirrors the portable core bound.
+pub const MAX_BLOCKS: usize = 64;
+
+/// JavaScript cannot represent every `u64` exactly as a JSON number. Logic
+/// revisions are opaque hashes, so keep them exact on the browser wire as
+/// decimal strings while retaining `u64` internally.
+pub(crate) mod wire_revision {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub(crate) struct Value(pub u64);
+
+    impl serde::Serialize for Value {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serialize(&self.0, serializer)
+        }
+    }
+
+    pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value
+            .parse()
+            .map_err(|_| D::Error::custom("must be a decimal revision string"))
+    }
+}
 
 /// A source replacement requested by the management API. The session owns the
 /// engine, so activation is acknowledged on that same task between events.
 pub struct ActivationRequest {
-    pub source: String,
-    pub logic_hash: u64,
+    pub updates: Vec<CoreBlockActivation>,
     pub document_revision: u64,
-    pub reply: oneshot::Sender<Result<ActivationResult, String>>,
+    pub reply: oneshot::Sender<Result<CoreActivationResult, String>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ActivationResult {
-    pub logic_revision: u64,
-    pub cancelled_timers: Vec<String>,
-    pub changed: bool,
+pub struct CoreActivationResult {
+    pub document_revision: u64,
+    pub result: logiksmith_core::ActivationResult,
 }
 
 /// Browser payload for one immutable input simulation. Values carry their
@@ -56,7 +93,10 @@ pub struct ActivationResult {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimulationPayload {
+    #[serde(alias = "blockId")]
+    pub block_id: String,
     #[serde(alias = "expectedLogicRevision")]
+    #[serde(deserialize_with = "wire_revision::deserialize")]
     pub expected_logic_revision: u64,
     pub trigger: SimulationTriggerPayload,
     pub inputs: Vec<SimulationInputPayload>,
@@ -101,6 +141,7 @@ pub struct PendingTimerPayload {
     #[serde(alias = "dueAtMs")]
     pub due_at_ms: u64,
     #[serde(alias = "logicRevision")]
+    #[serde(deserialize_with = "wire_revision::deserialize")]
     pub logic_revision: u64,
 }
 
@@ -123,6 +164,7 @@ pub struct SimulationRequest {
 }
 
 pub enum SimulationOutcome {
+    NotFound,
     Conflict { current_revision: u64 },
     Invalid(Vec<FieldError>),
     Complete(diagnostics::SimulationResponse),
@@ -226,35 +268,70 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone)]
 pub struct AutomationRuntime {
     pub document: AutomationDocument,
-    pub engine_config: EngineConfig,
-    pub address_to_endpoint: HashMap<GroupAddress, BindingRuntime>,
-    pub endpoint_to_address: HashMap<EndpointName, GroupAddress>,
-    pub endpoint_dpts: HashMap<EndpointName, Dpt>,
+    pub core_config: CoreRuntimeConfig,
+    pub blocks: Vec<BlockRuntime>,
+    pub address_to_inputs: HashMap<GroupAddress, Vec<BlockInputBinding>>,
+    pub output_to_address: HashMap<(String, EndpointName), GroupAddress>,
+    pub address_dpts: HashMap<GroupAddress, Dpt>,
     pub structural_revision: u64,
     pub document_revision: u64,
 }
 
 #[derive(Debug, Clone)]
-pub struct BindingRuntime {
+pub struct BlockRuntime {
+    pub id: String,
+    pub revision: u64,
+    pub enabled: bool,
+    pub engine_config: EngineConfig,
+    pub endpoint_to_address: HashMap<EndpointName, GroupAddress>,
+    pub endpoint_dpts: HashMap<EndpointName, Dpt>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockInputBinding {
+    pub block_id: String,
     pub endpoint: EndpointName,
-    pub direction: EndpointDirection,
     pub dpt: Dpt,
     pub address: GroupAddress,
+}
+
+impl AutomationRuntime {
+    pub fn block(&self, id: &str) -> Option<&BlockRuntime> {
+        self.blocks.iter().find(|block| block.id == id)
+    }
+
+    pub fn block_ids(&self) -> impl Iterator<Item = &str> {
+        self.blocks.iter().map(|block| block.id.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AutomationDocument {
+    pub blocks: Vec<AutomationBlock>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationBlock {
+    pub id: String,
+    #[serde(default = "default_block_revision")]
+    pub revision: u64,
+    pub enabled: bool,
     pub inputs: Vec<AutomationEndpoint>,
     pub outputs: Vec<AutomationEndpoint>,
     pub knx_bindings: Vec<KnxBinding>,
-    pub logic: LogicDocument,
+    pub source: String,
+}
+
+fn default_block_revision() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct StoredAutomation {
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     revision: u16,
     #[serde(flatten)]
     document: AutomationDocument,
@@ -274,21 +351,43 @@ pub struct KnxBinding {
     pub group_address: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct LogicDocument {
-    pub source: String,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct AutomationEnvelope {
     pub document: AutomationDocument,
+    #[serde(skip_serializing)]
     pub revision: u64,
     pub active_structural_revision: u64,
     pub saved_structural_revision: u64,
+    #[serde(serialize_with = "wire_revision::serialize")]
     pub active_logic_revision: u64,
+    #[serde(serialize_with = "wire_revision::serialize")]
     pub saved_logic_revision: u64,
     pub restart_required: bool,
+    pub blocks: Vec<AutomationBlockStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AutomationBlockStatus {
+    pub id: String,
+    pub active_enabled: bool,
+    pub saved_enabled: bool,
+    #[serde(serialize_with = "wire_revision::serialize")]
+    pub active_revision: u64,
+    #[serde(serialize_with = "wire_revision::serialize")]
+    pub saved_revision: u64,
+    #[serde(serialize_with = "wire_revision::serialize")]
+    pub active_logic_revision: u64,
+    #[serde(serialize_with = "wire_revision::serialize")]
+    pub saved_logic_revision: u64,
+}
+
+pub fn block_revision(document: &AutomationDocument, id: &str) -> u64 {
+    document
+        .blocks
+        .iter()
+        .find(|block| block.id == id)
+        .map(|block| block.revision.max(1))
+        .unwrap_or(1)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -454,7 +553,12 @@ const MAX_LOGIC_SOURCE_BYTES: usize = 64 * 1024;
 
 pub fn structural_revision(document: &AutomationDocument) -> u64 {
     let mut structure = document.clone();
-    structure.logic.source.clear();
+    for block in &mut structure.blocks {
+        block.source.clear();
+        // Enabled status is a live, non-structural setting. Keep it out of
+        // the restart token so an enable/disable batch can hot-apply.
+        block.enabled = true;
+    }
     let bytes = toml::to_string(&structure).unwrap_or_default();
     automation_revision(bytes.as_bytes())
 }
@@ -465,157 +569,247 @@ pub fn build_automation(
     document: AutomationDocument,
 ) -> Result<AutomationRuntime, Vec<FieldError>> {
     let mut errors = Vec::new();
-    let mut endpoint_dpts = HashMap::new();
-    let mut endpoints = Vec::new();
-    let mut seen_names = HashSet::new();
-    for (direction, declarations) in [
-        (EndpointDirection::Input, &document.inputs),
-        (EndpointDirection::Output, &document.outputs),
-    ] {
-        for (index, declaration) in declarations.iter().enumerate() {
-            let path = match direction {
-                EndpointDirection::Input => format!("inputs[{index}]"),
-                EndpointDirection::Output => format!("outputs[{index}]"),
-            };
-            let name = match endpoint_name(&format!("{path}.name"), &declaration.name) {
+    if document.blocks.is_empty() {
+        errors.push(FieldError {
+            path: "blocks".to_owned(),
+            message: "must contain at least one block".to_owned(),
+        });
+    } else if document.blocks.len() > MAX_BLOCKS {
+        errors.push(FieldError {
+            path: "blocks".to_owned(),
+            message: format!("must contain at most {MAX_BLOCKS} blocks"),
+        });
+    }
+    let mut block_ids = HashSet::new();
+    let mut blocks = Vec::new();
+    let mut address_to_inputs: HashMap<GroupAddress, Vec<BlockInputBinding>> = HashMap::new();
+    let mut output_to_address = HashMap::new();
+    let mut address_dpts = HashMap::new();
+    let mut address_origins: HashMap<GroupAddress, (String, String)> = HashMap::new();
+
+    for (block_index, block) in document.blocks.iter().enumerate() {
+        let block_path = format!("blocks[{block_index}]");
+        let id = match block.id.parse::<logiksmith_core::BlockId>() {
+            Ok(id) => id,
+            Err(error) => {
+                errors.push(FieldError {
+                    path: format!("{block_path}.id"),
+                    message: error.to_string(),
+                });
+                continue;
+            }
+        };
+        if !block_ids.insert(id.clone()) {
+            errors.push(FieldError {
+                path: format!("{block_path}.id"),
+                message: "must be unique".to_owned(),
+            });
+            continue;
+        }
+        let mut endpoint_dpts = HashMap::new();
+        let mut endpoints = Vec::new();
+        let mut endpoint_directions = HashMap::new();
+        let mut seen_names = HashSet::new();
+        for (direction, declarations, list_name) in [
+            (EndpointDirection::Input, &block.inputs, "inputs"),
+            (EndpointDirection::Output, &block.outputs, "outputs"),
+        ] {
+            for (index, declaration) in declarations.iter().enumerate() {
+                let path = format!("{block_path}.{list_name}[{index}]");
+                let name = match endpoint_name(&format!("{path}.name"), &declaration.name) {
+                    Ok(name) => name,
+                    Err(error) => {
+                        errors.push(error);
+                        continue;
+                    }
+                };
+                if !seen_names.insert(name.clone()) {
+                    errors.push(FieldError {
+                        path: format!("{path}.name"),
+                        message: "must be unique within this block".to_owned(),
+                    });
+                    continue;
+                }
+                let dpt = match parse_dpt(&format!("{path}.dpt"), &declaration.dpt) {
+                    Ok(dpt) => dpt,
+                    Err(error) => {
+                        errors.push(error);
+                        continue;
+                    }
+                };
+                endpoint_dpts.insert(name.clone(), dpt);
+                endpoint_directions.insert(name.clone(), direction);
+                endpoints.push(Endpoint::new(name, direction, dpt));
+            }
+        }
+        if block.inputs.is_empty() {
+            errors.push(FieldError {
+                path: format!("{block_path}.inputs"),
+                message: "must contain at least one input".to_owned(),
+            });
+        }
+        if block.source.is_empty() {
+            errors.push(FieldError {
+                path: format!("{block_path}.source"),
+                message: "must not be empty".to_owned(),
+            });
+        } else if block.source.len() > MAX_LOGIC_SOURCE_BYTES {
+            errors.push(FieldError {
+                path: format!("{block_path}.source"),
+                message: "must not exceed 65536 bytes".to_owned(),
+            });
+        }
+
+        let mut endpoint_to_address = HashMap::new();
+        let mut local_addresses = HashSet::new();
+        for (index, binding) in block.knx_bindings.iter().enumerate() {
+            let path = format!("{block_path}.knx_bindings[{index}]");
+            let name = match endpoint_name(&format!("{path}.endpoint"), &binding.endpoint) {
                 Ok(name) => name,
                 Err(error) => {
                     errors.push(error);
                     continue;
                 }
             };
-            if !seen_names.insert(name.clone()) {
+            let Some(&dpt) = endpoint_dpts.get(&name) else {
                 errors.push(FieldError {
-                    path: format!("{path}.name"),
-                    message: "must be globally unique".to_owned(),
+                    path: format!("{path}.endpoint"),
+                    message: "must reference an existing endpoint in this block".to_owned(),
                 });
                 continue;
-            }
-            let dpt = match parse_dpt(&format!("{path}.dpt"), &declaration.dpt) {
-                Ok(dpt) => dpt,
+            };
+            let address = match GroupAddress::parse(&binding.group_address) {
+                Ok(address) if address.to_string() == binding.group_address => address,
+                Ok(_) => {
+                    errors.push(FieldError {
+                        path: format!("{path}.group_address"),
+                        message: "must use canonical main/middle/subgroup form".to_owned(),
+                    });
+                    continue;
+                }
                 Err(error) => {
-                    errors.push(error);
+                    errors.push(FieldError {
+                        path: format!("{path}.group_address"),
+                        message: error.to_string(),
+                    });
                     continue;
                 }
             };
-            endpoint_dpts.insert(name.clone(), dpt);
-            endpoints.push(Endpoint::new(name, direction, dpt));
-        }
-    }
-
-    let mut address_to_endpoint = HashMap::new();
-    let mut endpoint_to_address = HashMap::new();
-    for (index, binding) in document.knx_bindings.iter().enumerate() {
-        let path = format!("knx_bindings[{index}]");
-        let name = match endpoint_name(&format!("{path}.endpoint"), &binding.endpoint) {
-            Ok(name) => name,
-            Err(error) => {
-                errors.push(error);
-                continue;
-            }
-        };
-        let Some(&dpt) = endpoint_dpts.get(&name) else {
-            errors.push(FieldError {
-                path: format!("{path}.endpoint"),
-                message: "must reference an existing endpoint".to_owned(),
-            });
-            continue;
-        };
-        let direction = endpoints
-            .iter()
-            .find(|endpoint| endpoint.name == name)
-            .map(|endpoint| endpoint.direction)
-            .expect("declared endpoint exists");
-        let address = match GroupAddress::parse(&binding.group_address) {
-            Ok(address) if address.to_string() == binding.group_address => address,
-            Ok(_) => {
+            if endpoint_to_address.contains_key(&name) {
                 errors.push(FieldError {
-                    path: format!("{path}.group_address"),
-                    message: "must use canonical main/middle/subgroup form".to_owned(),
+                    path: format!("{path}.endpoint"),
+                    message: "must have exactly one KNX binding".to_owned(),
                 });
                 continue;
             }
-            Err(error) => {
+            if !local_addresses.insert(address) {
                 errors.push(FieldError {
                     path: format!("{path}.group_address"),
-                    message: error.to_string(),
+                    message: "may bind only one endpoint within a block".to_owned(),
                 });
                 continue;
             }
-        };
-        if endpoint_to_address.contains_key(&name) {
-            errors.push(FieldError {
-                path: format!("{path}.endpoint"),
-                message: "must have exactly one KNX binding".to_owned(),
-            });
-            continue;
+            if let Some(previous) = address_dpts.get(&address)
+                && previous != &dpt
+            {
+                let (previous_block, previous_endpoint) = address_origins
+                    .get(&address)
+                    .cloned()
+                    .unwrap_or_else(|| ("another block".to_owned(), "unknown".to_owned()));
+                errors.push(FieldError {
+                    path: format!("{path}.group_address"),
+                    message: format!(
+                        "DPT conflicts with {previous_block}.{previous_endpoint} at {address}"
+                    ),
+                });
+                continue;
+            }
+            address_dpts.insert(address, dpt);
+            address_origins.insert(address, (block.id.clone(), name.to_string()));
+            endpoint_to_address.insert(name.clone(), address);
+            match endpoint_directions.get(&name) {
+                Some(EndpointDirection::Input) => address_to_inputs
+                    .entry(address)
+                    .or_default()
+                    .push(BlockInputBinding {
+                        block_id: block.id.clone(),
+                        endpoint: name,
+                        dpt,
+                        address,
+                    }),
+                Some(EndpointDirection::Output) => {
+                    output_to_address.insert((block.id.clone(), name), address);
+                }
+                None => unreachable!("endpoint DPT implies direction"),
+            }
         }
-        if address_to_endpoint.contains_key(&address) {
-            errors.push(FieldError {
-                path: format!("{path}.group_address"),
-                message: "must be globally unique".to_owned(),
-            });
-            continue;
+        for endpoint in &endpoints {
+            if !endpoint_to_address.contains_key(&endpoint.name) {
+                let list = match endpoint.direction {
+                    EndpointDirection::Input => "inputs",
+                    EndpointDirection::Output => "outputs",
+                };
+                let index = match endpoint.direction {
+                    EndpointDirection::Input => block
+                        .inputs
+                        .iter()
+                        .position(|item| item.name == endpoint.name.as_str()),
+                    EndpointDirection::Output => block
+                        .outputs
+                        .iter()
+                        .position(|item| item.name == endpoint.name.as_str()),
+                };
+                errors.push(FieldError {
+                    path: index.map_or_else(
+                        || format!("{block_path}.{list}"),
+                        |index| format!("{block_path}.{list}[{index}].name"),
+                    ),
+                    message: format!(
+                        "endpoint {} must have exactly one KNX binding",
+                        endpoint.name
+                    ),
+                });
+            }
         }
-        endpoint_to_address.insert(name.clone(), address);
-        address_to_endpoint.insert(
-            address,
-            BindingRuntime {
-                endpoint: name,
-                direction,
-                dpt,
-                address,
-            },
-        );
-    }
-    for endpoint in &endpoints {
-        if !endpoint_to_address.contains_key(&endpoint.name) {
-            let list = match endpoint.direction {
-                EndpointDirection::Input => "inputs",
-                EndpointDirection::Output => "outputs",
-            };
+        let engine_config = EngineConfig::new(endpoints, block.source.clone());
+        if let Err(error) = engine_config.validate() {
             errors.push(FieldError {
-                path: format!("{list}.name"),
-                message: format!(
-                    "endpoint {} must have exactly one KNX binding",
-                    endpoint.name
-                ),
+                path: format!("{block_path}.source"),
+                message: error.to_string(),
             });
         }
-    }
-
-    if document.logic.source.is_empty() {
-        errors.push(FieldError {
-            path: "logic.source".to_owned(),
-            message: "must not be empty".to_owned(),
-        });
-    } else if document.logic.source.len() > MAX_LOGIC_SOURCE_BYTES {
-        errors.push(FieldError {
-            path: "logic.source".to_owned(),
-            message: "must not exceed 65536 bytes".to_owned(),
-        });
-    }
-    // EngineConfig performs source loading and handler discovery in the core.
-    let engine_config = EngineConfig::new(endpoints, document.logic.source.clone());
-    if errors.is_empty()
-        && let Err(error) = engine_config.validate()
-    {
-        errors.push(FieldError {
-            path: "logic.source".to_owned(),
-            message: error.to_string(),
+        blocks.push(BlockRuntime {
+            id: block.id.clone(),
+            revision: block.revision.max(1),
+            enabled: block.enabled,
+            engine_config,
+            endpoint_to_address,
+            endpoint_dpts,
         });
     }
     if !errors.is_empty() {
         return Err(errors);
     }
+    let core_blocks = blocks
+        .iter()
+        .map(|block| {
+            CoreBlockConfig::new(
+                block.id.parse::<BlockId>().expect("validated block ID"),
+                block.enabled,
+                block.engine_config.endpoints.clone(),
+                block.engine_config.logic.source.clone(),
+            )
+        })
+        .collect();
     Ok(AutomationRuntime {
         structural_revision: structural_revision(&document),
         document_revision: 0,
         document,
-        engine_config,
-        address_to_endpoint,
-        endpoint_to_address,
-        endpoint_dpts,
+        core_config: CoreRuntimeConfig::new(core_blocks),
+        blocks,
+        address_to_inputs,
+        output_to_address,
+        address_dpts,
     })
 }
 
@@ -628,12 +822,36 @@ pub fn automation_revision(source: &[u8]) -> u64 {
     hash
 }
 
+pub fn document_logic_revision(document: &AutomationDocument) -> u64 {
+    let mut bytes = Vec::new();
+    for block in &document.blocks {
+        bytes.extend_from_slice(block.id.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(block.source.as_bytes());
+        bytes.push(0);
+    }
+    automation_revision(&bytes)
+}
+
 pub fn load_automation(path: &Path) -> Result<(AutomationDocument, u16), AutomationFileError> {
     let source = fs::read(path).map_err(|source| AutomationFileError::Read {
         path: path.to_path_buf(),
         source,
     })?;
     let text = String::from_utf8_lossy(&source);
+    if let Ok(value) = toml::from_str::<toml::Value>(&text) {
+        let legacy = ["inputs", "outputs", "knx_bindings", "logic"]
+            .into_iter()
+            .filter(|field| value.get(*field).is_some())
+            .map(|field| FieldError {
+                path: (*field).to_owned(),
+                message: "legacy top-level field must move inside [[blocks]]".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        if !legacy.is_empty() {
+            return Err(AutomationFileError::Invalid(legacy));
+        }
+    }
     let stored = toml::from_str::<StoredAutomation>(&text).map_err(AutomationFileError::Toml)?;
     build_automation(stored.document.clone()).map_err(AutomationFileError::Invalid)?;
     Ok((stored.document, stored.revision))
@@ -641,10 +859,10 @@ pub fn load_automation(path: &Path) -> Result<(AutomationDocument, u16), Automat
 
 pub fn serialize_automation(
     document: &AutomationDocument,
-    revision: u16,
+    _revision: u16,
 ) -> Result<Vec<u8>, String> {
     toml::to_string_pretty(&StoredAutomation {
-        revision,
+        revision: 0,
         document: document.clone(),
     })
     .map(|text| text.into_bytes())
@@ -684,11 +902,24 @@ fn load_config_with_bridge_validation(
             source,
         })?;
     let automation_text = String::from_utf8_lossy(&automation_source);
+    if let Ok(value) = toml::from_str::<toml::Value>(&automation_text) {
+        let legacy = ["inputs", "outputs", "knx_bindings", "logic"]
+            .into_iter()
+            .filter(|field| value.get(*field).is_some())
+            .map(|field| FieldError {
+                path: (*field).to_owned(),
+                message: "legacy top-level field must move inside [[blocks]]".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        if !legacy.is_empty() {
+            return Err(ConfigError::AutomationInvalid(legacy));
+        }
+    }
     let stored = toml::from_str::<StoredAutomation>(&automation_text)
         .map_err(ConfigError::AutomationToml)?;
     let mut automation =
         build_automation(stored.document).map_err(ConfigError::AutomationInvalid)?;
-    automation.document_revision = u64::from(stored.revision);
+    automation.document_revision = 0;
     if raw.knx.connection_type != "tunneling" {
         return Err(field("knx.connection_type", "must be 'tunneling'"));
     }
@@ -720,7 +951,7 @@ fn load_config_with_bridge_validation(
         config_path: config_path.to_path_buf(),
         automation_path: automation_path.to_path_buf(),
         automation,
-        automation_revision: u64::from(stored.revision),
+        automation_revision: 0,
         connection: ConnectionConfig {
             gateway_ip,
             gateway_port: raw.knx.gateway_port as u16,
@@ -941,7 +1172,7 @@ fn simulation_pending_timers(
 /// here, before the immutable core operation is called.
 pub(crate) fn simulation_scenario(
     payload: SimulationPayload,
-    automation: &AutomationRuntime,
+    block: &BlockRuntime,
 ) -> Result<SimulationScenario, Vec<FieldError>> {
     if payload
         .trigger
@@ -973,7 +1204,7 @@ pub(crate) fn simulation_scenario(
     };
     let trigger_dpt = trigger_endpoint
         .as_ref()
-        .and_then(|endpoint| automation.endpoint_dpts.get(endpoint).copied());
+        .and_then(|endpoint| block.endpoint_dpts.get(endpoint).copied());
     if trigger_endpoint.is_some() && trigger_dpt.is_none() {
         errors.push(FieldError {
             path: "trigger.endpoint".to_owned(),
@@ -1015,7 +1246,7 @@ pub(crate) fn simulation_scenario(
             };
             let dpt = endpoint
                 .as_ref()
-                .and_then(|endpoint| automation.endpoint_dpts.get(endpoint).copied());
+                .and_then(|endpoint| block.endpoint_dpts.get(endpoint).copied());
             if endpoint.is_some() && dpt.is_none() {
                 errors.push(FieldError {
                     path: format!("{path}.endpoint"),
@@ -1054,7 +1285,7 @@ pub(crate) fn simulation_scenario(
 
 pub(crate) fn simulation_timer_scenario(
     payload: &SimulationPayload,
-    automation: &AutomationRuntime,
+    block: &BlockRuntime,
     active_document_revision: u64,
     active_core_revision: u64,
     fallback_state: Option<&logiksmith_core::TransientState>,
@@ -1084,7 +1315,7 @@ pub(crate) fn simulation_timer_scenario(
         path: "trigger.fired_at_ms".to_owned(),
         message: "is required for a timer simulation".to_owned(),
     });
-    let inputs = simulation_input_values(payload, automation, &mut errors);
+    let inputs = simulation_input_values(payload, block, &mut errors);
     let state = match simulation_state(payload, fallback_state) {
         Ok(state) => state,
         Err(mut state_errors) => {
@@ -1128,7 +1359,7 @@ pub(crate) fn simulation_timer_scenario(
 
 fn simulation_input_values(
     payload: &SimulationPayload,
-    automation: &AutomationRuntime,
+    block: &BlockRuntime,
     errors: &mut Vec<FieldError>,
 ) -> Vec<SimulationInput> {
     payload
@@ -1144,7 +1375,7 @@ fn simulation_input_values(
                     None
                 }
             }?;
-            let dpt = automation.endpoint_dpts.get(&endpoint).copied();
+            let dpt = block.endpoint_dpts.get(&endpoint).copied();
             if dpt.is_none() {
                 errors.push(FieldError {
                     path: format!("{path}.endpoint"),
@@ -1418,34 +1649,6 @@ impl KnxEvent {
         }
         Ok(())
     }
-    fn to_input_event(&self, endpoint: EndpointName) -> Result<InputEvent, ProtocolError> {
-        if self.service != "group_value_write" {
-            return Err(ProtocolError::Field(
-                "service",
-                "only group_value_write drives logic".to_owned(),
-            ));
-        }
-        let value = self.typed_value()?.ok_or_else(|| {
-            ProtocolError::Field("value", "required for group_value_write".to_owned())
-        })?;
-        Ok(InputEvent::new(endpoint, value))
-    }
-
-    fn to_input_observation(
-        &self,
-        endpoint: EndpointName,
-    ) -> Result<InputObservation, ProtocolError> {
-        if self.service != "group_value_response" {
-            return Err(ProtocolError::Field(
-                "service",
-                "only group_value_response records a passive observation".to_owned(),
-            ));
-        }
-        let value = self.typed_value()?.ok_or_else(|| {
-            ProtocolError::Field("value", "required for group_value_response".to_owned())
-        })?;
-        Ok(InputObservation::new(endpoint, value))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1694,9 +1897,10 @@ pub async fn run_simulation_only(config: RuntimeConfig) -> Result<(), HostError>
     );
     init_logging(config.logging, store.clone());
     store.set_connection(ConnectionState::Disconnected);
-    let mut engine = Engine::try_new(config.automation.engine_config.clone()).map_err(|error| {
-        HostError::Protocol(ProtocolError::Field("automation", error.to_string()))
-    })?;
+    let mut runtime =
+        CoreRuntime::try_new(config.automation.core_config.clone()).map_err(|error| {
+            HostError::Protocol(ProtocolError::Field("automation", error.to_string()))
+        })?;
     let (activation_sender, activation_receiver) = mpsc::channel(8);
     let (simulation_sender, simulation_receiver) = mpsc::channel(8);
     let web_server = web::start_web_server_with_runtime(
@@ -1710,7 +1914,7 @@ pub async fn run_simulation_only(config: RuntimeConfig) -> Result<(), HostError>
     let result = run_simulation_session(
         &config,
         &store,
-        &mut engine,
+        &mut runtime,
         activation_receiver,
         simulation_receiver,
     )
@@ -1729,9 +1933,10 @@ pub async fn run_with_bridge(
         config.automation_revision,
     );
     init_logging(config.logging, store.clone());
-    let mut engine = Engine::try_new(config.automation.engine_config.clone()).map_err(|error| {
-        HostError::Protocol(ProtocolError::Field("automation", error.to_string()))
-    })?;
+    let mut runtime =
+        CoreRuntime::try_new(config.automation.core_config.clone()).map_err(|error| {
+            HostError::Protocol(ProtocolError::Field("automation", error.to_string()))
+        })?;
     let (activation_sender, activation_receiver) = mpsc::channel(8);
     let (simulation_sender, simulation_receiver) = mpsc::channel(8);
     let web_server = web::start_web_server_with_runtime(
@@ -1772,7 +1977,7 @@ pub async fn run_with_bridge(
     let result = run_session(
         &config,
         &store,
-        &mut engine,
+        &mut runtime,
         &mut child,
         &mut stdin,
         &mut reader,
@@ -1798,27 +2003,26 @@ async fn forward_bridge_stderr<R: AsyncRead + Unpin>(stderr: R) {
 async fn run_simulation_session(
     config: &RuntimeConfig,
     store: &DiagnosticStore,
-    engine: &mut Engine,
+    runtime: &mut CoreRuntime,
     mut activations: mpsc::Receiver<ActivationRequest>,
     mut simulations: mpsc::Receiver<SimulationRequest>,
 ) -> Result<(), HostError> {
     let interrupt = signal::ctrl_c();
     tokio::pin!(interrupt);
-    let mut active_logic_revision = config.automation.document_revision;
-    let mut timer_sleep = Box::pin(time::sleep(timer_wait(engine, store)));
+    let mut timer_sleep = Box::pin(time::sleep(timer_wait(runtime, store)));
     loop {
         tokio::select! {
             Some(request) = activations.recv() => {
-                apply_activation(engine, store, &mut active_logic_revision, request);
-                reset_timer_sleep(&mut timer_sleep, engine, store);
+                apply_activation(runtime, store, config, request);
+                reset_timer_sleep(&mut timer_sleep, runtime, store);
             }
             Some(request) = simulations.recv() => {
-                apply_simulation(engine, store, config, active_logic_revision, request);
-                reset_timer_sleep(&mut timer_sleep, engine, store);
+                apply_simulation(runtime, store, config, request);
+                reset_timer_sleep(&mut timer_sleep, runtime, store);
             }
             _ = &mut timer_sleep => {
-                drain_due_timers(engine, store, config, None).await?;
-                reset_timer_sleep(&mut timer_sleep, engine, store);
+                drain_due_timers(runtime, store, config, None).await?;
+                reset_timer_sleep(&mut timer_sleep, runtime, store);
             }
             signal = &mut interrupt => {
                 signal?;
@@ -1831,7 +2035,7 @@ async fn run_simulation_session(
 async fn run_session(
     config: &RuntimeConfig,
     store: &DiagnosticStore,
-    engine: &mut Engine,
+    runtime: &mut CoreRuntime,
     child: &mut Child,
     stdin: &mut ChildStdin,
     reader: &mut BufReader<ChildStdout>,
@@ -1880,8 +2084,7 @@ async fn run_session(
     let mut line = String::new();
     let mut next_request_id = 1u64;
     let mut pending = HashSet::new();
-    let mut active_logic_revision = config.automation.document_revision;
-    let mut timer_sleep = Box::pin(time::sleep(timer_wait(engine, store)));
+    let mut timer_sleep = Box::pin(time::sleep(timer_wait(runtime, store)));
     loop {
         tokio::select! {
             read = reader.read_line(&mut line) => {
@@ -1892,52 +2095,66 @@ async fn run_session(
                 match message {
                     Message::KnxEvent(event) => {
                         let destination = GroupAddress::parse(&event.destination).map_err(|error| ProtocolError::Field("destination", error.to_string()))?;
-                        let logical_endpoint = config.automation.address_to_endpoint.get(&destination).map(|binding| binding.endpoint.clone());
+                        let logical_endpoint = config.automation.address_to_inputs.get(&destination).and_then(|bindings| bindings.first()).map(|binding| binding.endpoint.clone());
                         store.record_telegram(TelegramRecord::from_event(&event, logical_endpoint.as_ref()));
-                        let Some(binding) = config.automation.address_to_endpoint.get(&destination) else { continue };
-                        if binding.direction != EndpointDirection::Input || event.value.is_none() { continue; }
+                        let Some(bindings) = config.automation.address_to_inputs.get(&destination) else { continue };
+                        if event.value.is_none() { continue; }
+                        let now = store.now();
                         if event.service == "group_value_write" {
-                            let input = match event.to_input_event(binding.endpoint.clone()) { Ok(input) => input, Err(error) => { tracing::warn!(target: "logiksmith", error = %error, "ignoring invalid logical input event"); continue; } };
-                            let now = store.now();
-                            let started = Instant::now();
-                            let execution = match engine.process_input(input, now) {
-                                Ok(execution) => execution,
-                                Err(error) => {
-                                    tracing::warn!(target: "logiksmith", error = %error, "ignoring invalid logical input event");
-                                    continue;
-                                }
+                            let input_value = match event.typed_value()? {
+                                Some(value) => value,
+                                None => continue,
                             };
-                            let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                            store.record_execution(&execution, duration_us, &config.automation);
-                            if let Ok(transition) = &execution.outcome {
-                                dispatch_effects(store, stdin, &config.automation, transition.outputs.clone(), &mut next_request_id, &mut pending).await?;
+                            for binding in bindings {
+                                let input = InputEvent::new(binding.endpoint.clone(), input_value);
+                                let block_id = binding.block_id.parse::<BlockId>().map_err(|error| ProtocolError::Field("block_id", error.to_string()))?;
+                                let started = Instant::now();
+                                let result = runtime.process_input(&block_id, input, now);
+                                let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                                match result {
+                                    Ok(Some(execution)) => {
+                                        store.record_block_execution(&execution, now, duration_us, &config.automation);
+                                        if let Ok(transition) = &execution.execution.outcome {
+                                            dispatch_effects(store, stdin, &config.automation, &execution.block_id, transition.outputs.clone(), &mut next_request_id, &mut pending).await?;
+                                        }
+                                    }
+                                    Ok(None) => store.set_runtime_projection_from_runtime(runtime, now),
+                                    Err(error) => tracing::warn!(target: "logiksmith", block = %binding.block_id, error = %error, "ignoring invalid logical input event"),
+                                }
                             }
-                            reset_timer_sleep(&mut timer_sleep, engine, store);
                         } else if event.service == "group_value_response"
-                            && let Ok(observation) = event.to_input_observation(binding.endpoint.clone())
-                            && let Err(error) = engine.observe_input(observation, store.now()) { tracing::warn!(target: "logiksmith", error = %error, "ignoring invalid passive input observation"); }
-                        reset_timer_sleep(&mut timer_sleep, engine, store);
+                            && let Some(value) = event.typed_value()? {
+                            for binding in bindings {
+                                let block_id = binding.block_id.parse::<BlockId>().map_err(|error| ProtocolError::Field("block_id", error.to_string()))?;
+                                let observation = InputObservation::new(binding.endpoint.clone(), value);
+                                if let Err(error) = runtime.observe_input(&block_id, observation, now) {
+                                    tracing::warn!(target: "logiksmith", block = %binding.block_id, error = %error, "ignoring invalid passive input observation");
+                                }
+                            }
+                            store.set_runtime_projection_from_runtime(runtime, now);
+                        }
+                        reset_timer_sleep(&mut timer_sleep, runtime, store);
                     }
                     Message::CommandResult(result) => {
                         if !pending.remove(&result.request_id) { return Err(HostError::UnknownRequest(result.request_id)); }
                         store.record_write_result(result.request_id, result.ok, result.error.clone());
-                        reset_timer_sleep(&mut timer_sleep, engine, store);
+                        reset_timer_sleep(&mut timer_sleep, runtime, store);
                     }
                     Message::Fatal(fatal) => return Err(HostError::BridgeFatal { code: fatal.code, message: fatal.message }),
                     _ => return Err(ProtocolError::Field("runtime", "unexpected bridge message".to_owned()).into()),
                 }
             }
             Some(request) = activations.recv() => {
-                apply_activation(engine, store, &mut active_logic_revision, request);
-                reset_timer_sleep(&mut timer_sleep, engine, store);
+                apply_activation(runtime, store, config, request);
+                reset_timer_sleep(&mut timer_sleep, runtime, store);
             }
             Some(request) = simulations.recv() => {
-                apply_simulation(engine, store, config, active_logic_revision, request);
-                reset_timer_sleep(&mut timer_sleep, engine, store);
+                apply_simulation(runtime, store, config, request);
+                reset_timer_sleep(&mut timer_sleep, runtime, store);
             }
             _ = &mut timer_sleep => {
-                drain_due_timers(engine, store, config, Some((&mut *stdin, &mut next_request_id, &mut pending))).await?;
-                reset_timer_sleep(&mut timer_sleep, engine, store);
+                drain_due_timers(runtime, store, config, Some((&mut *stdin, &mut next_request_id, &mut pending))).await?;
+                reset_timer_sleep(&mut timer_sleep, runtime, store);
             }
             signal = &mut interrupt => {
                 signal?;
@@ -1950,39 +2167,23 @@ async fn run_session(
 }
 
 fn apply_activation(
-    engine: &mut Engine,
+    runtime: &mut CoreRuntime,
     store: &DiagnosticStore,
-    active_logic_revision: &mut u64,
+    config: &RuntimeConfig,
     request: ActivationRequest,
 ) {
-    let source = request.source;
-    let result = engine
-        .activate_source(source.clone())
+    let result = runtime
+        .activate(logiksmith_core::RuntimeActivation::new(request.updates))
         .map(|activation| {
-            let cancelled_timers = activation
-                .cancelled_timers
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
-            if !activation.changed {
-                let result = ActivationResult {
-                    logic_revision: *active_logic_revision,
-                    cancelled_timers,
-                    changed: false,
-                };
-                return result;
-            }
-            *active_logic_revision = request.document_revision;
-            store.record_activation(
+            store.record_runtime_activation(
                 request.document_revision,
-                source,
-                &cancelled_timers,
-                &engine.snapshot(),
+                &activation,
+                runtime,
+                &config.automation,
             );
-            ActivationResult {
-                logic_revision: request.document_revision,
-                cancelled_timers,
-                changed: activation.changed,
+            CoreActivationResult {
+                document_revision: request.document_revision,
+                result: activation,
             }
         })
         .map_err(|error| error.to_string());
@@ -1990,70 +2191,93 @@ fn apply_activation(
 }
 
 fn apply_simulation(
-    engine: &Engine,
+    runtime: &CoreRuntime,
     store: &DiagnosticStore,
     config: &RuntimeConfig,
-    active_logic_revision: u64,
     request: SimulationRequest,
 ) {
     let SimulationRequest { payload, reply } = request;
+    let Some(block) = config.automation.block(&payload.block_id) else {
+        let _ = reply.send(SimulationOutcome::NotFound);
+        return;
+    };
+    let Ok(block_id) = payload.block_id.parse::<BlockId>() else {
+        let _ = reply.send(SimulationOutcome::NotFound);
+        return;
+    };
+    let Some(core_block) = runtime.block(&block_id) else {
+        let _ = reply.send(SimulationOutcome::NotFound);
+        return;
+    };
+    let active_logic_revision = block.revision;
+    let active_core_revision = core_block.active_logic_revision();
     let outcome = if payload.expected_logic_revision != active_logic_revision {
         SimulationOutcome::Conflict {
             current_revision: active_logic_revision,
         }
     } else {
         let started = Instant::now();
+        let snapshot = core_block.snapshot_at(store.now());
         if payload.trigger.trigger_type.as_deref() == Some("timer") {
             match simulation_timer_scenario(
                 &payload,
-                &config.automation,
+                block,
                 active_logic_revision,
-                engine.active_logic_revision(),
-                Some(engine.transient_state()),
+                active_core_revision,
+                Some(&snapshot.state),
             ) {
                 Err(errors) => SimulationOutcome::Invalid(errors),
-                Ok(scenario) => match engine.simulate_timer(scenario) {
-                    Ok(execution) => SimulationOutcome::Complete(diagnostics::simulation_response(
-                        &execution,
-                        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                        active_logic_revision,
-                        &config.automation,
-                    )),
-                    Err(error) => {
+                Ok(scenario) => match runtime.simulate_timer(&block_id, scenario) {
+                    Ok(execution) => {
+                        SimulationOutcome::Complete(diagnostics::simulation_response_for_block(
+                            &execution,
+                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                            active_logic_revision,
+                            &config.automation,
+                        ))
+                    }
+                    Err(RuntimeSimulationError::Block { error, .. }) => {
                         SimulationOutcome::Invalid(simulation_error_fields(&error, &payload))
                     }
+                    Err(RuntimeSimulationError::UnknownBlock(_)) => SimulationOutcome::NotFound,
                 },
             }
         } else {
-            match simulation_scenario(payload.clone(), &config.automation) {
+            match simulation_scenario(payload.clone(), block) {
                 Err(errors) => SimulationOutcome::Invalid(errors),
-                Ok(scenario) => match simulation_state(&payload, Some(engine.transient_state())) {
+                Ok(scenario) => match simulation_state(&payload, Some(&snapshot.state)) {
                     Err(errors) => SimulationOutcome::Invalid(errors),
                     Ok(state) => match simulation_pending_timers(
                         &payload,
-                        Some(&engine.snapshot().pending_timers),
+                        Some(&snapshot.pending_timers),
                         active_logic_revision,
-                        engine.active_logic_revision(),
+                        active_core_revision,
                     ) {
                         Err(errors) => SimulationOutcome::Invalid(errors),
-                        Ok(pending_timers) => match engine.simulate_input_with_state(
+                        Ok(pending_timers) => match runtime.simulate_input_with_state(
+                            &block_id,
                             scenario,
                             state,
                             pending_timers,
                             store.now(),
                         ) {
-                            Ok(execution) => {
-                                SimulationOutcome::Complete(diagnostics::simulation_response(
+                            Ok(execution) => SimulationOutcome::Complete(
+                                diagnostics::simulation_response_for_block(
                                     &execution,
                                     u64::try_from(started.elapsed().as_micros())
                                         .unwrap_or(u64::MAX),
                                     active_logic_revision,
                                     &config.automation,
+                                ),
+                            ),
+                            Err(RuntimeSimulationError::Block { error, .. }) => {
+                                SimulationOutcome::Invalid(simulation_error_fields(
+                                    &error, &payload,
                                 ))
                             }
-                            Err(error) => SimulationOutcome::Invalid(simulation_error_fields(
-                                &error, &payload,
-                            )),
+                            Err(RuntimeSimulationError::UnknownBlock(_)) => {
+                                SimulationOutcome::NotFound
+                            }
                         },
                     },
                 },
@@ -2063,8 +2287,8 @@ fn apply_simulation(
     let _ = reply.send(outcome);
 }
 
-fn timer_wait(engine: &Engine, store: &DiagnosticStore) -> Duration {
-    engine
+fn timer_wait(runtime: &CoreRuntime, store: &DiagnosticStore) -> Duration {
+    runtime
         .next_timer_deadline()
         .map(|deadline| Duration::from_millis(deadline.0.saturating_sub(store.now().0)))
         .unwrap_or(Duration::from_secs(86_400))
@@ -2072,44 +2296,45 @@ fn timer_wait(engine: &Engine, store: &DiagnosticStore) -> Duration {
 
 fn reset_timer_sleep(
     sleep: &mut std::pin::Pin<Box<time::Sleep>>,
-    engine: &Engine,
+    runtime: &CoreRuntime,
     store: &DiagnosticStore,
 ) {
     sleep
         .as_mut()
-        .reset(time::Instant::now() + timer_wait(engine, store));
+        .reset(time::Instant::now() + timer_wait(runtime, store));
 }
 
 async fn drain_due_timers(
-    engine: &mut Engine,
+    runtime: &mut CoreRuntime,
     store: &DiagnosticStore,
     config: &RuntimeConfig,
     mut bridge: Option<(&mut ChildStdin, &mut u64, &mut HashSet<u64>)>,
 ) -> Result<(), HostError> {
     let now = store.now();
-    while engine
+    while runtime
         .next_timer_deadline()
         .is_some_and(|deadline| deadline <= now)
     {
         let started = Instant::now();
-        let execution = match engine.process_next_due_timer(now) {
+        let execution = match runtime.process_next_due_timer(now) {
             Ok(Some(execution)) => execution,
             Ok(None) => break,
             Err(error) => {
                 tracing::warn!(target: "logiksmith", error = %error, "discarding invalid timer execution");
-                store.set_engine_snapshot(&engine.snapshot());
+                store.set_runtime_projection_from_runtime(runtime, now);
                 continue;
             }
         };
         let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        store.record_execution(&execution, duration_us, &config.automation);
+        store.record_block_execution(&execution, now, duration_us, &config.automation);
         if let Some((stdin, next_request_id, pending)) = bridge.as_mut()
-            && let Ok(transition) = &execution.outcome
+            && let Ok(transition) = &execution.execution.outcome
         {
             dispatch_effects(
                 store,
                 stdin,
                 &config.automation,
+                &execution.block_id,
                 transition.outputs.clone(),
                 next_request_id,
                 pending,
@@ -2123,14 +2348,20 @@ async fn drain_due_timers(
 fn configure_message(config: &RuntimeConfig) -> Message {
     let mut group_addresses: Vec<_> = config
         .automation
-        .address_to_endpoint
-        .values()
-        .map(|binding| GroupAddressDpt {
-            address: binding.address.to_string(),
-            dpt: DptMessage::from_core(binding.dpt),
+        .address_dpts
+        .iter()
+        .map(|(address, dpt)| GroupAddressDpt {
+            address: address.to_string(),
+            dpt: DptMessage::from_core(*dpt),
         })
         .collect();
-    group_addresses.sort_by(|left, right| left.address.cmp(&right.address));
+    group_addresses.sort_by_key(|entry| {
+        entry
+            .address
+            .parse::<GroupAddress>()
+            .map(|address| (address.main, address.middle, address.subgroup))
+            .unwrap_or((u8::MAX, u8::MAX, u8::MAX))
+    });
     Message::Configure(Configure {
         v: PROTOCOL_VERSION,
         message_type: "configure".to_owned(),
@@ -2155,6 +2386,7 @@ async fn dispatch_effects(
     store: &DiagnosticStore,
     stdin: &mut ChildStdin,
     automation: &AutomationRuntime,
+    block_id: &BlockId,
     effects: Vec<OutputEffect>,
     next_request_id: &mut u64,
     pending: &mut HashSet<u64>,
@@ -2162,8 +2394,12 @@ async fn dispatch_effects(
     for effect in effects {
         let endpoint = effect.endpoint;
         let value = effect.value;
-        let Some(destination) = automation.endpoint_to_address.get(&endpoint).copied() else {
-            tracing::error!(target: "logiksmith", endpoint = %endpoint, "core returned an unresolved output effect");
+        let Some(destination) = automation
+            .output_to_address
+            .get(&(block_id.to_string(), endpoint.clone()))
+            .copied()
+        else {
+            tracing::error!(target: "logiksmith", block = %block_id, endpoint = %endpoint, "core returned an unresolved output effect");
             continue;
         };
         let request_id = *next_request_id;
@@ -2171,8 +2407,8 @@ async fn dispatch_effects(
             HostError::Protocol(ProtocolError::Field("request_id", "exhausted".to_owned()))
         })?;
         let dpt = automation
-            .endpoint_dpts
-            .get(&endpoint)
+            .block(block_id.as_str())
+            .and_then(|block| block.endpoint_dpts.get(&endpoint))
             .copied()
             .ok_or_else(|| {
                 HostError::Protocol(ProtocolError::Field(
@@ -2185,7 +2421,14 @@ async fn dispatch_effects(
             continue;
         }
         pending.insert(request_id);
-        store.record_write_requested(request_id, endpoint.clone(), destination, dpt, value);
+        store.record_write_requested(
+            request_id,
+            block_id,
+            endpoint.clone(),
+            destination,
+            dpt,
+            value,
+        );
         let message = Message::KnxWrite(KnxWrite {
             v: PROTOCOL_VERSION,
             message_type: "knx_write".to_owned(),
@@ -2271,19 +2514,143 @@ mod milestone7_simulation_tests {
     #[test]
     fn simulated_timer_document_revisions_are_mapped_to_the_core_revision() {
         let payload: SimulationPayload = serde_json::from_value(serde_json::json!({
-            "expected_logic_revision": 6,
+            "block_id": "test",
+            "expected_logic_revision": "6",
             "trigger": {},
             "inputs": [],
             "pending_timers": [{
                 "name": "off",
                 "scheduled_at_ms": 1000,
                 "due_at_ms": 6000,
-                "logic_revision": 6
+                "logic_revision": "6"
             }]
         }))
         .unwrap();
 
         let timers = simulation_pending_timers(&payload, None, 6, u64::MAX).unwrap();
         assert_eq!(timers[0].scheduled_logic_revision, u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod milestone8_config_tests {
+    use super::*;
+
+    fn block(id: &str, input_address: &str, output_address: &str) -> AutomationBlock {
+        AutomationBlock {
+            id: id.to_owned(),
+            revision: 1,
+            enabled: true,
+            inputs: vec![AutomationEndpoint {
+                name: "input".to_owned(),
+                dpt: "1.001".to_owned(),
+            }],
+            outputs: vec![AutomationEndpoint {
+                name: "light".to_owned(),
+                dpt: "1.001".to_owned(),
+            }],
+            knx_bindings: vec![
+                KnxBinding {
+                    endpoint: "input".to_owned(),
+                    group_address: input_address.to_owned(),
+                },
+                KnxBinding {
+                    endpoint: "light".to_owned(),
+                    group_address: output_address.to_owned(),
+                },
+            ],
+            source: "function handle(event, input) return nil end".to_owned(),
+        }
+    }
+
+    #[test]
+    fn nested_document_supports_sixty_four_blocks_and_rejects_sixty_five() {
+        let document = AutomationDocument {
+            blocks: (0..64)
+                .map(|index| {
+                    block(
+                        &format!("block_{index}"),
+                        &format!("1/1/{}", index + 1),
+                        &format!("1/2/{}", index + 1),
+                    )
+                })
+                .collect(),
+        };
+        let runtime = build_automation(document.clone()).unwrap();
+        assert_eq!(runtime.blocks.len(), 64);
+        let too_many = AutomationDocument {
+            blocks: (0..65)
+                .map(|index| {
+                    block(
+                        &format!("block_{index}"),
+                        &format!("2/1/{}", index + 1),
+                        &format!("2/2/{}", index + 1),
+                    )
+                })
+                .collect(),
+        };
+        assert!(build_automation(too_many).is_err());
+    }
+
+    #[test]
+    fn shared_same_dpt_address_fans_out_in_declaration_order() {
+        let runtime = build_automation(AutomationDocument {
+            blocks: vec![
+                block("first", "3/1/1", "3/2/1"),
+                block("second", "3/1/1", "3/2/2"),
+            ],
+        })
+        .unwrap();
+        let bindings = runtime
+            .address_to_inputs
+            .get(&GroupAddress::parse("3/1/1").unwrap())
+            .unwrap();
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| binding.block_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(runtime.address_dpts.len(), 3);
+    }
+
+    #[test]
+    fn cross_block_dpt_conflict_and_local_duplicate_address_are_rejected() {
+        let mut conflicting = block("second", "4/1/1", "4/2/1");
+        conflicting.inputs[0].dpt = "5.001".to_owned();
+        let errors = build_automation(AutomationDocument {
+            blocks: vec![block("first", "4/1/1", "4/2/2"), conflicting],
+        })
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.path == "blocks[1].knx_bindings[0].group_address")
+        );
+
+        let mut duplicate = block("first", "5/1/1", "5/2/1");
+        duplicate.knx_bindings[1].group_address = "5/1/1".to_owned();
+        let errors = build_automation(AutomationDocument {
+            blocks: vec![duplicate],
+        })
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.path == "blocks[0].knx_bindings[1].group_address")
+        );
+    }
+
+    #[test]
+    fn legacy_top_level_shape_reports_migration_fields() {
+        let path =
+            std::env::temp_dir().join(format!("logiksmith-legacy-{}.toml", std::process::id()));
+        fs::write(&path, "[logic]\nsource = \"function handle() end\"\n").unwrap();
+        let error = load_automation(&path).unwrap_err();
+        assert!(
+            matches!(error, AutomationFileError::Invalid(errors) if errors.iter().any(|error| error.path == "logic"))
+        );
+        let _ = fs::remove_file(path);
     }
 }

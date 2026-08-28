@@ -10,10 +10,12 @@ import type {
   SimulationScenario,
   SimulationTypedValue
 } from './state';
+import { isRevisionToken, type RevisionToken } from './revision';
 
 export type SimulationValue = boolean | number | null;
 export interface SimulationDraftInput { endpoint: string; dpt: string; value: SimulationValue; valid: boolean; ageMs: number | null; }
 export interface SimulationDraft {
+  blockId: string;
   triggerType: 'input' | 'timer';
   triggerEndpoint: string;
   triggerValue: SimulationValue;
@@ -32,13 +34,15 @@ function inputFromEndpoint(endpoint: DisplayEndpoint): SimulationDraftInput | nu
 
 /** Starts an editable scenario from an execution, or with all active inputs unknown. */
 export function createSimulationDraft(snapshot: DisplaySnapshot, execution: DisplayExecution | null = null): SimulationDraft {
+  const selectedBlock = execution?.blockId ? snapshot.blocks.find((block) => block.id === execution.blockId) : snapshot.blocks[0];
   const inputs = execution
     ? execution.inputs.map((input) => ({ ...input }))
-    : (snapshot.automation?.inputs ?? []).map(inputFromEndpoint).filter((input): input is SimulationDraftInput => input !== null);
+    : (selectedBlock?.inputs ?? snapshot.automation?.inputs ?? []).map(inputFromEndpoint).filter((input): input is SimulationDraftInput => input !== null);
   const timerTrigger = execution?.trigger.type === 'timer' ? execution.trigger : null;
-  const pendingTimers = snapshot.pendingTimers.map((timer) => ({ ...timer }));
+  const pendingTimers = (selectedBlock?.pendingTimers ?? snapshot.pendingTimers).map((timer) => ({ ...timer }));
   if (timerTrigger && !pendingTimers.some((timer) => timer.name === timerTrigger.timer)) pendingTimers.push({ name: timerTrigger.timer, scheduledAtMs: timerTrigger.scheduledAtMs, dueAtMs: timerTrigger.dueAtMs, logicRevision: timerTrigger.scheduledLogicRevision });
   return {
+    blockId: selectedBlock?.id ?? 'default',
     triggerType: timerTrigger ? 'timer' : 'input',
     triggerEndpoint: execution && execution.trigger.type === 'input' ? execution.trigger.endpoint : inputs[0]?.endpoint ?? '',
     triggerValue: execution && execution.trigger.type === 'input' ? execution.trigger.value : null,
@@ -103,7 +107,7 @@ export function validateSimulationDraft(draft: SimulationDraft): string[] {
     if (!timer.name) errors.push(`Pending timer ${index + 1} needs a name.`);
     if (!Number.isInteger(timer.scheduledAtMs) || timer.scheduledAtMs < 0) errors.push(`Pending timer ${timer.name || index + 1} has an invalid scheduled time.`);
     if (!Number.isInteger(timer.dueAtMs) || timer.dueAtMs < 0) errors.push(`Pending timer ${timer.name || index + 1} has an invalid due time.`);
-    if (!Number.isInteger(timer.logicRevision) || timer.logicRevision < 0) errors.push(`Pending timer ${timer.name || index + 1} has an invalid logic revision.`);
+    if (!isRevisionToken(timer.logicRevision)) errors.push(`Pending timer ${timer.name || index + 1} has an invalid logic revision.`);
   });
   if (draft.triggerType === 'timer') {
     if (!draft.triggerTimerName) errors.push('Choose a pending timer.');
@@ -130,19 +134,20 @@ export function validateSimulationDraft(draft: SimulationDraft): string[] {
   return errors;
 }
 
-export function toSimulationScenario(draft: SimulationDraft, expectedLogicRevision: number): SimulationScenario | null {
+export function toSimulationScenario(draft: SimulationDraft, expectedLogicRevision: RevisionToken): SimulationScenario | null {
   const prepared = forceTriggerInput(draft);
   const errors = validateSimulationDraft(prepared);
   if (errors.length) return null;
   const inputs: SimulationInputRequest[] = prepared.inputs.map((input) => ({ endpoint: input.endpoint, value: input.valid ? typedValueForDpt(input.dpt, input.value) : null, valid: input.valid, ageMs: input.valid ? input.ageMs : null }));
   if (prepared.triggerType === 'timer') {
     if (prepared.timerFiredAtMs === null) return null;
-    return { expectedLogicRevision, trigger: { type: 'timer', name: prepared.triggerTimerName, firedAtMs: prepared.timerFiredAtMs }, inputs, state: { ...prepared.state }, pendingTimers: prepared.pendingTimers.map((timer) => ({ ...timer })) };
+    return { blockId: prepared.blockId, expectedLogicRevision, trigger: { type: 'timer', name: prepared.triggerTimerName, firedAtMs: prepared.timerFiredAtMs }, inputs, state: { ...prepared.state }, pendingTimers: prepared.pendingTimers.map((timer) => ({ ...timer })) };
   }
   const trigger = prepared.inputs.find((input) => input.endpoint === prepared.triggerEndpoint);
   const triggerValue = trigger ? typedValueForDpt(trigger.dpt, prepared.triggerValue) : null;
   if (!trigger || !triggerValue) return null;
   return {
+    blockId: prepared.blockId,
     expectedLogicRevision,
     trigger: { type: 'input', endpoint: prepared.triggerEndpoint, value: triggerValue, previous: typedValueForDpt(trigger.dpt, prepared.previousValue) },
     inputs,

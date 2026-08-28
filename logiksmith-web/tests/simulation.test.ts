@@ -76,7 +76,7 @@ describe('simulation API and model', () => {
     });
     expect(result.status).toBe('succeeded');
     expect(JSON.parse(String(request?.body))).toEqual({
-      expected_logic_revision: 12,
+      expected_logic_revision: '12',
       trigger: scenario().trigger,
       inputs: [
         { endpoint: 'wall_switch', value: { kind: 'bool', value: true }, valid: true, age_ms: 0 },

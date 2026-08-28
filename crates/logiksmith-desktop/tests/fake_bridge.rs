@@ -56,39 +56,9 @@ listen_port = {web_port}
     fs::write(
         &automation_path,
         r#"
-[[inputs]]
-name = "wall_switch"
-dpt = "1.001"
-
-[[inputs]]
-name = "dimmer_level"
-dpt = "5.001"
-
-[[outputs]]
-name = "test_light"
-dpt = "1.001"
-
-[[outputs]]
-name = "dimmer_output"
-dpt = "5.001"
-
-[[knx_bindings]]
-endpoint = "wall_switch"
-group_address = "2/2/52"
-
-[[knx_bindings]]
-endpoint = "dimmer_level"
-group_address = "2/2/53"
-
-[[knx_bindings]]
-endpoint = "test_light"
-group_address = "2/3/52"
-
-[[knx_bindings]]
-endpoint = "dimmer_output"
-group_address = "2/3/53"
-
-[logic]
+[[blocks]]
+id = "test"
+enabled = true
 source = '''
 function handle(event, input)
   if event.input == "wall_switch" and event.value == true then
@@ -98,6 +68,38 @@ function handle(event, input)
   end
 end
 '''
+
+[[blocks.inputs]]
+name = "wall_switch"
+dpt = "1.001"
+
+[[blocks.inputs]]
+name = "dimmer_level"
+dpt = "5.001"
+
+[[blocks.outputs]]
+name = "test_light"
+dpt = "1.001"
+
+[[blocks.outputs]]
+name = "dimmer_output"
+dpt = "5.001"
+
+[[blocks.knx_bindings]]
+endpoint = "wall_switch"
+group_address = "2/2/52"
+
+[[blocks.knx_bindings]]
+endpoint = "dimmer_level"
+group_address = "2/2/53"
+
+[[blocks.knx_bindings]]
+endpoint = "test_light"
+group_address = "2/3/52"
+
+[[blocks.knx_bindings]]
+endpoint = "dimmer_output"
+group_address = "2/3/53"
 "#,
     )
     .unwrap();
@@ -200,31 +202,9 @@ listen_port = {web_port}
     fs::write(
         &automation_path,
         r#"
-[[inputs]]
-name = "wall_switch"
-dpt = "1.001"
-
-[[inputs]]
-name = "enabled"
-dpt = "1.001"
-
-[[outputs]]
-name = "test_light"
-dpt = "1.001"
-
-[[knx_bindings]]
-endpoint = "wall_switch"
-group_address = "2/2/52"
-
-[[knx_bindings]]
-endpoint = "enabled"
-group_address = "2/2/53"
-
-[[knx_bindings]]
-endpoint = "test_light"
-group_address = "2/3/52"
-
-[logic]
+[[blocks]]
+id = "test"
+enabled = true
 source = '''
 function handle(event, input, meta)
   if event.falling then error("contained boom") end
@@ -233,6 +213,30 @@ function handle(event, input, meta)
   end
 end
 '''
+
+[[blocks.inputs]]
+name = "wall_switch"
+dpt = "1.001"
+
+[[blocks.inputs]]
+name = "enabled"
+dpt = "1.001"
+
+[[blocks.outputs]]
+name = "test_light"
+dpt = "1.001"
+
+[[blocks.knx_bindings]]
+endpoint = "wall_switch"
+group_address = "2/2/52"
+
+[[blocks.knx_bindings]]
+endpoint = "enabled"
+group_address = "2/2/53"
+
+[[blocks.knx_bindings]]
+endpoint = "test_light"
+group_address = "2/3/52"
 "#,
     )
     .unwrap();
@@ -298,7 +302,7 @@ done
     assert!(snapshot["logic"].get("recent_effects").is_none());
     for execution in executions {
         assert!(execution["execution_id"].as_u64().is_some());
-        assert!(execution["logic_revision"].as_u64().is_some());
+        assert!(execution["logic_revision"].as_str().is_some());
         assert!(execution["duration_us"].as_u64().is_some());
         assert_eq!(execution["inputs"].as_array().unwrap().len(), 2);
         assert_eq!(execution["inputs"][1]["value"]["value"], true);

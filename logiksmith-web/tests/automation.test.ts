@@ -69,7 +69,7 @@ describe('automation editor model', () => {
     });
     expect(result).toEqual({ revision: 8, logicActivated: true, activeLogicRevision: 8, restartRequired: false });
     expect(request?.method).toBe('PUT');
-    expect(JSON.parse(String(request?.body))).toEqual({ document: document(), revision: 7 });
+    expect(JSON.parse(String(request?.body))).toEqual({ document: document() });
   });
 
   it('decodes the names cancelled by a source activation', async () => {

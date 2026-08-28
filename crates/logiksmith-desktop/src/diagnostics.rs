@@ -4,8 +4,8 @@ use crate::{
     AutomationRuntime, BoolValueMessage, DptMessage, GroupAddress, KnxEvent, ValueMessage,
 };
 use logiksmith_core::{
-    Dpt, EndpointDirection, EndpointName, Execution, OutputEffect, StateValue, TimerAction,
-    Trigger, TypedValue,
+    BlockExecution, Dpt, EndpointDirection, EndpointName, Execution, OutputEffect, Runtime,
+    StateValue, TimerAction, Trigger, TypedValue,
 };
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -54,6 +54,9 @@ pub struct Snapshot {
     pub logic: LogicStatusSnapshot,
     pub telegrams: Vec<TelegramRecord>,
     pub logs: Vec<LogRecord>,
+    /// Ordered block-local diagnostics. The older global projections remain
+    /// during the dashboard migration, but this is the authoritative M8 view.
+    pub blocks: Vec<BlockSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -70,6 +73,38 @@ pub struct AutomationSnapshot {
     pub outputs: Vec<EndpointSnapshot>,
     pub knx_bindings: Vec<BindingSnapshot>,
     pub logic: LogicSourceSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BlockSnapshot {
+    pub id: String,
+    pub active_enabled: bool,
+    pub saved_enabled: bool,
+    #[serde(serialize_with = "crate::wire_revision::serialize")]
+    pub active_revision: u64,
+    #[serde(serialize_with = "crate::wire_revision::serialize")]
+    pub saved_revision: u64,
+    #[serde(serialize_with = "crate::wire_revision::serialize")]
+    pub active_logic_revision: u64,
+    #[serde(serialize_with = "crate::wire_revision::serialize")]
+    pub saved_logic_revision: u64,
+    pub source: String,
+    pub inputs: Vec<EndpointSnapshot>,
+    pub outputs: Vec<EndpointSnapshot>,
+    pub knx_bindings: Vec<BindingSnapshot>,
+    pub values: ValuesSnapshot,
+    pub state: BTreeMap<String, StateValueRecord>,
+    pub pending_timers: Vec<PendingTimerRecord>,
+    pub executions: Vec<ExecutionRecord>,
+    pub last_result: Option<LastResultSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LastResultSnapshot {
+    pub status: LogicExecutionStatus,
+    pub execution_id: u64,
+    pub time_ms: u64,
+    pub error: Option<LogicErrorRecord>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LogicSourceSnapshot {
@@ -100,7 +135,9 @@ pub struct EndpointValueSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LogicStatusSnapshot {
+    #[serde(serialize_with = "crate::wire_revision::serialize")]
     pub active_logic_revision: u64,
+    #[serde(serialize_with = "crate::wire_revision::serialize")]
     pub saved_logic_revision: u64,
     pub active_structural_revision: u64,
     pub saved_structural_revision: u64,
@@ -124,6 +161,7 @@ pub struct PendingTimerRecord {
     pub name: String,
     pub scheduled_at_ms: u64,
     pub due_at_ms: u64,
+    #[serde(serialize_with = "crate::wire_revision::serialize")]
     pub logic_revision: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -134,9 +172,11 @@ pub enum LogicExecutionStatus {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ExecutionRecord {
+    pub block_id: String,
     pub execution_id: u64,
     pub time_ms: u64,
     pub duration_us: u64,
+    #[serde(serialize_with = "crate::wire_revision::serialize")]
     pub logic_revision: u64,
     pub status: LogicExecutionStatus,
     pub trigger: LogicalTriggerRecord,
@@ -191,7 +231,10 @@ impl Serialize for LogicalTriggerRecord {
                 map.serialize_entry("late_by_ms", &value)?;
             }
             if let Some(value) = self.scheduled_logic_revision {
-                map.serialize_entry("scheduled_logic_revision", &value)?;
+                map.serialize_entry(
+                    "scheduled_logic_revision",
+                    &crate::wire_revision::Value(value),
+                )?;
             }
         } else {
             map.serialize_entry("endpoint", &self.endpoint)?;
@@ -221,6 +264,7 @@ pub struct LogicErrorRecord {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LogicalEffectRecord {
+    pub block_id: String,
     pub endpoint: String,
     pub destination: String,
     pub dpt: DptMessage,
@@ -250,6 +294,8 @@ pub struct LogicalTimerEffectRecord {
 /// live execution IDs and timestamps because no live diagnostic record exists.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SimulationResponse {
+    pub block_id: String,
+    #[serde(serialize_with = "crate::wire_revision::serialize")]
     pub logic_revision: u64,
     pub duration_us: u64,
     pub status: LogicExecutionStatus,
@@ -276,6 +322,8 @@ pub enum WriteStatus {
 pub struct WriteSnapshot {
     pub status: WriteStatus,
     pub request_id: Option<u64>,
+    pub block_id: Option<String>,
+    pub execution_id: Option<u64>,
     pub value: Option<ValueMessage>,
     pub error: Option<String>,
 }
@@ -355,6 +403,10 @@ struct Inner {
     logs: VecDeque<LogRecord>,
     journal: VecDeque<DiagnosticUpdate>,
     pending_writes: BTreeMap<u64, WriteState>,
+    blocks: BTreeMap<String, BlockDiagnosticState>,
+    block_order: Vec<String>,
+    block_automation: BTreeMap<String, AutomationSnapshot>,
+    block_endpoint_values: BTreeMap<(String, EndpointName), EndpointValueState>,
 }
 #[derive(Clone, Debug)]
 struct EndpointValueState {
@@ -367,22 +419,71 @@ struct EndpointValueState {
 #[derive(Clone, Debug)]
 struct WriteState;
 
+#[derive(Clone, Debug)]
+struct BlockDiagnosticState {
+    active_enabled: bool,
+    saved_enabled: bool,
+    active_logic_revision: u64,
+    saved_logic_revision: u64,
+    source: String,
+    state: BTreeMap<String, StateValueRecord>,
+    pending_timers: Vec<PendingTimerRecord>,
+    executions: VecDeque<ExecutionRecord>,
+    last_result: Option<LastResultSnapshot>,
+}
+
 impl DiagnosticStore {
     pub fn new(runtime: &AutomationRuntime, automation_path: PathBuf, revision: u64) -> Self {
         let (events, _) = broadcast::channel(JOURNAL_CAPACITY);
         let mut endpoint_values = BTreeMap::new();
-        for endpoint in runtime.engine_config.endpoints.iter() {
-            let address = runtime.endpoint_to_address[&endpoint.name];
-            endpoint_values.insert(
-                endpoint.name.clone(),
-                EndpointValueState {
+        let mut block_endpoint_values = BTreeMap::new();
+        let mut blocks = BTreeMap::new();
+        let mut block_automation = BTreeMap::new();
+        for block in &runtime.blocks {
+            let source = runtime
+                .document
+                .blocks
+                .iter()
+                .find(|candidate| candidate.id == block.id)
+                .map(|candidate| candidate.source.clone())
+                .unwrap_or_default();
+            let revision = block.revision;
+            blocks.insert(
+                block.id.clone(),
+                BlockDiagnosticState {
+                    active_enabled: block.enabled,
+                    saved_enabled: block.enabled,
+                    active_logic_revision: revision,
+                    saved_logic_revision: revision,
+                    source,
+                    state: BTreeMap::new(),
+                    pending_timers: Vec::new(),
+                    executions: VecDeque::new(),
+                    last_result: None,
+                },
+            );
+            block_automation.insert(block.id.clone(), block_automation_snapshot(runtime, block));
+            for endpoint in block.engine_config.endpoints.iter() {
+                let Some(address) = block.endpoint_to_address.get(&endpoint.name).copied() else {
+                    continue;
+                };
+                // The legacy global value projection is retained for the
+                // desktop shell while block snapshots carry the authoritative
+                // identity. Repeated local names intentionally overwrite this
+                // compatibility view; block-local diagnostics never do.
+                let endpoint_state = EndpointValueState {
                     direction: endpoint.direction,
                     dpt: endpoint.dpt,
                     address,
                     observed: None,
                     requested: None,
-                },
-            );
+                };
+                block_endpoint_values.insert(
+                    (block.id.clone(), endpoint.name.clone()),
+                    endpoint_state.clone(),
+                );
+                endpoint_values.insert(endpoint.name.clone(), endpoint_state);
+            }
         }
         let automation = automation_snapshot(runtime);
         Self {
@@ -398,11 +499,21 @@ impl DiagnosticStore {
                 last_write: WriteSnapshot {
                     status: WriteStatus::Idle,
                     request_id: None,
+                    block_id: None,
+                    execution_id: None,
                     value: None,
                     error: None,
                 },
-                active_logic_revision: runtime.document_revision,
-                saved_logic_revision: runtime.document_revision,
+                active_logic_revision: runtime
+                    .blocks
+                    .first()
+                    .map(|block| block.revision)
+                    .unwrap_or(1),
+                saved_logic_revision: runtime
+                    .blocks
+                    .first()
+                    .map(|block| block.revision)
+                    .unwrap_or(1),
                 active_structural_revision: runtime.structural_revision,
                 saved_structural_revision: runtime.structural_revision,
                 restart_required: false,
@@ -414,6 +525,14 @@ impl DiagnosticStore {
                 logs: VecDeque::new(),
                 journal: VecDeque::new(),
                 pending_writes: BTreeMap::new(),
+                blocks,
+                block_order: runtime
+                    .blocks
+                    .iter()
+                    .map(|block| block.id.clone())
+                    .collect(),
+                block_automation,
+                block_endpoint_values,
             })),
             events,
             origin: Instant::now(),
@@ -484,6 +603,33 @@ impl DiagnosticStore {
         inner.saved_logic_revision = logic_revision;
         inner.saved_structural_revision = structural_revision;
         inner.restart_required = restart_required;
+        self.publish_locked(&mut inner);
+    }
+
+    pub fn set_saved_document_state(
+        &self,
+        automation_revision: u64,
+        structural_revision: u64,
+        restart_required: bool,
+        document: &crate::AutomationDocument,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.saved_automation_revision = automation_revision;
+        inner.saved_structural_revision = structural_revision;
+        inner.restart_required = restart_required;
+        for candidate in &document.blocks {
+            if let Some(block) = inner.blocks.get_mut(&candidate.id) {
+                block.saved_enabled = candidate.enabled;
+                block.saved_logic_revision = candidate.revision.max(1);
+                if !restart_required {
+                    block.active_logic_revision = candidate.revision.max(1);
+                    block.active_enabled = candidate.enabled;
+                }
+            }
+        }
         self.publish_locked(&mut inner);
     }
     pub fn set_active_logic(&self, logic_revision: u64, source: impl Into<String>) {
@@ -575,6 +721,247 @@ impl DiagnosticStore {
                 .collect(),
         );
     }
+
+    /// Projects all portable block state into the browser diagnostics view.
+    /// Runtime state remains owned by the core; this method only copies its
+    /// immutable snapshot into bounded dashboard data.
+    pub fn set_runtime_projection_from_runtime(
+        &self,
+        runtime: &Runtime,
+        now: logiksmith_core::MonotonicMs,
+    ) {
+        let snapshot = runtime.snapshot_at(now);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for block in snapshot.blocks {
+            let id = block.id.to_string();
+            let revision = inner
+                .blocks
+                .get(&id)
+                .map(|current| current.active_logic_revision)
+                .unwrap_or(1);
+            let entry = inner
+                .blocks
+                .entry(id.clone())
+                .or_insert_with(|| BlockDiagnosticState {
+                    active_enabled: block.enabled,
+                    saved_enabled: block.enabled,
+                    active_logic_revision: revision,
+                    saved_logic_revision: revision,
+                    source: String::new(),
+                    state: BTreeMap::new(),
+                    pending_timers: Vec::new(),
+                    executions: VecDeque::new(),
+                    last_result: None,
+                });
+            entry.active_enabled = block.enabled;
+            entry.state = state_record(&block.state);
+            entry.pending_timers = block
+                .pending_timers
+                .iter()
+                .map(|timer| pending_timer_record(timer, revision))
+                .collect();
+            for input in block.inputs {
+                if let Some(value) = input.value {
+                    if let Some(state) = inner
+                        .block_endpoint_values
+                        .get_mut(&(id.clone(), input.endpoint.clone()))
+                    {
+                        state.observed = Some(ValueMessage::from_core(value));
+                    }
+                }
+            }
+        }
+        let first_revision = inner
+            .blocks
+            .values()
+            .next()
+            .map(|block| block.active_logic_revision);
+        if let Some(first_revision) = first_revision {
+            inner.active_logic_revision = first_revision;
+            inner.active_automation_revision = first_revision;
+        }
+        self.publish_locked(&mut inner);
+    }
+
+    /// Records one tagged execution in the owning block's bounded history.
+    pub fn record_block_execution(
+        &self,
+        execution: &BlockExecution,
+        now: logiksmith_core::MonotonicMs,
+        duration_us: u64,
+        automation: &AutomationRuntime,
+    ) {
+        let block_id = execution.block_id.to_string();
+        let semantic = &execution.execution;
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let revision = crate::block_revision(&automation.document, &block_id);
+        let (status, effects, transition, error) = match &semantic.outcome {
+            Ok(effects) => (
+                LogicExecutionStatus::Succeeded,
+                effects
+                    .outputs
+                    .iter()
+                    .filter_map(|effect| {
+                        effect_record_for_block(effect, automation, &execution.block_id)
+                    })
+                    .collect(),
+                Some(transition_record_for_block(
+                    effects,
+                    automation,
+                    &execution.block_id,
+                )),
+                None,
+            ),
+            Err(error) => (
+                LogicExecutionStatus::Failed,
+                Vec::new(),
+                None,
+                Some(logic_error_record(error)),
+            ),
+        };
+        let execution_id = inner.next_execution_id;
+        inner.next_execution_id = inner.next_execution_id.saturating_add(1);
+        let first_block_id = inner.blocks.keys().next().cloned();
+        let record = ExecutionRecord {
+            block_id: execution.block_id.to_string(),
+            execution_id,
+            time_ms: now.0,
+            duration_us,
+            logic_revision: revision,
+            status,
+            trigger: trigger_record(&semantic.trigger, revision),
+            inputs: semantic.inputs.iter().map(input_snapshot_record).collect(),
+            state_before: state_record(&semantic.state_before),
+            state_after: state_record(&semantic.state_after),
+            timer_effects: transition
+                .as_ref()
+                .map(|transition| transition.timers.clone())
+                .unwrap_or_default(),
+            transition,
+            effects,
+            error: error.clone(),
+        };
+        let (block_revision, block_state, block_pending, block_executions) = {
+            let block =
+                inner
+                    .blocks
+                    .entry(block_id.clone())
+                    .or_insert_with(|| BlockDiagnosticState {
+                        active_enabled: true,
+                        saved_enabled: true,
+                        active_logic_revision: revision,
+                        saved_logic_revision: revision,
+                        source: String::new(),
+                        state: BTreeMap::new(),
+                        pending_timers: Vec::new(),
+                        executions: VecDeque::new(),
+                        last_result: None,
+                    });
+            block.active_logic_revision = revision;
+            block.state = record.state_after.clone();
+            block.pending_timers = semantic
+                .pending_timers
+                .iter()
+                .map(|timer| pending_timer_record(timer, revision))
+                .collect();
+            block.last_result = Some(LastResultSnapshot {
+                status,
+                execution_id,
+                time_ms: now.0,
+                error,
+            });
+            block.executions.push_back(record);
+            while block.executions.len() > MAX_EXECUTIONS {
+                block.executions.pop_front();
+            }
+            (
+                block.active_logic_revision,
+                block.state.clone(),
+                block.pending_timers.clone(),
+                block.executions.clone(),
+            )
+        };
+        if first_block_id.as_deref() == Some(block_id.as_str()) {
+            inner.active_logic_revision = block_revision;
+            inner.active_automation_revision = block_revision;
+            inner.state = block_state;
+            inner.pending_timers = block_pending;
+            inner.executions = block_executions;
+        }
+        self.publish_locked(&mut inner);
+    }
+
+    /// Applies the core's atomic source/enabled activation result to
+    /// diagnostics. No block is updated if core activation failed.
+    pub fn record_runtime_activation(
+        &self,
+        document_revision: u64,
+        activation: &logiksmith_core::ActivationResult,
+        runtime: &Runtime,
+        automation: &AutomationRuntime,
+    ) {
+        let snapshot = runtime.snapshot();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for result in &activation.blocks {
+            let id = result.block_id.to_string();
+            let Some(block) = inner.blocks.get_mut(&id) else {
+                continue;
+            };
+            block.active_enabled = result.enabled;
+            block.active_logic_revision = crate::block_revision(&automation.document, &id);
+            if let Ok(core_id) = id.parse::<logiksmith_core::BlockId>()
+                && let Some(core_block) = runtime.block(&core_id)
+            {
+                block.source = core_block.logic_program().source().to_owned();
+            } else if let Some(document_block) = automation
+                .document
+                .blocks
+                .iter()
+                .find(|candidate| candidate.id == id)
+            {
+                block.source = document_block.source.clone();
+            }
+            if !result.cancelled_timers.is_empty() {
+                let mut fields = BTreeMap::new();
+                fields.insert("block_id".to_owned(), id.clone());
+                fields.insert(
+                    "cancelled_timers".to_owned(),
+                    result
+                        .cancelled_timers
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                inner.logs.push_back(LogRecord {
+                    time_ms: self.now().0,
+                    level: "info".to_owned(),
+                    target: "logiksmith".to_owned(),
+                    message: "block activation cancelled pending timers".to_owned(),
+                    fields,
+                });
+                while inner.logs.len() > MAX_LOGS {
+                    inner.logs.pop_front();
+                }
+            }
+        }
+        inner.saved_automation_revision = document_revision;
+        drop(inner);
+        self.set_runtime_projection_from_runtime(
+            runtime,
+            runtime.last_accepted_at().unwrap_or_default(),
+        );
+        let _ = snapshot;
+    }
     /// Stores one immutable semantic core execution with host-only timing and
     /// resolved KNX destinations. The core outcome is intentionally handled
     /// here so zero-effect successes and contained Lua failures are retained.
@@ -620,6 +1007,11 @@ impl DiagnosticStore {
             ),
         };
         inner.executions.push_back(ExecutionRecord {
+            block_id: automation
+                .blocks
+                .first()
+                .map(|block| block.id.clone())
+                .unwrap_or_default(),
             execution_id,
             time_ms: now.0,
             duration_us,
@@ -669,6 +1061,15 @@ impl DiagnosticStore {
         {
             state.observed = Some(value.clone());
         }
+        if let Some(value) = telegram.value.as_ref()
+            && let Ok(address) = telegram.destination.parse::<GroupAddress>()
+        {
+            for state in inner.block_endpoint_values.values_mut() {
+                if state.address == address && state.direction == EndpointDirection::Input {
+                    state.observed = Some(value.clone());
+                }
+            }
+        }
         inner.telegrams.push_back(telegram);
         while inner.telegrams.len() > MAX_TELEGRAMS {
             inner.telegrams.pop_front();
@@ -678,6 +1079,7 @@ impl DiagnosticStore {
     pub fn record_write_requested(
         &self,
         request_id: u64,
+        block_id: &logiksmith_core::BlockId,
         endpoint: EndpointName,
         destination: GroupAddress,
         dpt: Dpt,
@@ -688,12 +1090,25 @@ impl DiagnosticStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let value = ValueMessage::from_core(value);
+        let execution_id = inner
+            .blocks
+            .get(block_id.as_str())
+            .and_then(|block| block.last_result.as_ref())
+            .map(|result| result.execution_id);
+        if let Some(block_state) = inner
+            .block_endpoint_values
+            .get_mut(&(block_id.to_string(), endpoint.clone()))
+        {
+            block_state.requested = Some(value.clone());
+        }
         if let Some(state) = inner.endpoint_values.get_mut(&endpoint) {
             state.requested = Some(value.clone());
             if state.address == destination && state.direction == EndpointDirection::Output {
                 inner.last_write = WriteSnapshot {
                     status: WriteStatus::Pending,
                     request_id: Some(request_id),
+                    block_id: Some(block_id.to_string()),
+                    execution_id,
                     value: Some(value.clone()),
                     error: None,
                 };
@@ -853,6 +1268,64 @@ pub fn simulation_response(
         ),
     };
     SimulationResponse {
+        block_id: automation
+            .blocks
+            .first()
+            .map(|block| block.id.clone())
+            .unwrap_or_default(),
+        logic_revision,
+        duration_us,
+        status,
+        trigger: trigger_record(&execution.trigger, logic_revision),
+        inputs: execution.inputs.iter().map(input_snapshot_record).collect(),
+        state_before: state_record(&execution.state_before),
+        state_after: state_record(&execution.state_after),
+        transition: transition.clone(),
+        pending_timers: execution
+            .pending_timers
+            .iter()
+            .map(|timer| pending_timer_record(timer, logic_revision))
+            .collect(),
+        effects,
+        timer_effects: transition
+            .as_ref()
+            .map(|transition| transition.timers.clone())
+            .unwrap_or_default(),
+        error,
+    }
+}
+
+pub fn simulation_response_for_block(
+    tagged: &BlockExecution,
+    duration_us: u64,
+    logic_revision: u64,
+    automation: &AutomationRuntime,
+) -> SimulationResponse {
+    let execution = &tagged.execution;
+    let (status, effects, transition, error) = match &execution.outcome {
+        Ok(effects) => (
+            LogicExecutionStatus::Succeeded,
+            effects
+                .outputs
+                .iter()
+                .filter_map(|effect| effect_record_for_block(effect, automation, &tagged.block_id))
+                .collect(),
+            Some(transition_record_for_block(
+                effects,
+                automation,
+                &tagged.block_id,
+            )),
+            None,
+        ),
+        Err(error) => (
+            LogicExecutionStatus::Failed,
+            Vec::new(),
+            None,
+            Some(logic_error_record(error)),
+        ),
+    };
+    SimulationResponse {
+        block_id: tagged.block_id.to_string(),
         logic_revision,
         duration_us,
         status,
@@ -889,11 +1362,24 @@ fn effect_record(
     effect: &OutputEffect,
     automation: &AutomationRuntime,
 ) -> Option<LogicalEffectRecord> {
+    let block_id = automation.blocks.first().map(|block| block.id.as_str())?;
+    effect_record_for_block(effect, automation, &block_id.parse().ok()?)
+}
+
+fn effect_record_for_block(
+    effect: &OutputEffect,
+    automation: &AutomationRuntime,
+    block_id: &logiksmith_core::BlockId,
+) -> Option<LogicalEffectRecord> {
     let endpoint = &effect.endpoint;
     let value = effect.value;
     Some(LogicalEffectRecord {
+        block_id: block_id.to_string(),
         endpoint: endpoint.to_string(),
-        destination: automation.endpoint_to_address.get(endpoint)?.to_string(),
+        destination: automation
+            .output_to_address
+            .get(&(block_id.to_string(), endpoint.clone()))?
+            .to_string(),
         dpt: DptMessage::from_core(value.dpt),
         value: ValueMessage::from_core(value),
     })
@@ -940,46 +1426,71 @@ fn transition_record(
     transition: &logiksmith_core::Transition,
     automation: &AutomationRuntime,
 ) -> LogicalTransitionRecord {
+    let Some(block_id) = automation
+        .blocks
+        .first()
+        .and_then(|block| block.id.parse::<logiksmith_core::BlockId>().ok())
+    else {
+        return LogicalTransitionRecord {
+            state: state_record(&transition.state),
+            effects: Vec::new(),
+            timers: transition_timer_records(transition),
+        };
+    };
+    transition_record_for_block(transition, automation, &block_id)
+}
+
+fn transition_record_for_block(
+    transition: &logiksmith_core::Transition,
+    automation: &AutomationRuntime,
+    block_id: &logiksmith_core::BlockId,
+) -> LogicalTransitionRecord {
     LogicalTransitionRecord {
         state: state_record(&transition.state),
         effects: transition
             .outputs
             .iter()
-            .filter_map(|effect| effect_record(effect, automation))
+            .filter_map(|effect| effect_record_for_block(effect, automation, block_id))
             .collect(),
-        timers: transition
-            .timers
-            .iter()
-            .map(|effect| {
-                let (action, after_ms, previous_due_at_ms, due_at_ms) = match effect.action {
-                    TimerAction::Scheduled { after_ms, due_at } => {
-                        ("scheduled", Some(after_ms), None, Some(due_at.0))
-                    }
-                    TimerAction::Replaced {
-                        previous_due_at,
-                        after_ms,
-                        due_at,
-                    } => (
-                        "replaced",
-                        Some(after_ms),
-                        Some(previous_due_at.0),
-                        Some(due_at.0),
-                    ),
-                    TimerAction::Cancelled { previous_due_at } => {
-                        ("cancelled", None, Some(previous_due_at.0), None)
-                    }
-                    TimerAction::CancelNoop => ("cancel_noop", None, None, None),
-                };
-                LogicalTimerEffectRecord {
-                    name: effect.name.to_string(),
-                    action: action.to_owned(),
-                    after_ms,
-                    previous_due_at_ms,
-                    due_at_ms,
-                }
-            })
-            .collect(),
+        timers: transition_timer_records(transition),
     }
+}
+
+fn transition_timer_records(
+    transition: &logiksmith_core::Transition,
+) -> Vec<LogicalTimerEffectRecord> {
+    transition
+        .timers
+        .iter()
+        .map(|effect| {
+            let (action, after_ms, previous_due_at_ms, due_at_ms) = match effect.action {
+                TimerAction::Scheduled { after_ms, due_at } => {
+                    ("scheduled", Some(after_ms), None, Some(due_at.0))
+                }
+                TimerAction::Replaced {
+                    previous_due_at,
+                    after_ms,
+                    due_at,
+                } => (
+                    "replaced",
+                    Some(after_ms),
+                    Some(previous_due_at.0),
+                    Some(due_at.0),
+                ),
+                TimerAction::Cancelled { previous_due_at } => {
+                    ("cancelled", None, Some(previous_due_at.0), None)
+                }
+                TimerAction::CancelNoop => ("cancel_noop", None, None, None),
+            };
+            LogicalTimerEffectRecord {
+                name: effect.name.to_string(),
+                action: action.to_owned(),
+                after_ms,
+                previous_due_at_ms,
+                due_at_ms,
+            }
+        })
+        .collect()
 }
 
 fn logic_error_record(error: &logiksmith_core::LogicError) -> LogicErrorRecord {
@@ -998,25 +1509,42 @@ fn logic_error_record(error: &logiksmith_core::LogicError) -> LogicErrorRecord {
     }
 }
 fn automation_snapshot(runtime: &AutomationRuntime) -> AutomationSnapshot {
+    let Some(block) = runtime.blocks.first() else {
+        return AutomationSnapshot {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            knx_bindings: Vec::new(),
+            logic: LogicSourceSnapshot {
+                source: String::new(),
+            },
+        };
+    };
+    block_automation_snapshot(runtime, block)
+}
+
+fn block_automation_snapshot(
+    runtime: &AutomationRuntime,
+    block: &crate::BlockRuntime,
+) -> AutomationSnapshot {
     let endpoint = |name: &str, dpt: Dpt| EndpointSnapshot {
         name: name.to_owned(),
         dpt: DptMessage::from_core(dpt),
     };
-    let inputs = runtime
+    let inputs = block
         .engine_config
         .endpoints
         .iter()
         .filter(|item| item.direction == EndpointDirection::Input)
         .map(|item| endpoint(item.name.as_str(), item.dpt))
         .collect();
-    let outputs = runtime
+    let outputs = block
         .engine_config
         .endpoints
         .iter()
         .filter(|item| item.direction == EndpointDirection::Output)
         .map(|item| endpoint(item.name.as_str(), item.dpt))
         .collect();
-    let mut knx_bindings: Vec<_> = runtime
+    let mut knx_bindings: Vec<_> = block
         .endpoint_to_address
         .iter()
         .map(|(endpoint, address)| BindingSnapshot {
@@ -1030,7 +1558,7 @@ fn automation_snapshot(runtime: &AutomationRuntime) -> AutomationSnapshot {
         outputs,
         knx_bindings,
         logic: LogicSourceSnapshot {
-            source: runtime.document.logic.source.clone(),
+            source: runtime.document.blocks[0].source.clone(),
         },
     }
 }
@@ -1048,6 +1576,57 @@ fn snapshot_locked(inner: &Inner, _now: logiksmith_core::MonotonicMs) -> Snapsho
             })
             .collect(),
     };
+    let blocks = inner
+        .block_order
+        .iter()
+        .filter_map(|id| inner.blocks.get(id).map(|state| (id, state)))
+        .map(|(id, state)| {
+            let automation = inner.block_automation.get(id);
+            BlockSnapshot {
+                id: id.clone(),
+                active_enabled: state.active_enabled,
+                saved_enabled: state.saved_enabled,
+                active_revision: state.active_logic_revision,
+                saved_revision: state.saved_logic_revision,
+                active_logic_revision: state.active_logic_revision,
+                saved_logic_revision: state.saved_logic_revision,
+                source: if state.source.is_empty() {
+                    automation
+                        .map(|automation| automation.logic.source.clone())
+                        .unwrap_or_default()
+                } else {
+                    state.source.clone()
+                },
+                inputs: automation
+                    .map(|automation| automation.inputs.clone())
+                    .unwrap_or_default(),
+                outputs: automation
+                    .map(|automation| automation.outputs.clone())
+                    .unwrap_or_default(),
+                knx_bindings: automation
+                    .map(|automation| automation.knx_bindings.clone())
+                    .unwrap_or_default(),
+                values: ValuesSnapshot {
+                    endpoints: inner
+                        .block_endpoint_values
+                        .iter()
+                        .filter(|((block_id, _), _)| block_id == id)
+                        .map(|((_, name), state)| EndpointValueSnapshot {
+                            name: name.to_string(),
+                            direction: state.direction.to_string(),
+                            dpt: DptMessage::from_core(state.dpt),
+                            observed: state.observed.clone(),
+                            requested: state.requested.clone(),
+                        })
+                        .collect(),
+                },
+                state: state.state.clone(),
+                pending_timers: state.pending_timers.clone(),
+                executions: state.executions.iter().rev().cloned().collect(),
+                last_result: state.last_result.clone(),
+            }
+        })
+        .collect();
     Snapshot {
         revision: inner.revision,
         connection: ConnectionSnapshot {
@@ -1076,6 +1655,7 @@ fn snapshot_locked(inner: &Inner, _now: logiksmith_core::MonotonicMs) -> Snapsho
         },
         telegrams: inner.telegrams.iter().cloned().collect(),
         logs: inner.logs.iter().cloned().collect(),
+        blocks,
     }
 }
 
