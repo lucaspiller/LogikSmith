@@ -12,6 +12,10 @@ if [ ! -f config/local.toml ]; then
     echo "error: config/local.toml is missing; copy config/local.toml.example and edit it first" >&2
     exit 1
 fi
+if [ ! -f config/automation.toml ]; then
+    echo "error: config/automation.toml is missing; copy config/automation.toml.example and edit it first" >&2
+    exit 1
+fi
 if [ ! -x .venv/bin/python ]; then
     echo "error: .venv/bin/python is missing; run ./scripts/bootstrap.sh first" >&2
     exit 1
@@ -22,4 +26,4 @@ if [ ! -d logiksmith-web/node_modules ]; then
 fi
 mise exec -- npm --prefix logiksmith-web run build
 
-exec mise exec -- cargo run -p logiksmith-desktop -- --config config/local.toml
+exec mise exec -- cargo run -p logiksmith-desktop -- --config config/local.toml --automation config/automation.toml

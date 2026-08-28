@@ -16,8 +16,9 @@ fn temporary_path(suffix: &str) -> PathBuf {
 }
 
 #[tokio::test]
-async fn fake_bridge_drives_on_then_timer_off() {
+async fn fake_bridge_drives_lua_outputs() {
     let config_path = temporary_path("config.toml");
+    let automation_path = temporary_path("automation.toml");
     let marker_path = temporary_path("writes.log");
     let web_port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -33,13 +34,6 @@ connection_type = "tunneling"
 gateway_ip = "192.0.2.1"
 gateway_port = 3671
 
-[poc]
-input_group_address = "2/2/52"
-input_dpt = "1.001"
-output_group_address = "2/3/52"
-output_dpt = "1.001"
-off_delay_ms = 30
-
 [bridge]
 python = "/bin/sh"
 
@@ -54,6 +48,54 @@ listen_port = {web_port}
         ),
     )
     .unwrap();
+    fs::write(
+        &automation_path,
+        r#"
+[[inputs]]
+name = "wall_switch"
+dpt = "1.001"
+
+[[inputs]]
+name = "dimmer_level"
+dpt = "5.001"
+
+[[outputs]]
+name = "test_light"
+dpt = "1.001"
+
+[[outputs]]
+name = "dimmer_output"
+dpt = "5.001"
+
+[[knx_bindings]]
+endpoint = "wall_switch"
+group_address = "2/2/52"
+
+[[knx_bindings]]
+endpoint = "dimmer_level"
+group_address = "2/2/53"
+
+[[knx_bindings]]
+endpoint = "test_light"
+group_address = "2/3/52"
+
+[[knx_bindings]]
+endpoint = "dimmer_output"
+group_address = "2/3/53"
+
+[logic]
+source = '''
+function handle(event, input)
+  if event.input == "wall_switch" and event.value == true then
+    return { outputs = { test_light = input.dimmer_level == 42 } }
+  elseif event.input == "dimmer_level" then
+    return { outputs = { dimmer_output = event.value } }
+  end
+end
+'''
+"#,
+    )
+    .unwrap();
 
     let marker = marker_path.to_str().unwrap();
     let fixture = format!(
@@ -63,13 +105,15 @@ while IFS= read -r line; do
   case "$line" in
     *'"type":"configure"'*)
       printf '%s\n' '{{"v":1,"type":"ready","transport":"knxip_tunneling","gateway":"192.0.2.1"}}'
+      printf '%s\n' '{{"v":1,"type":"knx_event","source":"1.1.42","destination":"2/2/53","service":"group_value_response","dpt":{{"major":5,"subtype":1}},"value":{{"kind":"percent","value":42}}}}'
       printf '%s\n' '{{"v":1,"type":"knx_event","source":"1.1.42","destination":"2/2/52","service":"group_value_write","dpt":{{"major":1,"subtype":1}},"value":{{"kind":"bool","value":true}}}}'
+      printf '%s\n' '{{"v":1,"type":"knx_event","source":"1.1.42","destination":"2/2/53","service":"group_value_write","dpt":{{"major":5,"subtype":1}},"value":{{"kind":"percent","value":42}}}}'
       ;;
     *'"type":"knx_write"'*'"value":{{"kind":"bool","value":true}}'*)
       printf '%s\n' on >> '{marker}'
       ;;
-    *'"type":"knx_write"'*'"value":{{"kind":"bool","value":false}}'*)
-      printf '%s\n' off >> '{marker}'
+    *'"type":"knx_write"'*'"value":{{"kind":"percent","value":42}}'*)
+      printf '%s\n' percent >> '{marker}'
       printf '%s\n' '{{"v":1,"type":"fatal","code":"test_complete","message":"fake bridge observed both writes"}}'
       exit 0
       ;;
@@ -79,7 +123,7 @@ done
 "#
     );
 
-    let config = load_config(&config_path).unwrap();
+    let config = load_config(&config_path, &automation_path).unwrap();
     let result = run_with_bridge(
         config,
         BridgeCommand::new(
@@ -94,7 +138,8 @@ done
     ));
 
     let writes = fs::read_to_string(&marker_path).unwrap();
-    assert_eq!(writes, "on\noff\n");
+    assert_eq!(writes, "on\npercent\n");
     let _ = fs::remove_file(config_path);
+    let _ = fs::remove_file(automation_path);
     let _ = fs::remove_file(marker_path);
 }

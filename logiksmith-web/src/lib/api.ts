@@ -1,6 +1,12 @@
 import type {
   ConnectionState,
   DashboardEvent,
+  DisplayAutomation,
+  DisplayBinding,
+  DisplayEndpoint,
+  DisplayLogicEffect,
+  DisplayLogicError,
+  DisplayLogicExecution,
   DisplayLog,
   DisplaySnapshot,
   DisplayTelegram,
@@ -96,7 +102,7 @@ function dpt(value: unknown, path: string): string {
 function endpoint(value: unknown, path: string): { address: string; dpt: string } {
   const record = object(value, path);
   return {
-    address: stringValue(required(field(record, path, 'address'), `${path}.address`), `${path}.address`),
+    address: field(record, path, 'address', 'group_address', 'groupAddress') === undefined ? '' : stringValue(field(record, path, 'address', 'group_address', 'groupAddress'), `${path}.address`),
     dpt: dpt(required(field(record, path, 'dpt'), `${path}.dpt`), `${path}.dpt`)
   };
 }
@@ -110,9 +116,26 @@ function connection(value: unknown): { state: ConnectionState } {
   return { state: state as ConnectionState };
 }
 
-function valueFrom(value: unknown, path: string, name: string): boolean | null {
-  if (isObject(value)) return nullableBoolean(field(value, path, name, 'value'), `${path}.${name}`);
-  return nullableBoolean(value, path);
+function displayValue(value: unknown, path: string): boolean | number | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (isObject(value)) {
+    const kind = field(value, path, 'kind');
+    const raw = field(value, path, 'value', 'data');
+    if (kind === 'bool') return nullableBoolean(raw, `${path}.value`);
+    if (kind === 'percent') {
+      const percentage = nonNegativeNumber(raw, `${path}.value`);
+      if (percentage > 100) throw new ApiDecodeError(`${path}.value`, 'percentage must be between 0 and 100');
+      return percentage;
+    }
+  }
+  throw new ApiDecodeError(path, 'expected a boolean, percentage, or null');
+}
+
+function valueFrom(value: unknown, path: string, name: string): boolean | number | null {
+  if (isObject(value)) return displayValue(field(value, path, name, 'value'), `${path}.${name}`);
+  return displayValue(value, path);
 }
 
 function timer(value: unknown, receivedAtMs: number): DisplayTimer {
@@ -176,7 +199,7 @@ function write(value: unknown): DisplayWrite {
   return {
     status,
     requestId,
-    value: nullableBoolean(field(record, 'write', 'value'), 'write.value'),
+    value: displayValue(field(record, 'write', 'value'), 'write.value'),
     error: optionalString(field(record, 'write', 'error'), 'write.error')
   };
 }
@@ -186,35 +209,202 @@ function array(value: unknown, path: string): unknown[] {
   return value;
 }
 
+function optionalRevision(value: unknown, path: string): number | null {
+  return value === undefined || value === null ? null : revision(value, path);
+}
+
+function displayEndpoint(value: unknown, path: string, direction: 'input' | 'output', bindings: Map<string, string>, values: Map<string, { observed: boolean | number | null; requested: boolean | number | null }>): DisplayEndpoint {
+  const source = object(value, path);
+  const nameRaw = field(source, path, 'name', 'endpoint');
+  const name = nameRaw === undefined || nameRaw === null ? undefined : stringValue(nameRaw, `${path}.name`);
+  const bindingRaw = field(source, path, 'binding');
+  const binding = isObject(bindingRaw) ? object(bindingRaw, `${path}.binding`) : null;
+  const addressRaw = field(source, path, 'address', 'group_address', 'groupAddress') ?? (typeof bindingRaw === 'string' ? bindingRaw : binding ? field(binding, `${path}.binding`, 'address', 'group_address', 'groupAddress') : undefined);
+  const mappedValue = name ? values.get(name) : undefined;
+  return {
+    ...(name ? { name } : {}),
+    address: addressRaw === undefined || addressRaw === null ? (name ? bindings.get(name) ?? '' : '') : stringValue(addressRaw, `${path}.address`),
+    dpt: dpt(required(field(source, path, 'dpt'), `${path}.dpt`), `${path}.dpt`),
+    direction,
+    observed: mappedValue?.observed ?? displayValue(field(source, path, 'observed'), `${path}.observed`),
+    requested: direction === 'output' ? mappedValue?.requested ?? displayValue(field(source, path, 'requested'), `${path}.requested`) : undefined
+  };
+}
+
+function endpointValues(values: JsonObject): Map<string, { observed: boolean | number | null; requested: boolean | number | null }> {
+  const result = new Map<string, { observed: boolean | number | null; requested: boolean | number | null }>();
+  const raw = field(values, 'values', 'endpoints', 'endpoint_values', 'endpointValues');
+  const groups: Array<[string, unknown]> = [['inputs', field(values, 'values', 'inputs')], ['outputs', field(values, 'values', 'outputs')]].filter((entry): entry is [string, unknown] => entry[1] !== undefined);
+  const add = (name: string, value: unknown, path: string): void => {
+    const source = isObject(value) ? value : { observed: value };
+    result.set(name, {
+      observed: displayValue(field(source, path, 'observed', 'value'), `${path}.observed`),
+      requested: displayValue(field(source, path, 'requested'), `${path}.requested`)
+    });
+  };
+  if (isObject(raw)) {
+    for (const [name, value] of Object.entries(raw)) {
+      add(name, value, `values.endpoints.${name}`);
+    }
+  } else if (Array.isArray(raw)) {
+    raw.forEach((value, index) => {
+      const source = object(value, `values.endpoints[${index}]`);
+      const name = stringValue(required(field(source, `values.endpoints[${index}]`, 'name'), `values.endpoints[${index}].name`), `values.endpoints[${index}].name`);
+      add(name, source, `values.endpoints[${index}]`);
+    });
+  }
+  groups.forEach(([groupName, group]) => {
+    if (isObject(group)) {
+      Object.entries(group).forEach(([name, value]) => add(name, value, `values.${groupName}.${name}`));
+    } else if (Array.isArray(group)) {
+      group.forEach((value, index) => {
+        const source = object(value, `values.${groupName}[${index}]`);
+        const name = stringValue(required(field(source, `values.${groupName}[${index}]`, 'name', 'endpoint'), `values.${groupName}[${index}].name`), `values.${groupName}[${index}].name`);
+        add(name, source, `values.${groupName}[${index}]`);
+      });
+    }
+  });
+  return result;
+}
+
+function decodeDisplayAutomation(root: JsonObject, config: JsonObject, values: JsonObject): DisplayAutomation | undefined {
+  const nested = isObject(field(root, 'snapshot', 'automation')) ? object(field(root, 'snapshot', 'automation'), 'automation') : null;
+  const active = isObject(field(config, 'config', 'active')) ? object(field(config, 'config', 'active'), 'config.active') : null;
+  const source = nested ?? active ?? config;
+  const inputsRaw = field(source, 'automation', 'inputs') ?? field(root, 'snapshot', 'active_inputs', 'activeInputs');
+  const outputsRaw = field(source, 'automation', 'outputs') ?? field(root, 'snapshot', 'active_outputs', 'activeOutputs');
+  if (inputsRaw === undefined && outputsRaw === undefined) return undefined;
+  const bindings = new Map<string, string>();
+  const bindingsRaw = field(source, 'automation', 'knx_bindings', 'bindings') ?? field(config, 'config', 'knx_bindings', 'bindings');
+  if (bindingsRaw !== undefined) {
+    array(bindingsRaw, 'automation.knx_bindings').forEach((item, index) => {
+      const binding = object(item, `automation.knx_bindings[${index}]`);
+      const name = stringValue(required(field(binding, `automation.knx_bindings[${index}]`, 'endpoint'), `automation.knx_bindings[${index}].endpoint`), `automation.knx_bindings[${index}].endpoint`);
+      const address = stringValue(required(field(binding, `automation.knx_bindings[${index}]`, 'group_address', 'groupAddress', 'address'), `automation.knx_bindings[${index}].group_address`), `automation.knx_bindings[${index}].group_address`);
+      bindings.set(name, address);
+    });
+  }
+  const valuesByName = endpointValues(values);
+  const inputs = array(inputsRaw ?? [], 'automation.inputs').map((item, index) => displayEndpoint(item, `automation.inputs[${index}]`, 'input', bindings, valuesByName));
+  const outputs = array(outputsRaw ?? [], 'automation.outputs').map((item, index) => displayEndpoint(item, `automation.outputs[${index}]`, 'output', bindings, valuesByName));
+  const logicSource = field(source, 'automation', 'logic');
+  const logic = isObject(logicSource) ? stringValue(required(field(logicSource, 'automation.logic', 'source'), 'automation.logic.source'), 'automation.logic.source') : (typeof logicSource === 'string' ? logicSource : '');
+  return { inputs, outputs, bindings: [...bindings.entries()].map(([endpoint, groupAddress]) => ({ endpoint, groupAddress } as DisplayBinding)), source: logic };
+}
+
+function logicError(value: unknown, path: string): DisplayLogicError {
+  const source = object(value, path);
+  const category = stringValue(required(field(source, path, 'category', 'kind', 'type'), `${path}.category`), `${path}.category`);
+  const message = stringValue(required(field(source, path, 'message', 'error'), `${path}.message`), `${path}.message`);
+  const lineRaw = field(source, path, 'line', 'line_number', 'lineNumber');
+  const line = lineRaw === undefined || lineRaw === null ? null : revision(lineRaw, `${path}.line`);
+  return { category, message, line };
+}
+
+function logicExecution(value: unknown): DisplayLogicExecution {
+  if (value === undefined || value === null) return { status: 'idle', triggerInput: null, triggerValue: null, logicRevision: null, effectCount: 0, error: null };
+  const source = object(value, 'logic_execution');
+  const statusRaw = field(source, 'logic_execution', 'status', 'state') ?? 'idle';
+  const status = stringValue(statusRaw, 'logic_execution.status');
+  if (status !== 'idle' && status !== 'succeeded' && status !== 'failed') throw new ApiDecodeError('logic_execution.status', `unsupported status ${status}`);
+  const trigger = isObject(field(source, 'logic_execution', 'trigger')) ? object(field(source, 'logic_execution', 'trigger'), 'logic_execution.trigger') : null;
+  const triggerValueRaw = field(source, 'logic_execution', 'trigger_value', 'triggerValue', 'value') ?? (trigger ? field(trigger, 'logic_execution.trigger', 'value') : undefined);
+  const errorRaw = field(source, 'logic_execution', 'error', 'last_error');
+  return {
+    status,
+    triggerInput: optionalString(field(source, 'logic_execution', 'trigger_input', 'triggerInput', 'input') ?? (trigger ? field(trigger, 'logic_execution.trigger', 'endpoint', 'input', 'name') : undefined), 'logic_execution.trigger_input'),
+    triggerValue: triggerValueRaw === undefined ? null : displayValue(triggerValueRaw, 'logic_execution.trigger_value'),
+    logicRevision: optionalRevision(field(source, 'logic_execution', 'logic_revision', 'logicRevision', 'revision'), 'logic_execution.logic_revision'),
+    effectCount: nonNegativeNumber(field(source, 'logic_execution', 'effect_count', 'effectCount', 'effects_count') ?? 0, 'logic_execution.effect_count'),
+    error: errorRaw === undefined || errorRaw === null ? null : logicError(errorRaw, 'logic_execution.error')
+  };
+}
+
+function logicEffect(value: unknown, index: number): DisplayLogicEffect {
+  const path = `logic_effects[${index}]`;
+  const source = object(value, path);
+  const endpointName = stringValue(required(field(source, path, 'endpoint', 'output', 'name'), `${path}.endpoint`), `${path}.endpoint`);
+  const addressRaw = field(source, path, 'address', 'group_address', 'groupAddress', 'destination');
+  const dptRaw = field(source, path, 'dpt');
+  return {
+    time: field(source, path, 'time', 'time_ms', 'timeMs', 'timestamp') === undefined ? '—' : timeValue(field(source, path, 'time', 'time_ms', 'timeMs', 'timestamp'), `${path}.time`),
+    endpoint: endpointName,
+    address: addressRaw === undefined || addressRaw === null ? '—' : stringValue(addressRaw, `${path}.address`),
+    dpt: dptRaw === undefined || dptRaw === null ? '—' : dpt(dptRaw, `${path}.dpt`),
+    value: displayValue(field(source, path, 'value', 'data'), `${path}.value`)
+  };
+}
+
 /** Maps the internal wire DTO to the UI's small display model. */
 export function decodeSnapshot(input: unknown, receivedAtMs = Date.now()): DisplaySnapshot {
   const root = object(input, 'snapshot');
   const config = object(required(field(root, 'snapshot', 'config'), 'config'), 'config');
   const values = object(required(field(root, 'snapshot', 'values'), 'values'), 'values');
-  const inputValues = object(required(field(values, 'values', 'input'), 'values.input'), 'values.input');
-  const outputValues = object(required(field(values, 'values', 'output'), 'values.output'), 'values.output');
+  const endpointValuesByName = endpointValues(values);
+  const inputValuesRaw = field(values, 'values', 'input');
+  const outputValuesRaw = field(values, 'values', 'output');
+  const inputValues = inputValuesRaw === undefined ? {} : object(inputValuesRaw, 'values.input');
+  const outputValues = outputValuesRaw === undefined ? {} : object(outputValuesRaw, 'values.output');
   const telegrams = array(required(field(root, 'snapshot', 'telegrams'), 'telegrams'), 'telegrams').map(telegram);
   const logs = array(required(field(root, 'snapshot', 'logs'), 'logs'), 'logs').map(log);
-  const offDelayRaw = required(field(config, 'config', 'off_delay_ms', 'offDelayMs', 'off_delay'), 'config.off_delay_ms');
-  const offDelayMs = nonNegativeNumber(offDelayRaw, 'config.off_delay_ms');
+  const automation = decodeDisplayAutomation(root, config, values);
+  const firstInput = automation?.inputs[0];
+  const firstOutput = automation?.outputs[0];
+  const inputRaw = field(config, 'config', 'input') ?? firstInput;
+  const outputRaw = field(config, 'config', 'output') ?? firstOutput;
+  const offDelayRaw = field(config, 'config', 'off_delay_ms', 'offDelayMs', 'off_delay');
+  const inputEndpoint = inputRaw === undefined ? { address: '', dpt: '1.001' } : (field(config, 'config', 'input') === undefined && firstInput ? firstInput : endpoint(inputRaw, 'config.input'));
+  const outputEndpoint = outputRaw === undefined ? { address: '', dpt: '1.001' } : (field(config, 'config', 'output') === undefined && firstOutput ? firstOutput : endpoint(outputRaw, 'config.output'));
+  const offDelayMs = offDelayRaw === undefined || offDelayRaw === null ? 0 : nonNegativeNumber(offDelayRaw, 'config.off_delay_ms');
+  const activeRevisionRaw = field(root, 'snapshot', 'active_automation_revision', 'activeAutomationRevision') ?? field(config, 'config', 'active_automation_revision', 'activeAutomationRevision');
+  const savedRevisionRaw = field(root, 'snapshot', 'saved_automation_revision', 'savedAutomationRevision') ?? field(config, 'config', 'saved_automation_revision', 'savedAutomationRevision');
+  const logicStatus = isObject(field(root, 'snapshot', 'logic')) ? object(field(root, 'snapshot', 'logic'), 'logic') : null;
+  const activeStructuralRevisionRaw = field(root, 'snapshot', 'active_structural_revision', 'activeStructuralRevision') ?? (logicStatus ? field(logicStatus, 'logic', 'active_structural_revision', 'activeStructuralRevision') : undefined) ?? field(config, 'config', 'active_structural_revision', 'activeStructuralRevision');
+  const savedStructuralRevisionRaw = field(root, 'snapshot', 'saved_structural_revision', 'savedStructuralRevision') ?? (logicStatus ? field(logicStatus, 'logic', 'saved_structural_revision', 'savedStructuralRevision') : undefined) ?? field(config, 'config', 'saved_structural_revision', 'savedStructuralRevision');
+  const activeLogicRevisionRaw = field(root, 'snapshot', 'active_logic_revision', 'activeLogicRevision') ?? (logicStatus ? field(logicStatus, 'logic', 'active_logic_revision', 'activeLogicRevision') : undefined) ?? field(config, 'config', 'active_logic_revision', 'activeLogicRevision');
+  const savedLogicRevisionRaw = field(root, 'snapshot', 'saved_logic_revision', 'savedLogicRevision') ?? (logicStatus ? field(logicStatus, 'logic', 'saved_logic_revision', 'savedLogicRevision') : undefined) ?? field(config, 'config', 'saved_logic_revision', 'savedLogicRevision');
+  const inputObserved = inputValuesRaw === undefined && firstInput?.name ? endpointValuesByName.get(firstInput.name)?.observed ?? null : valueFrom(inputValues, 'values.input', 'observed');
+  const outputObserved = outputValuesRaw === undefined && firstOutput?.name ? endpointValuesByName.get(firstOutput.name)?.observed ?? null : valueFrom(outputValues, 'values.output', 'observed');
+  const outputRequested = outputValuesRaw === undefined && firstOutput?.name ? endpointValuesByName.get(firstOutput.name)?.requested ?? null : valueFrom(outputValues, 'values.output', 'requested');
 
+  const logicExecutionRaw = field(root, 'snapshot', 'logic_execution', 'logicExecution', 'last_logic_execution', 'lastLogicExecution') ?? (logicStatus ? field(logicStatus, 'logic', 'last_execution', 'lastExecution') : undefined);
+  const effectsRaw = field(root, 'snapshot', 'logic_effects', 'logicEffects', 'recent_logic_effects', 'recentLogicEffects', 'effects') ?? (logicStatus ? field(logicStatus, 'logic', 'recent_effects', 'recentEffects') : undefined);
+  const activeAutomationRevision = optionalRevision(activeRevisionRaw, 'active_automation_revision');
+  const savedAutomationRevision = optionalRevision(savedRevisionRaw, 'saved_automation_revision');
+  const activeStructuralRevision = optionalRevision(activeStructuralRevisionRaw, 'active_structural_revision');
+  const savedStructuralRevision = optionalRevision(savedStructuralRevisionRaw, 'saved_structural_revision');
+  const activeLogicRevision = optionalRevision(activeLogicRevisionRaw, 'active_logic_revision');
+  const savedLogicRevision = optionalRevision(savedLogicRevisionRaw, 'saved_logic_revision');
+  const explicitRestart = field(root, 'snapshot', 'restart_required', 'restartRequired') ?? (logicStatus ? field(logicStatus, 'logic', 'restart_required', 'restartRequired') : undefined) ?? field(config, 'config', 'restart_required', 'restartRequired');
+  const restartRequired = explicitRestart === true || (activeStructuralRevision !== null && savedStructuralRevision !== null && activeStructuralRevision !== savedStructuralRevision) || (activeAutomationRevision !== null && savedAutomationRevision !== null && activeAutomationRevision !== savedAutomationRevision);
+  const logicEffects = effectsRaw === undefined || effectsRaw === null ? [] : array(effectsRaw, 'logic_effects').map(logicEffect);
   return {
     revision: revision(required(field(root, 'snapshot', 'revision'), 'revision'), 'revision'),
     connection: connection(required(field(root, 'snapshot', 'connection'), 'connection')),
     config: {
-      input: endpoint(required(field(config, 'config', 'input'), 'config.input'), 'config.input'),
-      output: endpoint(required(field(config, 'config', 'output'), 'config.output'), 'config.output'),
+      input: inputEndpoint,
+      output: outputEndpoint,
       offDelayMs
     },
     values: {
-      input: { observed: valueFrom(inputValues, 'values.input', 'observed') },
+      input: { observed: inputObserved },
       output: {
-        observed: valueFrom(outputValues, 'values.output', 'observed'),
-        requested: valueFrom(outputValues, 'values.output', 'requested')
+        observed: outputObserved,
+        requested: outputRequested
       }
     },
+    automation,
+    activeAutomationRevision,
+    savedAutomationRevision,
+    activeStructuralRevision,
+    savedStructuralRevision,
+    activeLogicRevision,
+    savedLogicRevision,
+    restartRequired,
+    logicExecution: logicExecution(logicExecutionRaw),
+    logicEffects,
     write: write(field(root, 'write', 'write_status', 'last_write')),
-    timer: timer(required(field(root, 'snapshot', 'timer'), 'timer'), receivedAtMs),
+    timer: field(root, 'snapshot', 'timer') === undefined ? { state: 'idle', deadlineMs: null, remainingMs: null, sampledAtMs: receivedAtMs } : timer(field(root, 'snapshot', 'timer'), receivedAtMs),
     telegrams: telegrams as DisplayTelegram[],
     logs: logs as DisplayLog[]
   };

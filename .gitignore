@@ -1,6 +1,7 @@
 /target/
 .venv/
 config/local.toml
+config/automation.toml
 /docs/local/
 
 # Python and OS-generated files.

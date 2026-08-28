@@ -7,6 +7,7 @@ KNX connection and translates between XKNX telegrams and the typed protocol.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import logging
 import sys
@@ -15,14 +16,18 @@ from typing import Any, Callable, TextIO
 from .protocol import (
     BRIDGE_VERSION,
     DPT_1_001,
+    DPT_5_001,
     BridgeHello,
     BoolValue,
     CommandResult,
     Configure,
+    Dpt,
     Fatal,
+    GroupAddressDpt,
     KnxEvent,
     KnxWrite,
     Message,
+    PercentValue,
     ProtocolError,
     Ready,
     Shutdown,
@@ -68,17 +73,68 @@ def bool_from_xknx(value: Any) -> bool:
     raise ValueError(f"unsupported DPT 1.001 value: {value!r}")
 
 
-def event_from_telegram(telegram: Any, input_address: str) -> KnxEvent | None:
-    """Map one filtered XKNX telegram to a typed event, without XKNX imports.
+def percent_from_xknx(value: Any) -> int:
+    """Convert a DPT 5.001 value to its protocol percentage integer."""
+    if type(value) is int and 0 <= value <= 100:
+        return value
+    enum_value = getattr(value, "value", None)
+    if type(enum_value) is int and not isinstance(enum_value, bool) and 0 <= enum_value <= 100:
+        return enum_value
+    raise ValueError(f"unsupported DPT 5.001 value: {value!r}")
 
-    ``TelegramQueue`` already filters the callback to ``input_address``.  The
-    explicit address check remains here as a second correctness boundary.
-    The mapper keys on the public XKNX APCI class names, keeping tests free of
-    gateway/network objects while retaining write/response/read distinctions.
+
+def value_from_xknx(value: Any, dpt: Dpt) -> BoolValue | PercentValue:
+    if dpt == DPT_1_001:
+        return BoolValue("bool", bool_from_xknx(value))
+    if dpt == DPT_5_001:
+        return PercentValue("percent", percent_from_xknx(value))
+    raise ValueError(f"unsupported configured DPT: {dpt}")
+
+
+def _configured_dpt_map(
+    group_addresses: Mapping[str, Dpt] | Iterable[GroupAddressDpt] | str,
+) -> dict[str, Dpt]:
+    """Normalize configured addresses for the telegram mapper.
+
+    The string form is retained for callers of the old one-address helper;
+    bridge runtime code always passes the complete configured map.
     """
-    input_address = validate_group_address(input_address, "input_address")
+    if isinstance(group_addresses, str):
+        return {validate_group_address(group_addresses, "group address"): DPT_1_001}
+    if isinstance(group_addresses, Mapping):
+        entries = group_addresses.items()
+    else:
+        entries = ((entry.address, entry.dpt) for entry in group_addresses)
+    result: dict[str, Dpt] = {}
+    for address, dpt in entries:
+        canonical = validate_group_address(address, "group address")
+        if canonical in result:
+            raise ProtocolError(f"duplicate configured group address: {canonical}")
+        if not isinstance(dpt, Dpt):
+            raise ProtocolError(f"DPT for {canonical} must be a DPT record")
+        if dpt not in (DPT_1_001, DPT_5_001):
+            raise ProtocolError(f"unsupported configured DPT for {canonical}: {dpt}")
+        result[canonical] = dpt
+    if not result:
+        raise ProtocolError("group_addresses must not be empty")
+    return result
+
+
+def event_from_telegram(
+    telegram: Any,
+    group_addresses: Mapping[str, Dpt] | Iterable[GroupAddressDpt] | str,
+) -> KnxEvent | None:
+    """Map one configured XKNX telegram to a typed event, without XKNX imports.
+
+    ``TelegramQueue`` filters the callback to all configured addresses.  The
+    explicit address check remains here as a second correctness boundary. The
+    mapper keys on public XKNX APCI class names, keeping tests free of gateway
+    objects while retaining write/response/read distinctions.
+    """
+    configured = _configured_dpt_map(group_addresses)
     destination = validate_group_address(str(telegram.destination_address), "destination")
-    if destination != input_address:
+    dpt = configured.get(destination)
+    if dpt is None:
         return None
 
     payload = getattr(telegram, "payload", None)
@@ -98,7 +154,7 @@ def event_from_telegram(telegram: Any, input_address: str) -> KnxEvent | None:
         candidate = getattr(decoded, "value", None) if decoded is not None else None
         if candidate is None:
             candidate = getattr(payload, "value", None)
-        event_value = bool_from_xknx(candidate)
+        event_value = value_from_xknx(candidate, dpt)
 
     source = getattr(telegram, "source_address", None)
     source_string = None if source is None else str(source)
@@ -106,8 +162,8 @@ def event_from_telegram(telegram: Any, input_address: str) -> KnxEvent | None:
         source=source_string,
         destination=destination,
         service=service,
-        dpt=DPT_1_001,
-        value=None if event_value is None else BoolValue("bool", event_value),
+        dpt=dpt,
+        value=event_value,
     )
 
 
@@ -179,9 +235,11 @@ async def _make_xknx(
         state_queue.put_nowait(state)
         LOGGER.debug("[XKNX] connection state=%s", getattr(state, "value", state))
 
+    configured_dpts = {entry.address: entry.dpt for entry in config.group_addresses}
+
     def telegram_received(telegram: Any) -> None:
         try:
-            event = event_from_telegram(telegram, config.input_address)
+            event = event_from_telegram(telegram, configured_dpts)
         except (ProtocolError, ValueError) as exc:
             LOGGER.warning("[XKNX] ignoring malformed/unsupported telegram: %s", exc)
             return
@@ -202,15 +260,10 @@ async def _make_xknx(
     xknx: Any | None = None
     try:
         xknx = XKNX(connection_config=connection)
-        xknx.group_address_dpt.set(
-            {
-                config.group_addresses[0].address: "1.001",
-                config.group_addresses[1].address: "1.001",
-            }
-        )
+        xknx.group_address_dpt.set({address: str(dpt) for address, dpt in configured_dpts.items()})
         xknx.telegram_queue.register_telegram_received_cb(
             telegram_received,
-            group_addresses=[GroupAddress(config.input_address)],
+            group_addresses=[GroupAddress(entry.address) for entry in config.group_addresses],
         )
         xknx.connection_manager.register_connection_state_changed_cb(connection_state_changed)
         await xknx.start()
@@ -280,7 +333,7 @@ async def _serve(
                         runtime.xknx,
                         message.destination,
                         message.value.value,
-                        value_type="1.001",
+                        value_type=str(message.dpt),
                     )
                 except Exception as exc:
                     LOGGER.exception(

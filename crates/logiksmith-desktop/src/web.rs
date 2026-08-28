@@ -1,14 +1,17 @@
 //! Internal HTTP/SSE dashboard API and static asset server.
 
 use crate::{
-    WebConfig,
+    ActivationRequest, AutomationDocument, AutomationEnvelope, FieldError, WebConfig,
+    build_automation,
     diagnostics::{DiagnosticStore, DiagnosticUpdate, Replay, Snapshot},
+    load_automation,
 };
 use axum::{
     Router,
     extract::{Query, State},
+    http::StatusCode,
     response::{
-        IntoResponse, Json,
+        IntoResponse, Json, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::get,
@@ -18,11 +21,17 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     convert::Infallible,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use tower_http::services::{ServeDir, ServeFile};
 
 pub const STATIC_ASSET_ROOT: &str = "logiksmith-web/dist";
@@ -43,6 +52,8 @@ pub enum WebError {
 #[derive(Clone)]
 struct AppState {
     store: DiagnosticStore,
+    automation_lock: Arc<Mutex<()>>,
+    activation: Option<mpsc::Sender<ActivationRequest>>,
 }
 
 pub struct WebServer {
@@ -86,6 +97,34 @@ pub async fn start_web_server_with_assets(
     config: WebConfig,
     root: &Path,
 ) -> Result<WebServer, WebError> {
+    start_web_server_with_assets_and_activation(store, config, root, None).await
+}
+
+/// Starts the dashboard with the runtime activation channel used for
+/// source-only saves. Tests and callers that do not run a session may omit it;
+/// those saves remain restart-pending after persistence.
+pub async fn start_web_server_with_activation(
+    store: DiagnosticStore,
+    config: WebConfig,
+    activation: mpsc::Sender<ActivationRequest>,
+) -> Result<WebServer, WebError> {
+    let relative = Path::new(STATIC_ASSET_ROOT);
+    let root = if relative.is_dir() {
+        relative.to_path_buf()
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(STATIC_ASSET_ROOT)
+    };
+    start_web_server_with_assets_and_activation(store, config, &root, Some(activation)).await
+}
+
+async fn start_web_server_with_assets_and_activation(
+    store: DiagnosticStore,
+    config: WebConfig,
+    root: &Path,
+    activation: Option<mpsc::Sender<ActivationRequest>>,
+) -> Result<WebServer, WebError> {
     let root = root.to_path_buf();
     let index = root.join("index.html");
     if !root.is_dir() || !index.is_file() {
@@ -107,9 +146,14 @@ pub async fn start_web_server_with_assets(
         .map_err(|source| WebError::Bind { address, source })?;
     let router = Router::new()
         .route("/api/snapshot", get(snapshot))
+        .route("/api/automation", get(get_automation).put(put_automation))
         .route("/api/events", get(events))
         .fallback_service(ServeDir::new(&root).not_found_service(ServeFile::new(index)))
-        .with_state(AppState { store });
+        .with_state(AppState {
+            store,
+            automation_lock: Arc::new(Mutex::new(())),
+            activation,
+        });
     let (sender, receiver) = oneshot::channel();
     let task = tokio::spawn(async move {
         let result = axum::serve(listener, router)
@@ -130,6 +174,194 @@ pub async fn start_web_server_with_assets(
 
 async fn snapshot(State(state): State<AppState>) -> Json<Snapshot> {
     Json(state.store.snapshot())
+}
+
+async fn get_automation(State(state): State<AppState>) -> Response {
+    match load_automation(&state.store.automation_path()) {
+        Ok((document, revision)) => {
+            let snapshot = state.store.snapshot();
+            (
+                StatusCode::OK,
+                Json(AutomationEnvelope {
+                    document,
+                    revision,
+                    active_structural_revision: snapshot.logic.active_structural_revision,
+                    saved_structural_revision: snapshot.logic.saved_structural_revision,
+                    active_logic_revision: snapshot.logic.active_logic_revision,
+                    saved_logic_revision: snapshot.logic.saved_logic_revision,
+                    restart_required: snapshot.logic.restart_required,
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveAutomationRequest {
+    document: AutomationDocument,
+    revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SaveAutomationResponse {
+    revision: u64,
+    logic_activated: bool,
+    active_logic_revision: u64,
+    restart_required: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FieldErrorsResponse {
+    errors: Vec<FieldError>,
+}
+
+async fn put_automation(
+    State(state): State<AppState>,
+    Json(request): Json<SaveAutomationRequest>,
+) -> Response {
+    let path = state.store.automation_path();
+    let candidate_structural_revision = crate::structural_revision(&request.document);
+    let candidate_logic_revision = crate::logic_revision(&request.document.logic.source);
+    enum SaveOutcome {
+        Conflict(AutomationDocument, u64),
+        Invalid(Vec<FieldError>),
+        Saved(Result<u64, String>),
+    }
+    // Keep the stale check and rename under one lock. The await below happens
+    // only after this guard is dropped, so the axum handler remains Send.
+    let save = {
+        let _guard = state
+            .automation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (current, current_revision) = match load_automation(&path) {
+            Ok(value) => value,
+            Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        };
+        if request.revision != current_revision {
+            SaveOutcome::Conflict(current, current_revision)
+        } else if let Err(errors) = build_automation(request.document.clone()) {
+            SaveOutcome::Invalid(errors)
+        } else {
+            SaveOutcome::Saved(atomic_save(&path, &request.document))
+        }
+    };
+    match save {
+        SaveOutcome::Conflict(current, current_revision) => {
+            let snapshot = state.store.snapshot();
+            (
+                StatusCode::CONFLICT,
+                Json(AutomationEnvelope {
+                    document: current,
+                    revision: current_revision,
+                    active_structural_revision: snapshot.logic.active_structural_revision,
+                    saved_structural_revision: snapshot.logic.saved_structural_revision,
+                    active_logic_revision: snapshot.logic.active_logic_revision,
+                    saved_logic_revision: snapshot.logic.saved_logic_revision,
+                    restart_required: snapshot.logic.restart_required,
+                }),
+            )
+                .into_response()
+        }
+        SaveOutcome::Invalid(errors) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(FieldErrorsResponse { errors }),
+        )
+            .into_response(),
+        SaveOutcome::Saved(save_result) => match save_result {
+            Ok(revision) => {
+                let active_structural_revision =
+                    state.store.snapshot().logic.active_structural_revision;
+                let mut logic_activated = false;
+                let mut restart_required =
+                    candidate_structural_revision != active_structural_revision;
+                if !restart_required {
+                    if let Some(activation) = &state.activation {
+                        let (reply, result) = oneshot::channel();
+                        let request = ActivationRequest {
+                            source: request.document.logic.source.clone(),
+                            revision: candidate_logic_revision,
+                            reply,
+                        };
+                        if activation.send(request).await.is_ok() {
+                            logic_activated = tokio::time::timeout(Duration::from_secs(2), result)
+                                .await
+                                .ok()
+                                .and_then(Result::ok)
+                                .is_some();
+                        }
+                    }
+                    restart_required = !logic_activated;
+                }
+                state.store.set_saved_logic_state(
+                    revision,
+                    candidate_logic_revision,
+                    candidate_structural_revision,
+                    restart_required,
+                );
+                if logic_activated {
+                    state.store.set_active_logic(
+                        candidate_logic_revision,
+                        request.document.logic.source.clone(),
+                    );
+                }
+                let active_logic_revision = state.store.snapshot().logic.active_logic_revision;
+                (
+                    StatusCode::OK,
+                    Json(SaveAutomationResponse {
+                        revision,
+                        logic_activated,
+                        active_logic_revision,
+                        restart_required,
+                    }),
+                )
+                    .into_response()
+            }
+            Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+        },
+    }
+}
+
+fn json_error(status: StatusCode, error: String) -> Response {
+    (status, Json(ErrorResponse { error })).into_response()
+}
+
+fn atomic_save(path: &Path, document: &AutomationDocument) -> Result<u64, String> {
+    let bytes = toml::to_string_pretty(document)
+        .map_err(|error| error.to_string())?
+        .into_bytes();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "automation path has no file name".to_owned())?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let temporary = parent.join(format!(".{file_name}.{stamp}-{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+        Ok::<_, String>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map(|_| crate::automation_revision(&bytes))
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,18 +447,59 @@ fn resync_event(revision: u64) -> Event {
 mod tests {
     use super::*;
     use crate::diagnostics::JOURNAL_CAPACITY;
-    use logiksmith_core::{Dpt, EngineConfig};
     use std::{fs, net::IpAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn store() -> DiagnosticStore {
-        DiagnosticStore::new(EngineConfig {
-            input_group_address: "2/2/52".parse().unwrap(),
-            input_dpt: Dpt::BOOL,
-            output_group_address: "2/3/52".parse().unwrap(),
-            output_dpt: Dpt::BOOL,
-            off_delay_ms: 5_000,
+        let runtime = crate::build_automation(crate::AutomationDocument {
+            inputs: vec![
+                crate::AutomationEndpoint {
+                    name: "wall_switch".to_owned(),
+                    dpt: "1.001".to_owned(),
+                },
+                crate::AutomationEndpoint {
+                    name: "dimmer_level".to_owned(),
+                    dpt: "5.001".to_owned(),
+                },
+            ],
+            outputs: vec![
+                crate::AutomationEndpoint {
+                    name: "test_light".to_owned(),
+                    dpt: "1.001".to_owned(),
+                },
+                crate::AutomationEndpoint {
+                    name: "dimmer_output".to_owned(),
+                    dpt: "5.001".to_owned(),
+                },
+            ],
+            knx_bindings: vec![
+                crate::KnxBinding {
+                    endpoint: "wall_switch".to_owned(),
+                    group_address: "2/2/52".to_owned(),
+                },
+                crate::KnxBinding {
+                    endpoint: "dimmer_level".to_owned(),
+                    group_address: "2/2/53".to_owned(),
+                },
+                crate::KnxBinding {
+                    endpoint: "test_light".to_owned(),
+                    group_address: "2/3/52".to_owned(),
+                },
+                crate::KnxBinding {
+                    endpoint: "dimmer_output".to_owned(),
+                    group_address: "2/3/53".to_owned(),
+                },
+            ],
+            logic: crate::LogicDocument {
+                source: "function handle(event, input) return nil end".to_owned(),
+            },
         })
+        .unwrap();
+        DiagnosticStore::new(
+            &runtime,
+            std::env::temp_dir().join("logiksmith-web-test-automation.toml"),
+            1,
+        )
     }
 
     #[tokio::test]

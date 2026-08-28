@@ -5,3 +5,6 @@ edition = "2024"
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+mlua = { version = "0.10", features = ["lua54", "vendored"] }

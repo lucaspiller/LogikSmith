@@ -12,12 +12,15 @@ struct Args {
     /// Path to the TOML configuration file.
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
+    /// Path to the TOML automation document.
+    #[arg(long, value_name = "PATH")]
+    automation: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let args = Args::parse();
-    let config = match load_config(&args.config) {
+    let config = match load_config(&args.config, &args.automation) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("configuration error: {error}");
