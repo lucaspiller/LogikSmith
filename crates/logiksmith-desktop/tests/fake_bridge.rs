@@ -42,6 +42,9 @@ gateway_port = 3671
 [bridge]
 python = "/bin/sh"
 
+[time]
+timezone = "UTC"
+
 [logging]
 level = "off"
 bridge_level = "off"
@@ -187,6 +190,9 @@ gateway_port = 3671
 
 [bridge]
 python = "/bin/sh"
+
+[time]
+timezone = "UTC"
 
 [logging]
 level = "off"

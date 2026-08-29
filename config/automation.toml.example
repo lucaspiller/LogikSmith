@@ -15,6 +15,42 @@ function handle(event, input, meta, state)
 end
 '''
 
+[[blocks.schedules]]
+name = "morning_on"
+enabled = true
+kind = "astronomical"
+anchor = "sunrise"
+offset = "-1h30m"
+earliest = "05:30"
+
+[[blocks.schedules]]
+name = "morning_off"
+enabled = true
+kind = "astronomical"
+anchor = "sunrise"
+offset = "30m"
+
+[[blocks.schedules]]
+name = "weekday_evening_on"
+enabled = true
+kind = "astronomical"
+anchor = "sunset"
+offset = "-1h30m"
+weekdays = ["mon", "tue", "wed", "thu", "fri"]
+
+[[blocks.schedules]]
+name = "evening_off"
+enabled = true
+kind = "fixed"
+at = "23:30"
+
+[[blocks.schedules]]
+name = "heartbeat"
+enabled = true
+kind = "interval"
+every = "60s"
+offset = "0s"
+
 [[blocks.inputs]]
 name = "wall_switch"
 dpt = "1.001"

@@ -10,6 +10,14 @@ gateway_port = 3671
 [bridge]
 python = ".venv/bin/python"
 
+[time]
+# IANA time-zone identifier; required.
+timezone = "Europe/Vilnius"
+# Latitude/longitude are optional as a pair and become required when any
+# enabled astronomical schedule exists.
+latitude = 54.6872
+longitude = 25.2797
+
 [logging]
 level = "debug"
 bridge_level = "debug"

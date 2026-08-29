@@ -41,6 +41,7 @@ fn make_runtime(source: &str) -> logiksmith_desktop::AutomationRuntime {
                 },
             ],
             source: source.to_owned(),
+            schedules: Vec::new(),
         }],
     })
     .expect("valid automation")
@@ -68,8 +69,11 @@ fn records_zero_effect_and_failure_in_the_owning_block() {
         )
         .unwrap()
         .unwrap();
-    assert!(success.execution.outcome.as_ref().unwrap().is_empty());
-    store.record_block_execution(&success, MonotonicMs(10), 17, &runtime);
+    let transition = success.execution.outcome.as_ref().unwrap();
+    assert!(transition.outputs.is_empty());
+    assert!(transition.state.is_empty());
+    assert!(transition.timers.is_empty());
+    store.record_block_execution(&success, MonotonicMs(10), 17, &runtime, None);
 
     let failure_runtime = make_runtime("function handle(event, input, meta) error('boom') end");
     let mut failure_engine = Runtime::new(failure_runtime.core_config.clone());
@@ -82,7 +86,7 @@ fn records_zero_effect_and_failure_in_the_owning_block() {
         .unwrap()
         .unwrap();
     assert!(failure.execution.outcome.is_err());
-    store.record_block_execution(&failure, MonotonicMs(11), 23, &failure_runtime);
+    store.record_block_execution(&failure, MonotonicMs(11), 23, &failure_runtime, None);
 
     let snapshot = store.snapshot_at(MonotonicMs(11));
     assert_eq!(snapshot.blocks.len(), 1);
@@ -113,7 +117,7 @@ fn retains_newest_fifty_records_per_block() {
             )
             .unwrap()
             .unwrap();
-        store.record_block_execution(&execution, MonotonicMs(index + 1), index, &runtime);
+        store.record_block_execution(&execution, MonotonicMs(index + 1), index, &runtime, None);
     }
     let executions = &store.snapshot().blocks[0].executions;
     assert_eq!(executions.len(), 50);
@@ -144,6 +148,13 @@ fn timer_trigger_logic_revision_is_a_decimal_string() {
         fired_at_ms: Some(2),
         late_by_ms: Some(0),
         scheduled_logic_revision: Some(u64::MAX),
+        kind: None,
+        scheduled_for_utc_ms: None,
+        detected_at_utc_ms: None,
+        handled_at_utc_ms: None,
+        queue_delay_ms: None,
+        coalesced_count: None,
+        structural_revision: None,
     };
 
     let value = serde_json::to_value(trigger).unwrap();
@@ -161,4 +172,37 @@ fn dashboard_json_exposes_ordered_blocks() {
     assert_eq!(blocks[0]["id"], "test");
     assert!(blocks[0].get("state").is_some());
     assert!(blocks[0].get("pending_timers").is_some());
+}
+
+#[test]
+fn saved_and_active_documents_remain_distinct_until_restart() {
+    let runtime = make_runtime("function handle(event, input) return nil end");
+    let store = store(&runtime);
+    let mut candidate = runtime.document.clone();
+    candidate.blocks[0].revision = 2;
+    candidate.blocks[0].source = "function handle(event, input) error('new') end".to_owned();
+    let structural_revision = runtime.structural_revision;
+
+    store.set_saved_document_state(9, structural_revision, false, &candidate);
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.blocks[0].active_revision, 2);
+    assert_eq!(snapshot.blocks[0].saved_revision, 2);
+    assert_eq!(snapshot.blocks[0].source, candidate.blocks[0].source);
+    assert_eq!(store.active_document().blocks[0].revision, 2);
+
+    let mut structural_candidate = candidate.clone();
+    structural_candidate.blocks[0].inputs[0].name = "different".to_owned();
+    store.set_saved_document_state(
+        10,
+        structural_revision.wrapping_add(1),
+        true,
+        &structural_candidate,
+    );
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.blocks[0].active_revision, 2);
+    assert_eq!(snapshot.blocks[0].saved_revision, 2);
+    assert_eq!(
+        store.active_document().blocks[0].source,
+        candidate.blocks[0].source
+    );
 }

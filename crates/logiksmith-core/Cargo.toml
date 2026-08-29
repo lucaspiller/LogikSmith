@@ -8,3 +8,5 @@ path = "src/lib.rs"
 
 [dependencies]
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
+jiff-tzdb = "0.1"

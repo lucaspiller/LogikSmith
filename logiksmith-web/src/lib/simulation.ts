@@ -1,7 +1,9 @@
 import type {
+  DisplayBlockSchedule,
   DisplayEndpoint,
   DisplayExecution,
   DisplayPendingTimer,
+  DisplayScheduleOccurrence,
   DisplaySimulation,
   DisplaySnapshot,
   DisplayState,
@@ -16,12 +18,17 @@ export type SimulationValue = boolean | number | null;
 export interface SimulationDraftInput { endpoint: string; dpt: string; value: SimulationValue; valid: boolean; ageMs: number | null; }
 export interface SimulationDraft {
   blockId: string;
-  triggerType: 'input' | 'timer';
+  triggerType: 'input' | 'timer' | 'schedule';
   triggerEndpoint: string;
   triggerValue: SimulationValue;
   previousValue: SimulationValue;
   triggerTimerName: string;
   timerFiredAtMs: number | null;
+  triggerScheduleName: string;
+  /** Selected previewed occurrence in UTC epoch milliseconds; null until chosen. */
+  scheduleOccurrenceAtMs: number | null;
+  /** Occurrence previews offered for the selected schedule. */
+  schedulePreviews: DisplayScheduleOccurrence[];
   inputs: SimulationDraftInput[];
   state: DisplayState;
   pendingTimers: DisplayPendingTimer[];
@@ -39,16 +46,22 @@ export function createSimulationDraft(snapshot: DisplaySnapshot, execution: Disp
     ? execution.inputs.map((input) => ({ ...input }))
     : (selectedBlock?.inputs ?? snapshot.automation?.inputs ?? []).map(inputFromEndpoint).filter((input): input is SimulationDraftInput => input !== null);
   const timerTrigger = execution?.trigger.type === 'timer' ? execution.trigger : null;
+  const scheduleTrigger = execution?.trigger.type === 'schedule' ? execution.trigger : null;
   const pendingTimers = (selectedBlock?.pendingTimers ?? snapshot.pendingTimers).map((timer) => ({ ...timer }));
   if (timerTrigger && !pendingTimers.some((timer) => timer.name === timerTrigger.timer)) pendingTimers.push({ name: timerTrigger.timer, scheduledAtMs: timerTrigger.scheduledAtMs, dueAtMs: timerTrigger.dueAtMs, logicRevision: timerTrigger.scheduledLogicRevision });
+  const schedules = selectedBlock?.schedules ?? [];
+  const triggerScheduleName = scheduleTrigger && schedules.some((schedule) => schedule.name === scheduleTrigger.name) ? scheduleTrigger.name : schedules[0]?.name ?? '';
   return {
     blockId: selectedBlock?.id ?? 'default',
-    triggerType: timerTrigger ? 'timer' : 'input',
+    triggerType: scheduleTrigger ? 'schedule' : timerTrigger ? 'timer' : 'input',
     triggerEndpoint: execution && execution.trigger.type === 'input' ? execution.trigger.endpoint : inputs[0]?.endpoint ?? '',
     triggerValue: execution && execution.trigger.type === 'input' ? execution.trigger.value : null,
     previousValue: execution && execution.trigger.type === 'input' ? execution.trigger.previous : null,
     triggerTimerName: timerTrigger?.timer ?? pendingTimers[0]?.name ?? '',
     timerFiredAtMs: timerTrigger?.firedAtMs ?? pendingTimers[0]?.dueAtMs ?? null,
+    triggerScheduleName,
+    scheduleOccurrenceAtMs: scheduleTrigger ? scheduleTrigger.scheduledForUtcMs : schedules[0]?.nextOccurrenceUtcMs ?? null,
+    schedulePreviews: [],
     inputs,
     state: { ...(execution?.stateBefore ?? snapshot.state) },
     pendingTimers
@@ -57,7 +70,7 @@ export function createSimulationDraft(snapshot: DisplaySnapshot, execution: Disp
 
 /** Keeps the input trigger's corresponding snapshot entry equivalent to the event. */
 export function forceTriggerInput(draft: SimulationDraft): SimulationDraft {
-  if (draft.triggerType === 'timer' || draft.triggerValue === null) return { ...draft, inputs: draft.inputs.map((input) => ({ ...input })) };
+  if (draft.triggerType !== 'input' || draft.triggerValue === null) return { ...draft, inputs: draft.inputs.map((input) => ({ ...input })) };
   return {
     ...draft,
     inputs: draft.inputs.map((input) => input.endpoint === draft.triggerEndpoint
@@ -79,6 +92,27 @@ export function applySimulationResult(draft: SimulationDraft, result: DisplaySim
     triggerTimerName: selectedTimer?.name ?? '',
     timerFiredAtMs: selectedTimer?.dueAtMs ?? null
   };
+}
+
+/**
+ * Defaults the occurrence selection to the next previewed occurrence, keeping the
+ * current selection when it is still a valid previewed instant.
+ */
+export function schedulePreviewDefault(previews: DisplayScheduleOccurrence[], currentUtcMs: number | null): number | null {
+  if (currentUtcMs !== null && previews.some((occurrence) => occurrence.utcMs === currentUtcMs)) return currentUtcMs;
+  return previews[0]?.utcMs ?? null;
+}
+
+/**
+ * Resets schedule-only fields when the selected schedule no longer exists in the
+ * block (for example after a structural restart), preventing leakage of another
+ * block's or another schedule's form state.
+ */
+export function reconcileScheduleSelection(draft: SimulationDraft, schedules: DisplayBlockSchedule[]): SimulationDraft {
+  if (draft.triggerType !== 'schedule') return draft;
+  if (schedules.some((schedule) => schedule.name === draft.triggerScheduleName)) return draft;
+  const next = schedules[0];
+  return { ...draft, triggerScheduleName: next?.name ?? '', scheduleOccurrenceAtMs: next?.nextOccurrenceUtcMs ?? null, schedulePreviews: [] };
 }
 
 export function typedValueForDpt(dpt: string, value: SimulationValue): SimulationTypedValue | null {
@@ -115,6 +149,11 @@ export function validateSimulationDraft(draft: SimulationDraft): string[] {
     if (draft.timerFiredAtMs === null || !Number.isInteger(draft.timerFiredAtMs) || draft.timerFiredAtMs < 0) errors.push('Supply a non-negative integer fired time for the timer.');
     return errors;
   }
+  if (draft.triggerType === 'schedule') {
+    if (!draft.triggerScheduleName) errors.push('Choose a schedule.');
+    if (draft.scheduleOccurrenceAtMs === null || !Number.isInteger(draft.scheduleOccurrenceAtMs) || draft.scheduleOccurrenceAtMs < 0) errors.push('Pick a previewed occurrence for the schedule.');
+    return errors;
+  }
   if (!draft.triggerEndpoint) errors.push('Choose a triggering input.');
   const trigger = draft.inputs.find((input) => input.endpoint === draft.triggerEndpoint);
   if (!trigger) errors.push('The triggering input must be configured.');
@@ -134,7 +173,7 @@ export function validateSimulationDraft(draft: SimulationDraft): string[] {
   return errors;
 }
 
-export function toSimulationScenario(draft: SimulationDraft, expectedLogicRevision: RevisionToken): SimulationScenario | null {
+export function toSimulationScenario(draft: SimulationDraft, expectedLogicRevision: RevisionToken, expectedStructuralRevision: RevisionToken | null = null): SimulationScenario | null {
   const prepared = forceTriggerInput(draft);
   const errors = validateSimulationDraft(prepared);
   if (errors.length) return null;
@@ -142,6 +181,10 @@ export function toSimulationScenario(draft: SimulationDraft, expectedLogicRevisi
   if (prepared.triggerType === 'timer') {
     if (prepared.timerFiredAtMs === null) return null;
     return { blockId: prepared.blockId, expectedLogicRevision, trigger: { type: 'timer', name: prepared.triggerTimerName, firedAtMs: prepared.timerFiredAtMs }, inputs, state: { ...prepared.state }, pendingTimers: prepared.pendingTimers.map((timer) => ({ ...timer })) };
+  }
+  if (prepared.triggerType === 'schedule') {
+    if (prepared.scheduleOccurrenceAtMs === null) return null;
+    return { blockId: prepared.blockId, expectedLogicRevision, expectedStructuralRevision, trigger: { type: 'schedule', schedule: prepared.triggerScheduleName, occurrenceAtMs: prepared.scheduleOccurrenceAtMs }, inputs, state: { ...prepared.state }, pendingTimers: prepared.pendingTimers.map((timer) => ({ ...timer })) };
   }
   const trigger = prepared.inputs.find((input) => input.endpoint === prepared.triggerEndpoint);
   const triggerValue = trigger ? typedValueForDpt(trigger.dpt, prepared.triggerValue) : null;

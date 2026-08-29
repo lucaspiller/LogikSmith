@@ -3,6 +3,7 @@ import { decodeSnapshot } from '../src/lib/api';
 import {
   compatibleEndpoints,
   decodeAutomation,
+  decodeAutomationDocument,
   emptyAutomation,
   removeEndpoint,
   renameEndpoint,
@@ -70,6 +71,14 @@ describe('automation editor model', () => {
     expect(result).toEqual({ revision: 8, logicActivated: true, activeLogicRevision: 8, restartRequired: false });
     expect(request?.method).toBe('PUT');
     expect(JSON.parse(String(request?.body))).toEqual({ document: document() });
+  });
+
+  it('preserves canonical block revisions and schedules when saving', async () => {
+    const canonical = decodeAutomationDocument({ blocks: [{ id: 'stairs', revision: 12, enabled: true, inputs: [], outputs: [], knx_bindings: [], source: 'return nil', schedules: [{ name: 'morning_on', enabled: true, kind: 'fixed', at: '05:30', weekdays: ['mon', 'tue'] }] }] });
+    expect(validateAutomation(canonical)).toEqual([]);
+    let request: RequestInit | undefined;
+    await saveAutomation(canonical, 1, async (_url, init) => { request = init; return new Response(JSON.stringify({ revision: 2, logic_activated: false, restart_required: true }), { status: 200 }); });
+    expect(JSON.parse(String(request?.body))).toEqual({ document: { blocks: [{ ...canonical.blocks?.[0], revision: 12 }] } });
   });
 
   it('decodes the names cancelled by a source activation', async () => {
