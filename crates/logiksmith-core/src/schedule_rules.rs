@@ -4,7 +4,7 @@ use jiff::civil::{Date, DateTime, Weekday as JiffWeekday};
 use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp, Zoned};
 
-use mlua::{AnyUserData, IntoLua, UserData, UserDataFields, UserDataMethods};
+use mlua::{AnyUserData, IntoLua, UserData, UserDataFields, UserDataMethods, Value as LuaValue};
 
 use crate::noaa;
 use crate::{BlockId, EndpointNameError, LogicRevision, MonotonicMs, SimulationError};
@@ -239,8 +239,6 @@ pub enum ScheduleRule {
     Astronomical {
         anchor: SolarAnchor,
         offset_seconds: i32,
-        earliest: Option<LocalTime>,
-        latest: Option<LocalTime>,
         weekdays: WeekdaySet,
     },
 }
@@ -277,24 +275,13 @@ impl ScheduleRule {
                 }
                 Ok(())
             }
-            ScheduleRule::Astronomical {
-                offset_seconds,
-                earliest,
-                latest,
-                ..
-            } => {
+            ScheduleRule::Astronomical { offset_seconds, .. } => {
                 if !(-MAX_ASTRONOMICAL_OFFSET_SECONDS..=MAX_ASTRONOMICAL_OFFSET_SECONDS)
                     .contains(offset_seconds)
                 {
                     return Err(ScheduleError::InvalidAstronomicalOffset {
                         offset_seconds: *offset_seconds,
                     });
-                }
-                if let Some(earliest) = earliest {
-                    validate_local_time(earliest)?;
-                }
-                if let Some(latest) = latest {
-                    validate_local_time(latest)?;
                 }
                 Ok(())
             }
@@ -307,6 +294,10 @@ fn validate_local_time(at: &LocalTime) -> Result<(), ScheduleError> {
         return Err(ScheduleError::InvalidLocalTime(*at));
     }
     Ok(())
+}
+
+fn is_valid_local_time(at: &LocalTime) -> bool {
+    at.hour <= 23 && at.minute <= 59 && at.second <= 59
 }
 
 /// One configured schedule inside a logic block.
@@ -487,8 +478,9 @@ impl SunContext {
 }
 
 /// Lua exposure of [`DateTimeValue`]: civil fields via `__index`, ordering and
-/// equality via the hidden instant. Unavailable values expose `nil` fields and
-/// compare `false` against everything, including themselves.
+/// equality via the hidden instant. Ordering against a string compares the
+/// local time of day. Unavailable values expose `nil` fields and compare
+/// `false` against everything, including themselves.
 impl UserData for DateTimeValue {
     fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
         fields.add_field_function_get("year", |_, ud| {
@@ -528,13 +520,88 @@ impl UserData for DateTimeValue {
         methods.add_meta_function("__eq", |_, (left, right): (AnyUserData, AnyUserData)| {
             Ok(compare_datetime_values(&left, &right, |a, b| a == b))
         });
-        methods.add_meta_function("__lt", |_, (left, right): (AnyUserData, AnyUserData)| {
-            Ok(compare_datetime_values(&left, &right, |a, b| a < b))
+        methods.add_meta_function("__lt", |_, (left, right): (AnyUserData, LuaValue)| {
+            compare_datetime_value_to_lua(&left, right, |a, b| a < b)
         });
-        methods.add_meta_function("__le", |_, (left, right): (AnyUserData, AnyUserData)| {
-            Ok(compare_datetime_values(&left, &right, |a, b| a <= b))
+        methods.add_meta_function("__le", |_, (left, right): (AnyUserData, LuaValue)| {
+            compare_datetime_value_to_lua(&left, right, |a, b| a <= b)
         });
     }
+}
+
+fn compare_datetime_value_to_lua<F>(
+    left: &AnyUserData,
+    right: LuaValue,
+    compare: F,
+) -> mlua::Result<bool>
+where
+    F: Fn(i64, i64) -> bool,
+{
+    match right {
+        LuaValue::UserData(right) => Ok(compare_datetime_values(left, &right, compare)),
+        LuaValue::String(right) => {
+            let right = parse_local_time_string(&right)?;
+            let Ok(left) = left.borrow::<DateTimeValue>() else {
+                return Ok(false);
+            };
+            let Some(left) = local_seconds(&left) else {
+                return Ok(false);
+            };
+            Ok(compare(left, right))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn parse_local_time_string(value: &mlua::String) -> mlua::Result<i64> {
+    let bytes = value.as_bytes();
+    let fields = match bytes.len() {
+        5 => [
+            parse_two_digits(&bytes[0..2]),
+            parse_two_digits(&bytes[3..5]),
+            Some(0),
+        ],
+        8 => [
+            parse_two_digits(&bytes[0..2]),
+            parse_two_digits(&bytes[3..5]),
+            parse_two_digits(&bytes[6..8]),
+        ],
+        _ => [None, None, None],
+    };
+    let valid_separators = bytes.get(2) == Some(&b':')
+        && (bytes.len() == 5 || bytes.get(5) == Some(&b':'));
+    if !valid_separators
+        || fields.iter().any(Option::is_none)
+        || fields[0].is_some_and(|hour| hour > 23)
+        || fields[1].is_some_and(|minute| minute > 59)
+        || fields[2].is_some_and(|second| second > 59)
+    {
+        return Err(mlua::Error::RuntimeError(format!(
+            "invalid local time {:?}: expected canonical HH:MM or HH:MM:SS",
+            value.to_string_lossy()
+        )));
+    }
+    Ok(fields[0].unwrap_or_default() * 3_600
+        + fields[1].unwrap_or_default() * 60
+        + fields[2].unwrap_or_default())
+}
+
+fn parse_two_digits(value: &[u8]) -> Option<i64> {
+    (value.len() == 2
+        && value[0].is_ascii_digit()
+        && value[1].is_ascii_digit())
+        .then(|| i64::from(value[0] - b'0') * 10 + i64::from(value[1] - b'0'))
+}
+
+fn local_seconds(value: &DateTimeValue) -> Option<i64> {
+    if !value.available {
+        return None;
+    }
+    Some(
+        i64::from(value.hour?) * 3_600
+            + i64::from(value.minute?) * 60
+            + i64::from(value.second?),
+    )
 }
 
 fn compare_datetime_values<F>(left: &AnyUserData, right: &AnyUserData, compare: F) -> bool
@@ -794,8 +861,6 @@ pub(crate) fn next_occurrence_after(
         ScheduleRule::Astronomical {
             anchor,
             offset_seconds,
-            earliest,
-            latest,
             weekdays,
         } => {
             let coordinates = site.coordinates?;
@@ -817,8 +882,6 @@ pub(crate) fn next_occurrence_after(
                     anchor_date,
                     *anchor,
                     *offset_seconds,
-                    *earliest,
-                    *latest,
                     weekdays,
                     &tz,
                     coordinates,

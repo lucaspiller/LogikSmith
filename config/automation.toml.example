@@ -31,7 +31,6 @@ enabled = true
 kind = "astronomical"
 anchor = "sunrise"
 offset = "-1h30m"
-earliest = "05:30"
 
 [[blocks.schedules]]
 name = "morning_off"

@@ -32,7 +32,7 @@ const schedules = [
     name: 'morning_on',
     enabled: true,
     status: 'active',
-    rule: { kind: 'astronomical', summary: 'sunrise - 1h30m, earliest 05:30' },
+    rule: { kind: 'astronomical', summary: 'sunrise - 1h30m' },
     next_occurrence: '2026-08-29 05:30:00',
     next_occurrence_utc_ms: 1_756_500_000_000,
     relative_ms: 3_600_000,
@@ -66,7 +66,7 @@ const schedules = [
   }
 ];
 const scheduleDefinitions = [
-  { name: 'morning_on', enabled: true, kind: 'astronomical', anchor: 'sunrise', offset: '-1h30m', earliest: '05:30' },
+  { name: 'morning_on', enabled: true, kind: 'astronomical', anchor: 'sunrise', offset: '-1h30m' },
   { name: 'heartbeat', enabled: true, kind: 'interval', every: '60s' },
   { name: 'evening_off', enabled: false, kind: 'fixed', at: '23:30' }
 ];
@@ -181,7 +181,7 @@ function simulation(body) {
   if (body.trigger?.type === 'schedule') {
     const schedule = body.trigger.schedule ?? 'morning_on';
     if (body.trigger.occurrence_at_ms === undefined || body.trigger.occurrence_at_ms === null) {
-      return { block_id: body.block_id, schedule, rule: { kind: 'astronomical', summary: 'sunrise - 1h30m, earliest 05:30' }, occurrences: [
+      return { block_id: body.block_id, schedule, rule: { kind: 'astronomical', summary: 'sunrise - 1h30m' }, occurrences: [
         { utc_ms: 1_756_500_000_000, local: '2026-08-29 05:30:00', utc_offset: 10800, weekday: 'Saturday' },
         { utc_ms: 1_756_586_400_000, local: '2026-08-30 05:30:00', utc_offset: 10800, weekday: 'Sunday' },
         { utc_ms: 1_756_672_800_000, local: '2026-08-31 05:30:00', utc_offset: 10800, weekday: 'Monday' }
@@ -211,7 +211,7 @@ function contractErrors(body, required, optional = []) {
 function schedulePreview(body) {
   const base = simulation({ block_id: body.block_id, trigger: { type: 'schedule', schedule: body.schedule } });
   const occurrences = base.occurrences ?? [];
-  return { block_id: body.block_id, schedule: body.schedule, rule: { kind: 'astronomical', summary: 'sunrise - 1h30m, earliest 05:30' }, occurrences: occurrences.slice(0, body.count ?? 3) };
+  return { block_id: body.block_id, schedule: body.schedule, rule: { kind: 'astronomical', summary: 'sunrise - 1h30m' }, occurrences: occurrences.slice(0, body.count ?? 3) };
 }
 function schedulePreviewResponse(body) {
   // These names make the fixture useful for manually checking the final

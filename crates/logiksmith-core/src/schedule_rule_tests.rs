@@ -68,15 +68,11 @@
     fn astro(
         anchor: SolarAnchor,
         offset_seconds: i32,
-        earliest: Option<LocalTime>,
-        latest: Option<LocalTime>,
         weekdays: &[Weekday],
     ) -> ScheduleRule {
         ScheduleRule::Astronomical {
             anchor,
             offset_seconds,
-            earliest,
-            latest,
             weekdays: WeekdaySet::new(weekdays).unwrap(),
         }
     }
@@ -330,11 +326,11 @@
     // --- astronomical rules --------------------------------------------------
 
     #[test]
-    fn astronomical_offset_and_guards() {
+    fn astronomical_offset() {
         let site = utc_site();
         let baseline = utc_ms(2026, 6, 1, 0, 0, 0);
         // Plain offset: sunrise at (0,0) + 1h, computed from the NOAA engine.
-        let plain = astro(SolarAnchor::Sunrise, 3600, None, None, &Weekday::ALL);
+        let plain = astro(SolarAnchor::Sunrise, 3600, &Weekday::ALL);
         let sunrise_june_1 =
             noaa::solar_event_utc_ms(2026, 6, 1, 0.0, 0.0, SUNRISE_THRESHOLD_DEGREES)
                 .expect("equator sunrise exists");
@@ -342,44 +338,12 @@
             next_occurrence_after(&plain, &site, baseline),
             Some(sunrise_june_1 + 3_600_000)
         );
-        // earliest guard clamps the ~06:5x local time up to 08:00.
-        let earliest = astro(
-            SolarAnchor::Sunrise,
-            3600,
-            Some(LocalTime {
-                hour: 8,
-                minute: 0,
-                second: 0,
-            }),
-            None,
-            &Weekday::ALL,
-        );
-        assert_eq!(
-            next_occurrence_after(&earliest, &site, baseline),
-            Some(utc_ms(2026, 6, 1, 8, 0, 0))
-        );
-        // latest guard clamps the ~06:5x local time down to 06:00.
-        let latest = astro(
-            SolarAnchor::Sunrise,
-            3600,
-            None,
-            Some(LocalTime {
-                hour: 6,
-                minute: 0,
-                second: 0,
-            }),
-            &Weekday::ALL,
-        );
-        assert_eq!(
-            next_occurrence_after(&latest, &site, baseline),
-            Some(utc_ms(2026, 6, 1, 6, 0, 0))
-        );
     }
 
     #[test]
     fn astronomical_weekday_filter_on_final_date() {
         // 2026-06-01 is a Monday; a Saturday-only rule fires on June 6.
-        let saturdays = astro(SolarAnchor::Sunrise, 3600, None, None, &[Weekday::Saturday]);
+        let saturdays = astro(SolarAnchor::Sunrise, 3600, &[Weekday::Saturday]);
         let sunrise_june_6 =
             noaa::solar_event_utc_ms(2026, 6, 6, 0.0, 0.0, SUNRISE_THRESHOLD_DEGREES)
                 .expect("equator sunrise exists");
@@ -417,7 +381,7 @@
             }
         }
         let next_crossing = next_crossing.expect("polar sunrise crossing within the window");
-        let all = astro(SolarAnchor::Sunrise, 0, None, None, &Weekday::ALL);
+        let all = astro(SolarAnchor::Sunrise, 0, &Weekday::ALL);
         assert_eq!(
             next_occurrence_after(&all, &polar_site, baseline),
             Some(next_crossing)
@@ -432,7 +396,7 @@
             .filter(|weekday| !crossing_weekdays.contains(weekday))
             .collect();
         assert!(!allowed.is_empty());
-        let filtered = astro(SolarAnchor::Sunrise, 0, None, None, &allowed);
+        let filtered = astro(SolarAnchor::Sunrise, 0, &allowed);
         assert_eq!(
             next_occurrence_after(&filtered, &polar_site, baseline),
             None
@@ -445,7 +409,7 @@
             timezone: TimeZoneId::utc(),
             coordinates: None,
         };
-        let rule = astro(SolarAnchor::Sunrise, 0, None, None, &Weekday::ALL);
+        let rule = astro(SolarAnchor::Sunrise, 0, &Weekday::ALL);
         assert_eq!(
             next_occurrence_after(&rule, &no_coords, utc_ms(2026, 6, 1, 0, 0, 0)),
             None
@@ -796,7 +760,7 @@
                 vec![schedule(
                     "polar",
                     true,
-                    astro(SolarAnchor::Sunrise, 0, None, None, &polar_weekdays),
+                    astro(SolarAnchor::Sunrise, 0, &polar_weekdays),
                 )],
             )],
             polar_site,

@@ -2,8 +2,6 @@ fn astronomical_occurrence(
     anchor: Date,
     anchor_kind: SolarAnchor,
     offset_seconds: i32,
-    earliest: Option<LocalTime>,
-    latest: Option<LocalTime>,
     weekdays: &WeekdaySet,
     tz: &TimeZone,
     coordinates: Coordinates,
@@ -23,31 +21,8 @@ fn astronomical_occurrence(
         evening,
     )?;
     let candidate_utc = event_utc.saturating_add(i64::from(offset_seconds) * 1000);
-    let local = local_datetime_of(tz, candidate_utc)?;
-    let mut final_dt = local;
-    if let Some(earliest_time) = earliest
-        && is_valid_local_time(&earliest_time)
-        && local_time_of(local) < earliest_time
-    {
-        final_dt = local.date().at(
-            earliest_time.hour as i8,
-            earliest_time.minute as i8,
-            earliest_time.second as i8,
-            0,
-        );
-    }
-    if let Some(latest_time) = latest
-        && is_valid_local_time(&latest_time)
-        && local_time_of(final_dt) > latest_time
-    {
-        final_dt = local.date().at(
-            latest_time.hour as i8,
-            latest_time.minute as i8,
-            latest_time.second as i8,
-            0,
-        );
-    }
-    // Weekday filter applies to the FINAL computed occurrence's local date.
+    let final_dt = local_datetime_of(tz, candidate_utc)?;
+    // Weekday filter applies to the computed occurrence's local date.
     if !weekdays.contains(weekday_of(final_dt.date())) {
         return None;
     }
@@ -128,14 +103,6 @@ fn utc_civil_date(utc_ms: i64) -> (i32, u32, u32) {
     noaa::civil_from_days(utc_ms.div_euclid(86_400_000))
 }
 
-fn local_time_of(dt: DateTime) -> LocalTime {
-    LocalTime {
-        hour: dt.hour() as u8,
-        minute: dt.minute() as u8,
-        second: dt.second() as u8,
-    }
-}
-
 fn weekday_of(date: Date) -> Weekday {
     match date.weekday() {
         JiffWeekday::Monday => Weekday::Monday,
@@ -146,10 +113,6 @@ fn weekday_of(date: Date) -> Weekday {
         JiffWeekday::Saturday => Weekday::Saturday,
         JiffWeekday::Sunday => Weekday::Sunday,
     }
-}
-
-fn is_valid_local_time(at: &LocalTime) -> bool {
-    at.hour <= 23 && at.minute <= 59 && at.second <= 59
 }
 
 /// The [`DateTimeValue`] of the solar event on `date`, or an unavailable
