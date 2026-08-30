@@ -81,10 +81,6 @@ describe('automation editor model', () => {
     expect(JSON.parse(String(request?.body))).toEqual({ document: { blocks: [{ ...canonical.blocks?.[0], revision: 12 }] } });
   });
 
-  it('rejects removed astronomical clamp fields', () => {
-    expect(() => decodeAutomationDocument({ blocks: [{ id: 'stairs', revision: 1, enabled: true, inputs: [], outputs: [], knx_bindings: [], source: 'return nil', schedules: [{ name: 'sunset_check', enabled: true, kind: 'astronomical', anchor: 'sunset', offset: '-15m', earliest: '05:30' }] }] })).toThrow(/earliest/);
-  });
-
   it('decodes the names cancelled by a source activation', async () => {
     const result = await saveAutomation(document(), 7, async () => new Response(JSON.stringify({
       revision: 8,

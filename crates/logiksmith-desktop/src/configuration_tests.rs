@@ -95,8 +95,6 @@
             every: Some("60s".to_owned()),
             offset: None,
             anchor: None,
-            earliest: None,
-            latest: None,
             weekdays: Some(vec!["mon".to_owned()]),
             extra: Default::default(),
         };
@@ -120,8 +118,6 @@
             every: None,
             offset: None,
             anchor: None,
-            earliest: None,
-            latest: None,
             weekdays: None,
             extra: Default::default(),
         }];
