@@ -7,7 +7,7 @@ fn trigger_record(
         Trigger::Input(trigger) => LogicalTriggerRecord {
             trigger_type: "input".to_owned(),
             endpoint: trigger.endpoint.to_string(),
-            dpt: DptMessage::from_core(trigger.value.dpt),
+        dpt: DptMessage::from_core(trigger.value.dpt()),
             value: ValueMessage::from_core(trigger.value),
             previous: trigger.previous.map(ValueMessage::from_core),
             changed: trigger.changed,
@@ -154,7 +154,7 @@ pub fn simulation_response(
         block_id: automation
             .blocks
             .first()
-            .map(|block| block.id.clone())
+            .map(|block| block.id.to_string())
             .unwrap_or_default(),
         logic_revision,
         duration_us,
@@ -261,8 +261,8 @@ fn effect_record(
     effect: &OutputEffect,
     automation: &AutomationRuntime,
 ) -> Option<LogicalEffectRecord> {
-    let block_id = automation.blocks.first().map(|block| block.id.as_str())?;
-    effect_record_for_block(effect, automation, &block_id.parse().ok()?)
+    let block_id = &automation.blocks.first()?.id;
+    effect_record_for_block(effect, automation, block_id)
 }
 
 fn effect_record_for_block(
@@ -277,9 +277,9 @@ fn effect_record_for_block(
         endpoint: endpoint.to_string(),
         destination: automation
             .output_to_address
-            .get(&(block_id.to_string(), endpoint.clone()))?
+            .get(&(block_id.clone(), endpoint.clone()))?
             .to_string(),
-        dpt: DptMessage::from_core(value.dpt),
+        dpt: DptMessage::from_core(value.dpt()),
         value: ValueMessage::from_core(value),
     })
 }
@@ -328,7 +328,7 @@ fn transition_record(
     let Some(block_id) = automation
         .blocks
         .first()
-        .and_then(|block| block.id.parse::<logiksmith_core::BlockId>().ok())
+        .map(|block| block.id.clone())
     else {
         return LogicalTransitionRecord {
             state: state_record(&transition.state),
@@ -707,7 +707,7 @@ fn block_automation_snapshot(
         .document
         .blocks
         .iter()
-        .find(|candidate| candidate.id == block.id)
+        .find(|candidate| candidate.id == block.id.as_str())
         .map(|candidate| candidate.source.as_str())
         .unwrap_or_default();
     block_automation_snapshot_with_source(block, source)
@@ -730,7 +730,7 @@ fn block_automation_snapshot_with_source(
                 "unbound"
             }
             .to_owned(),
-            signal,
+            signal: signal.map(|signal| signal.to_string()),
         }
     };
     let inputs = block
@@ -761,7 +761,7 @@ fn block_automation_snapshot_with_source(
         .iter()
         .map(|(endpoint, signal)| SignalBindingSnapshot {
             endpoint: endpoint.to_string(),
-            signal: signal.clone(),
+            signal: signal.to_string(),
         })
         .collect();
     signal_bindings.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));

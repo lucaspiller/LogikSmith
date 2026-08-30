@@ -54,11 +54,11 @@ pub(crate) fn apply_simulation(
     request: SimulationRequest,
 ) {
     let SimulationRequest { payload, reply } = request;
-    let Some(block) = config.automation.block(&payload.block_id) else {
+    let Ok(block_id) = payload.block_id.parse::<BlockId>() else {
         let _ = reply.send(SimulationOutcome::NotFound);
         return;
     };
-    let Ok(block_id) = payload.block_id.parse::<BlockId>() else {
+    let Some(block) = config.automation.block(&block_id) else {
         let _ = reply.send(SimulationOutcome::NotFound);
         return;
     };

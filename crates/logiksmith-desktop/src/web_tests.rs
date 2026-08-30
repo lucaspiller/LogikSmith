@@ -342,11 +342,12 @@
                     current_revision: active_revision,
                 }
             } else {
-                let block = runtime.block(&payload.block_id).expect("known block");
+                let block_id = payload.block_id.parse().expect("known block ID");
+                let block = runtime.block(&block_id).expect("known block");
                 match crate::simulation_scenario(payload.clone(), block) {
                     Err(errors) => crate::SimulationOutcome::Invalid(errors),
                     Ok(scenario) => match core_runtime
-                        .simulate_input(&payload.block_id.parse().unwrap(), scenario)
+                        .simulate_input(&block_id, scenario)
                     {
                         Ok(execution) => crate::SimulationOutcome::Complete(
                             crate::diagnostics::simulation_response_for_block(

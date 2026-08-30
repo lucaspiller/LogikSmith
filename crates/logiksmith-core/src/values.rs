@@ -47,8 +47,8 @@ impl Endpoint {
 /// A structured KNX datapoint type identifier.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Dpt {
-    pub major: u16,
-    pub subtype: u16,
+    major: u16,
+    subtype: u16,
 }
 
 impl Dpt {
@@ -79,6 +79,14 @@ impl Dpt {
 
     pub fn parse(value: &str) -> Result<Self, DptError> {
         value.parse()
+    }
+
+    pub const fn major(self) -> u16 {
+        self.major
+    }
+
+    pub const fn subtype(self) -> u16 {
+        self.subtype
     }
 
     pub const fn is_bool(self) -> bool {
@@ -153,15 +161,24 @@ pub enum Value {
 /// A value with its DPT identity attached.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TypedValue {
-    pub dpt: Dpt,
-    pub value: Value,
+    dpt: Dpt,
+    value: Value,
 }
 
 impl TypedValue {
     pub fn new(dpt: Dpt, value: Value) -> Result<Self, ValueError> {
-        let typed = Self { dpt, value };
-        typed.validate()?;
-        Ok(typed)
+        match (dpt, value) {
+            (dpt, Value::Bool(_)) if dpt.is_bool() => Ok(Self { dpt, value }),
+            (dpt, Value::Percent(value)) if dpt.is_percent() && value <= 100 => Ok(Self {
+                dpt,
+                value: Value::Percent(value),
+            }),
+            (dpt, Value::Percent(value)) if dpt.is_percent() => {
+                Err(ValueError::PercentOutOfRange(value))
+            }
+            (dpt, _) if !dpt.is_supported() => Err(ValueError::UnsupportedDpt(dpt)),
+            (dpt, value) => Err(ValueError::DptValueMismatch { dpt, value }),
+        }
     }
 
     pub const fn bool(value: bool) -> Self {
@@ -175,16 +192,12 @@ impl TypedValue {
         Self::new(Dpt::PERCENT, Value::Percent(value))
     }
 
-    pub fn validate(self) -> Result<(), ValueError> {
-        match (self.dpt, self.value) {
-            (dpt, Value::Bool(_)) if dpt.is_bool() => Ok(()),
-            (dpt, Value::Percent(value)) if dpt.is_percent() && value <= 100 => Ok(()),
-            (dpt, Value::Percent(value)) if dpt.is_percent() => {
-                Err(ValueError::PercentOutOfRange(value))
-            }
-            (dpt, _) if !dpt.is_supported() => Err(ValueError::UnsupportedDpt(dpt)),
-            (dpt, value) => Err(ValueError::DptValueMismatch { dpt, value }),
-        }
+    pub const fn dpt(self) -> Dpt {
+        self.dpt
+    }
+
+    pub const fn value(self) -> Value {
+        self.value
     }
 }
 
@@ -213,6 +226,29 @@ impl fmt::Display for ValueError {
 }
 
 impl Error for ValueError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dpt_components_are_read_only_value_object_data() {
+        let dpt = Dpt::new(9, 4).unwrap();
+        assert_eq!(dpt.major(), 9);
+        assert_eq!(dpt.subtype(), 4);
+        assert_eq!(dpt.to_string(), "9.004");
+    }
+
+    #[test]
+    fn typed_value_constructor_preserves_dpt_pairing_invariant() {
+        assert!(TypedValue::new(Dpt::BOOL, Value::Percent(42)).is_err());
+        assert!(TypedValue::new(Dpt::PERCENT, Value::Percent(101)).is_err());
+
+        let value = TypedValue::bool(true);
+        assert_eq!(value.dpt(), Dpt::BOOL);
+        assert_eq!(value.value(), Value::Bool(true));
+    }
+}
 
 /// An input event supplied by a host or adapter. Only this explicit trigger
 /// operation evaluates Lua; use [`InputObservation`] for passive updates.

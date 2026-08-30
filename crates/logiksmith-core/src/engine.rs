@@ -751,7 +751,6 @@ impl Engine {
         endpoint_name: &EndpointName,
         value: TypedValue,
     ) -> Result<usize, EventError> {
-        value.validate().map_err(EventError::InvalidValue)?;
         let (index, endpoint) = self
             .config
             .endpoints
@@ -765,11 +764,11 @@ impl Engine {
                 actual: endpoint.direction,
             });
         }
-        if endpoint.dpt != value.dpt {
+        if endpoint.dpt != value.dpt() {
             return Err(EventError::DptMismatch {
                 endpoint: endpoint_name.clone(),
                 expected: endpoint.dpt,
-                actual: value.dpt,
+                actual: value.dpt(),
             });
         }
         Ok(index)

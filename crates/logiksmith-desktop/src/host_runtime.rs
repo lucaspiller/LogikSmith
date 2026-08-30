@@ -267,7 +267,7 @@ async fn run_session(
                 line.clear();
                 match message {
                     Message::KnxEvent(event) => {
-                        let destination = GroupAddress::parse(&event.destination).map_err(|error| ProtocolError::Field("destination", error.to_string()))?;
+                        let destination = event.destination_address();
                         let logical_endpoint = config.automation.address_to_inputs.get(&destination).and_then(|bindings| bindings.first()).map(|binding| binding.endpoint.clone());
                         store.record_telegram(TelegramRecord::from_event(&event, logical_endpoint.as_ref()));
                         let Some(bindings) = config.automation.address_to_inputs.get(&destination) else { continue };
@@ -281,9 +281,8 @@ async fn run_session(
                             };
                             for binding in bindings {
                                 let input = InputEvent::new(binding.endpoint.clone(), input_value);
-                                let block_id = binding.block_id.parse::<BlockId>().map_err(|error| ProtocolError::Field("block_id", error.to_string()))?;
                                 let started = Instant::now();
-                                let result = runtime.process_input_cascade_sampled(&block_id, input, sample.clone());
+                                let result = runtime.process_input_cascade_sampled(&binding.block_id, input, sample.clone());
                                 let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
                                 match result {
                                     Ok(executions) => record_and_dispatch_cascade(
@@ -302,9 +301,8 @@ async fn run_session(
                         } else if event.service == "group_value_response"
                             && let Some(value) = event.typed_value()? {
                             for binding in bindings {
-                                let block_id = binding.block_id.parse::<BlockId>().map_err(|error| ProtocolError::Field("block_id", error.to_string()))?;
                                 let observation = InputObservation::new(binding.endpoint.clone(), value);
-                                if let Err(error) = runtime.observe_input(&block_id, observation, now) {
+                                if let Err(error) = runtime.observe_input(&binding.block_id, observation, now) {
                                     tracing::warn!(target: "logiksmith", block = %binding.block_id, error = %error, "ignoring invalid passive input observation");
                                 }
                             }

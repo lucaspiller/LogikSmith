@@ -60,10 +60,7 @@ pub(crate) fn execute_logic(
             event_backing
                 .set(
                     "value",
-                    typed_value_to_lua(trigger.value).map_err(|message| LogicError::Runtime {
-                        message,
-                        line: None,
-                    })?,
+                    typed_value_to_lua(trigger.value),
                 )
                 .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
             event_backing
@@ -72,11 +69,6 @@ pub(crate) fn execute_logic(
                     trigger
                         .previous
                         .map(typed_value_to_lua)
-                        .transpose()
-                        .map_err(|message| LogicError::Runtime {
-                            message,
-                            line: None,
-                        })?
                         .unwrap_or(LuaValue::Nil),
                 )
                 .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
@@ -146,10 +138,7 @@ pub(crate) fn execute_logic(
             input_backing
                 .set(
                     snapshot.endpoint.as_str(),
-                    typed_value_to_lua(value).map_err(|message| LogicError::Runtime {
-                        message,
-                        line: None,
-                    })?,
+                    typed_value_to_lua(value),
                 )
                 .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
         }

@@ -49,7 +49,7 @@ async fn dispatch_effects(
         let value = effect.value;
         let Some(destination) = automation
             .output_to_address
-            .get(&(block_id.to_string(), endpoint.clone()))
+            .get(&(block_id.clone(), endpoint.clone()))
             .copied()
         else {
             tracing::error!(target: "logiksmith", block = %block_id, endpoint = %endpoint, "core returned an unresolved output effect");
@@ -60,7 +60,7 @@ async fn dispatch_effects(
             HostError::Protocol(ProtocolError::Field("request_id", "exhausted".to_owned()))
         })?;
         let dpt = automation
-            .block(block_id.as_str())
+            .block(block_id)
             .and_then(|block| block.endpoint_dpts.get(&endpoint))
             .copied()
             .ok_or_else(|| {
@@ -69,7 +69,7 @@ async fn dispatch_effects(
                     "missing endpoint DPT".to_owned(),
                 ))
             })?;
-        if value.dpt != dpt {
+        if value.dpt() != dpt {
             tracing::error!(target: "logiksmith", endpoint = %endpoint, "core returned an output value with the wrong DPT");
             continue;
         }
