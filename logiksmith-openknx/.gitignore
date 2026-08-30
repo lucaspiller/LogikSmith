@@ -1,0 +1,4 @@
+.pio/
+.pioenvs/
+.pytest_cache/
+scripts/__pycache__/

@@ -1,0 +1,123 @@
+diff --git a/src/knx/transport_layer.h b/src/knx/transport_layer.h
+--- a/src/knx/transport_layer.h
++++ b/src/knx/transport_layer.h
+@@ -13,3 +13,9 @@ class NetworkLayer;
+ class Platform;
+ 
++using RawGroupTelegramObserver = void (*)(void* context,
++                                           uint16_t sourceAddress,
++                                           uint16_t destinationAddress,
++                                           const uint8_t* payload,
++                                           uint8_t payloadLength);
++
+ enum StateType { Closed, OpenIdle, OpenWait, Connecting };
+@@ -19,5 +26,9 @@ public:
+     TransportLayer(ApplicationLayer& layer);
+     void networkLayer(NetworkLayer& layer);
+     void groupAddressTable(AddressTableObject& addrTable);
++    void setRawGroupObserver(void* context, RawGroupTelegramObserver observer);
++    bool dataGroupValueRequestRaw(uint16_t destinationAddress,
++                                  const uint8_t* payload,
++                                  uint8_t payloadLength);
+ 
+ #pragma region from network layer
+@@ -118,4 +132,6 @@ private:
+     ApplicationLayer& _applicationLayer;
+     AddressTableObject* _groupAddressTable;
+     NetworkLayer* _networkLayer;
++    void* _rawGroupObserverContext = nullptr;
++    RawGroupTelegramObserver _rawGroupObserver = nullptr;
+ };
+diff --git a/src/knx/transport_layer.cpp b/src/knx/transport_layer.cpp
+--- a/src/knx/transport_layer.cpp
++++ b/src/knx/transport_layer.cpp
+@@ -11,4 +11,6 @@ TransportLayer::TransportLayer(ApplicationLayer& layer): _savedFrame(0),
+     _savedFrameConnecting(0), _applicationLayer(layer)
+ {
+     _currentState = Closed;
++    _groupAddressTable = nullptr;
++    _networkLayer = nullptr;
+ }
+@@ -23,6 +23,28 @@
+     _groupAddressTable = &addrTable;
+ }
+ 
++void TransportLayer::setRawGroupObserver(void* context, RawGroupTelegramObserver observer)
++{
++    _rawGroupObserverContext = context;
++    _rawGroupObserver = observer;
++}
++
++bool TransportLayer::dataGroupValueRequestRaw(uint16_t destinationAddress,
++                                               const uint8_t* payload,
++                                               uint8_t payloadLength)
++{
++    if (_networkLayer == nullptr || destinationAddress == 0 || destinationAddress > 0x7FFF ||
++        payload == nullptr || payloadLength == 0 || payloadLength > 14)
++        return false;
++    CemiFrame frame(payloadLength + 1);
++    APDU& apdu = frame.apdu();
++    apdu.type(GroupValueWrite);
++    memcpy(apdu.data() + 1, payload, payloadLength);
++    _networkLayer->dataGroupRequest(AckRequested, destinationAddress,
++                                    NetworkLayerParameter, LowPriority, frame.tpdu());
++    return true;
++}
++
+ void TransportLayer::dataIndividualIndication(uint16_t destination, HopCountType hopType, Priority priority, uint16_t source, TPDU& tpdu)
+ {
+     //if (tpdu.apdu().length() > 0)
+@@ -366,3 +389,18 @@ void TransportLayer::dataGroupIndication(uint16_t destination, HopCountType hopType, Priority priority, uint16_t source, TPDU& tpdu)
+ {
++    if (_rawGroupObserver != nullptr && tpdu.apdu().type() == GroupValueWrite)
++    {
++        uint8_t len = tpdu.apdu().length();
++        uint8_t dataArray[0xff];
++        memcpy(dataArray, tpdu.apdu().data(), len);
++        if (len == 1)
++            dataArray[0] &= 0x3f;
++        else if (len > 1)
++        {
++            memmove(dataArray, dataArray + 1, len - 1);
++            --len;
++        }
++        _rawGroupObserver(_rawGroupObserverContext, source, destination, dataArray, len);
++    }
++
+     if (_groupAddressTable == nullptr)
+         return;
+diff --git a/src/knx/bau_systemB_device.h b/src/knx/bau_systemB_device.h
+--- a/src/knx/bau_systemB_device.h
++++ b/src/knx/bau_systemB_device.h
+@@ -23,5 +23,9 @@ class BauSystemBDevice : public BauSystemB
+     void loop() override;
+     bool configured() override;
+     GroupObjectTableObject& groupObjectTable();
++    void setRawGroupObserver(void* context, RawGroupTelegramObserver observer);
++    bool rawGroupValueWrite(uint16_t destinationAddress,
++                            const uint8_t* payload,
++                            uint8_t payloadLength);
+ 
+   protected:
+diff --git a/src/knx/bau_systemB_device.cpp b/src/knx/bau_systemB_device.cpp
+--- a/src/knx/bau_systemB_device.cpp
++++ b/src/knx/bau_systemB_device.cpp
+@@ -39,6 +39,18 @@ GroupObjectTableObject& BauSystemBDevice::groupObjectTable()
+ {
+     return _groupObjTable;
+ }
+ 
++void BauSystemBDevice::setRawGroupObserver(void* context, RawGroupTelegramObserver observer)
++{
++    _transLayer.setRawGroupObserver(context, observer);
++}
++
++bool BauSystemBDevice::rawGroupValueWrite(uint16_t destinationAddress,
++                                           const uint8_t* payload,
++                                           uint8_t payloadLength)
++{
++    return _transLayer.dataGroupValueRequestRaw(destinationAddress, payload, payloadLength);
++}
++
+ void BauSystemBDevice::loop()
+ {
