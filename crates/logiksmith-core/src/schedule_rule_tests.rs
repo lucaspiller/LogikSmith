@@ -41,6 +41,7 @@
         }
     }
 
+    #[cfg(feature = "timezones")]
     fn nyc_site() -> SiteTimeConfig {
         SiteTimeConfig {
             timezone: TimeZoneId::new("America/New_York").unwrap(),
@@ -194,6 +195,7 @@
     }
 
     #[test]
+    #[cfg(feature = "timezones")]
     fn timezone_id_validates_iana_names_and_utc_shortcut() {
         assert!(TimeZoneId::new("Europe/Berlin").is_ok());
         assert!(TimeZoneId::new("America/New_York").is_ok());
@@ -251,6 +253,7 @@
     }
 
     #[test]
+    #[cfg(feature = "timezones")]
     fn fixed_skips_nonexistent_dst_local_time() {
         // America/New_York spring-forward 2026-03-08 02:00 -> 03:00; 02:30
         // never exists. The next occurrence is 2026-03-09 02:30 EDT = 06:30Z.
@@ -269,6 +272,7 @@
     }
 
     #[test]
+    #[cfg(feature = "timezones")]
     fn fixed_ambiguous_fires_once_at_earlier_utc() {
         // America/New_York fall-back 2026-11-01: 01:30 occurs twice (EDT then
         // EST); the earlier UTC instant is 01:30 EDT = 05:30Z.
@@ -326,6 +330,7 @@
     // --- astronomical rules --------------------------------------------------
 
     #[test]
+    #[cfg(feature = "astronomy")]
     fn astronomical_offset() {
         let site = utc_site();
         let baseline = utc_ms(2026, 6, 1, 0, 0, 0);
@@ -341,6 +346,7 @@
     }
 
     #[test]
+    #[cfg(feature = "astronomy")]
     fn astronomical_weekday_filter_on_final_date() {
         // 2026-06-01 is a Monday; a Saturday-only rule fires on June 6.
         let saturdays = astro(SolarAnchor::Sunrise, 3600, &[Weekday::Saturday]);
@@ -354,6 +360,7 @@
     }
 
     #[test]
+    #[cfg(feature = "astronomy")]
     fn astronomical_polar_unavailable_after_370_days() {
         let polar_site = SiteTimeConfig {
             timezone: TimeZoneId::utc(),
@@ -404,6 +411,7 @@
     }
 
     #[test]
+    #[cfg(feature = "astronomy")]
     fn astronomical_without_coordinates_is_unavailable() {
         let no_coords = SiteTimeConfig {
             timezone: TimeZoneId::utc(),
@@ -706,6 +714,7 @@
     }
 
     #[test]
+    #[cfg(feature = "astronomy")]
     fn schedule_statuses_reflect_engine_state() {
         let mut runtime = Runtime::new(RuntimeConfig::with_site(
             vec![block_config(

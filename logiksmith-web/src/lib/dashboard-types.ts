@@ -291,6 +291,56 @@ export interface DisplayLog { time: string; level: string; target: string; messa
 export interface DisplayTimer { state: TimerState; deadlineMs: number | null; remainingMs: number | null; sampledAtMs: number; }
 export interface DisplayWrite { status: WriteStatus; requestId: number | null; blockId?: string | null; executionId?: number | null; value: boolean | number | null; error: string | null; }
 
+export interface DisplayQueue {
+  capacity: number;
+  depth: number;
+  highWater: number;
+  accepted: number;
+  rejected: number;
+}
+export interface DisplayHostTurn {
+  lastDurationUs: number;
+  maxDurationUs: number;
+  overBudgetCount: number;
+  warningCount: number;
+  lastOverBudget: boolean;
+  lastWarning: boolean;
+}
+export interface DisplayCapacity {
+  used: number;
+  capacity: number;
+}
+export interface DisplayCoreUsage {
+  logicBlocks: DisplayCapacity;
+  signals: DisplayCapacity;
+  signalBindings: DisplayCapacity;
+  logicSourceBytes: DisplayCapacity;
+  stateEntries: DisplayCapacity;
+  stateBytes: DisplayCapacity;
+  pendingTimers: DisplayCapacity;
+}
+export interface DisplayOperationsBlockHealth {
+  status: string;
+  consecutiveFailures: number;
+  liveExecutionsLastSecond: number;
+  lastSuspension: string | null;
+  lastExecutionAtMs: number | null;
+  lastFailureAtMs: number | null;
+  lastError: DisplayLogicError | null;
+}
+export interface DisplayOperations {
+  profile: string;
+  status: 'healthy' | 'degraded' | 'overloaded' | string;
+  queues: Record<string, DisplayQueue>;
+  core: DisplayCoreUsage;
+  hostTurn: DisplayHostTurn;
+  blockHealth: Record<string, DisplayOperationsBlockHealth>;
+  pendingKnxWrites: number;
+  pendingKnxWriteCapacity: number;
+  pendingWriteTimeouts: number;
+  fatal: string | null;
+}
+
 export interface DisplaySnapshot {
   revision: number;
   connection: { state: ConnectionState };
@@ -322,6 +372,7 @@ export interface DisplaySnapshot {
   telegrams: DisplayTelegram[];
   logs: DisplayLog[];
   blocks: DisplayBlock[];
+  operations?: DisplayOperations;
 }
 
 export interface DashboardState { snapshot: DisplaySnapshot | null; revision: number; streamStatus: StreamStatus; stale: boolean; staleAtMs: number | null; error: string | null; needsResync: boolean; nowMs: number; selectedBlockId: string | null; selectedExecutionId: number | null; selectionPinned: boolean; selectionNotice: string | null; }

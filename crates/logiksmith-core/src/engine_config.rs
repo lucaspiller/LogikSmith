@@ -1,4 +1,4 @@
-use crate::lua::validate_logic_source;
+use crate::lua::validate_logic_source_with_limits;
 use crate::program::revision_for;
 use crate::*;
 
@@ -22,6 +22,16 @@ impl EngineConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with_limits(&RuntimeLimits::desktop())
+    }
+
+    pub fn validate_with_limits(&self, limits: &RuntimeLimits) -> Result<(), ConfigError> {
+        if self.endpoints.len() > limits.max_endpoints_per_block {
+            return Err(ConfigError::TooManyEndpoints {
+                actual: self.endpoints.len(),
+                maximum: limits.max_endpoints_per_block,
+            });
+        }
         for (index, endpoint) in self.endpoints.iter().enumerate() {
             if self
                 .endpoints
@@ -45,7 +55,8 @@ impl EngineConfig {
                 line: None,
             }));
         }
-        validate_logic_source(&self.logic.source).map_err(ConfigError::InvalidLogic)
+        validate_logic_source_with_limits(&self.logic.source, limits, None)
+            .map_err(ConfigError::InvalidLogic)
     }
 
     pub fn logic_source(&self) -> &str {

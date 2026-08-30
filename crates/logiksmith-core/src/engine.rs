@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use crate::lua::execute_logic;
 use crate::state::{
-    apply_timer_effects, merge_state, validate_pending_timer_map, validate_pending_timers,
-    validate_state_map,
+    apply_timer_effects, merge_state_with_limits, validate_pending_timer_map_with_limits,
+    validate_pending_timers_with_limits, validate_state_map_with_limits,
 };
 use crate::support::{
     default_site, input_trigger, unavailable_time_context, validate_simulation_input,
@@ -15,6 +15,7 @@ use crate::*;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Engine {
     pub(crate) config: EngineConfig,
+    pub(crate) limits: RuntimeLimits,
     inputs: Vec<InputState>,
     state: TransientState,
     pub(crate) pending_timers: BTreeMap<TimerName, PendingTimer>,
@@ -35,78 +36,23 @@ impl Engine {
     }
 
     pub fn try_new(config: EngineConfig) -> Result<Self, ConfigError> {
-        config.validate()?;
+        Self::try_new_with_limits(config, RuntimeLimits::desktop())
+    }
+
+    pub fn try_new_with_limits(
+        config: EngineConfig,
+        limits: RuntimeLimits,
+    ) -> Result<Self, ConfigError> {
+        config.validate_with_limits(&limits)?;
         let inputs = vec![InputState::default(); config.endpoints.len()];
         Ok(Self {
             config,
+            limits,
             inputs,
             state: BTreeMap::new(),
             pending_timers: BTreeMap::new(),
             last_accepted_at: None,
         })
-    }
-
-    pub fn config(&self) -> &EngineConfig {
-        &self.config
-    }
-
-    pub fn logic_program(&self) -> &LogicProgram {
-        &self.config.logic
-    }
-
-    /// The active source revision. Replacing a source takes effect only after
-    /// validation and between calls, so this always identifies the next
-    /// execution's program.
-    pub fn active_logic_revision(&self) -> LogicRevision {
-        self.config.logic.revision
-    }
-
-    /// Alias for hosts that use the shorter revision terminology.
-    pub fn logic_revision(&self) -> LogicRevision {
-        self.active_logic_revision()
-    }
-
-    pub fn snapshot(&self) -> EngineSnapshot {
-        EngineSnapshot {
-            logic_revision: self.active_logic_revision(),
-            known_inputs: self.known_input_values(),
-            state: self.state.clone(),
-            pending_timers: self.pending_timers(),
-        }
-    }
-
-    pub fn state(&self) -> &TransientState {
-        &self.state
-    }
-
-    pub fn transient_state(&self) -> &TransientState {
-        self.state()
-    }
-
-    pub fn pending_timers(&self) -> Vec<PendingTimer> {
-        self.pending_timers.values().cloned().collect()
-    }
-
-    pub fn next_timer_deadline(&self) -> Option<MonotonicMs> {
-        self.pending_timers.values().map(|timer| timer.due_at).min()
-    }
-
-    /// Returns known values in configured input declaration order.
-    pub fn known_input_values(&self) -> Vec<(EndpointName, TypedValue)> {
-        self.config
-            .endpoints
-            .iter()
-            .enumerate()
-            .filter_map(|(index, endpoint)| {
-                (endpoint.direction == EndpointDirection::Input)
-                    .then(|| {
-                        self.inputs[index]
-                            .value
-                            .map(|value| (endpoint.name.clone(), value))
-                    })
-                    .flatten()
-            })
-            .collect()
     }
 
     /// Validates a candidate source in the same restricted environment used at
@@ -176,7 +122,7 @@ impl Engine {
         &mut self,
         source: impl Into<String>,
     ) -> Result<SourceActivation, LogicError> {
-        let program = LogicProgram::try_new(source)?;
+        let program = LogicProgram::try_new_with_limits(source, self.limits)?;
         let revision = program.revision;
         if revision == self.active_logic_revision() {
             return Ok(SourceActivation {
@@ -229,7 +175,7 @@ impl Engine {
         source: impl Into<String>,
         revision: LogicRevision,
     ) -> Result<(), LogicError> {
-        let program = LogicProgram::try_new(source)?;
+        let program = LogicProgram::try_new_with_limits(source, self.limits)?;
         if program.revision != revision {
             return Err(LogicError::Load {
                 message: "logic source revision does not match its source bytes".to_owned(),
@@ -249,7 +195,7 @@ impl Engine {
         revision: LogicRevision,
     ) -> Result<SourceActivation, LogicError> {
         let source = source.into();
-        let program = LogicProgram::try_new(source.clone())?;
+        let program = LogicProgram::try_new_with_limits(source.clone(), self.limits)?;
         if program.revision != revision {
             return Err(LogicError::Load {
                 message: "logic source revision does not match its source bytes".to_owned(),
@@ -302,12 +248,31 @@ impl Engine {
         .ok_or_else(|| unreachable!("trigger input always produces an execution"))
     }
 
+    /// ClockSample variant which passes a host-owned elapsed-time probe into
+    /// the Lua instruction hook.
+    pub fn process_input_sampled_with_budget_probe(
+        &mut self,
+        event: InputEvent,
+        sample: ClockSample,
+        site: &SiteTimeConfig,
+        budget_probe: BudgetProbeHandle,
+    ) -> Result<Execution, EventError> {
+        self.process_input_update_sampled_with_budget_probe(
+            event.endpoint,
+            InputUpdate::Trigger(event.value),
+            sample,
+            site,
+            budget_probe,
+        )?
+        .ok_or_else(|| unreachable!("trigger input always produces an execution"))
+    }
+
     /// The legacy MonotonicMs variant captures an unavailable time context.
     pub fn process_next_due_timer(
         &mut self,
         now: MonotonicMs,
     ) -> Result<Option<Execution>, EventError> {
-        self.process_next_due_timer_with_context(now, &default_site(), None)
+        self.process_next_due_timer_with_context(now, &default_site(), None, None)
     }
 
     /// ClockSample variant: captures the frozen time context from `site` and
@@ -317,7 +282,28 @@ impl Engine {
         sample: ClockSample,
         site: &SiteTimeConfig,
     ) -> Result<Option<Execution>, EventError> {
-        self.process_next_due_timer_with_context(sample.monotonic_ms, site, sample.utc_unix_ms)
+        self.process_next_due_timer_with_context(
+            sample.monotonic_ms,
+            site,
+            sample.utc_unix_ms,
+            None,
+        )
+    }
+
+    /// ClockSample timer variant which passes a host-owned elapsed-time probe
+    /// into the Lua instruction hook.
+    pub fn process_next_due_timer_sampled_with_budget_probe(
+        &mut self,
+        sample: ClockSample,
+        site: &SiteTimeConfig,
+        budget_probe: BudgetProbeHandle,
+    ) -> Result<Option<Execution>, EventError> {
+        self.process_next_due_timer_with_context(
+            sample.monotonic_ms,
+            site,
+            sample.utc_unix_ms,
+            Some(budget_probe),
+        )
     }
 
     fn process_next_due_timer_with_context(
@@ -325,6 +311,7 @@ impl Engine {
         now: MonotonicMs,
         site: &SiteTimeConfig,
         utc_unix_ms: Option<i64>,
+        budget_probe: Option<BudgetProbeHandle>,
     ) -> Result<Option<Execution>, EventError> {
         self.accept_time(now)?;
         let Some((name, timer)) = self
@@ -367,11 +354,13 @@ impl Engine {
             &self.pending_timers,
             now,
             &TimeContext::capture(site, utc_unix_ms),
+            &self.limits,
+            budget_probe,
         );
         let mut state_after = state_before.clone();
         let mut pending_timers = self.pending_timers();
         if let Ok(transition) = &outcome {
-            state_after = merge_state(&state_before, &transition.state)
+            state_after = merge_state_with_limits(&state_before, &transition.state, &self.limits)
                 .expect("validated transition state must merge");
             let candidate = apply_timer_effects(
                 &self.pending_timers,
@@ -514,11 +503,15 @@ impl Engine {
             &self.pending_timers,
             MonotonicMs(0),
             &unavailable_time_context(),
+            &self.limits,
+            None,
         );
         let state_after = outcome
             .as_ref()
             .ok()
-            .and_then(|transition| merge_state(&state_before, &transition.state).ok())
+            .and_then(|transition| {
+                merge_state_with_limits(&state_before, &transition.state, &self.limits).ok()
+            })
             .unwrap_or_else(|| state_before.clone());
         let pending_timers = outcome
             .as_ref()
@@ -557,8 +550,13 @@ impl Engine {
         pending_timers: Vec<PendingTimer>,
         now: MonotonicMs,
     ) -> Result<Execution, SimulationError> {
-        validate_state_map(&state).map_err(SimulationError::InvalidState)?;
-        validate_pending_timers(&pending_timers, self.active_logic_revision())?;
+        validate_state_map_with_limits(&state, &self.limits)
+            .map_err(SimulationError::InvalidState)?;
+        validate_pending_timers_with_limits(
+            &pending_timers,
+            self.active_logic_revision(),
+            &self.limits,
+        )?;
         let execution = self.simulate_input_against(scenario, state, pending_timers, now)?;
         Ok(execution)
     }
@@ -567,14 +565,19 @@ impl Engine {
         &self,
         scenario: TimerSimulationScenario,
     ) -> Result<Execution, SimulationError> {
-        validate_state_map(&scenario.state).map_err(SimulationError::InvalidState)?;
+        validate_state_map_with_limits(&scenario.state, &self.limits)
+            .map_err(SimulationError::InvalidState)?;
         let mut supplied = BTreeMap::new();
         for timer in scenario.pending_timers {
             if supplied.insert(timer.name.clone(), timer.clone()).is_some() {
                 return Err(SimulationError::DuplicateTimer(timer.name));
             }
         }
-        validate_pending_timer_map(&supplied, self.active_logic_revision())?;
+        validate_pending_timer_map_with_limits(
+            &supplied,
+            self.active_logic_revision(),
+            &self.limits,
+        )?;
         let timer = supplied
             .remove(&scenario.timer)
             .ok_or_else(|| SimulationError::UnknownTimer(scenario.timer.clone()))?;
@@ -603,11 +606,15 @@ impl Engine {
             &supplied,
             scenario.fired_at,
             &unavailable_time_context(),
+            &self.limits,
+            None,
         );
         let state_after = outcome
             .as_ref()
             .ok()
-            .and_then(|transition| merge_state(&state_before, &transition.state).ok())
+            .and_then(|transition| {
+                merge_state_with_limits(&state_before, &transition.state, &self.limits).ok()
+            })
             .unwrap_or_else(|| state_before.clone());
         let pending_timers = outcome
             .as_ref()
@@ -648,6 +655,19 @@ impl Engine {
         utc_unix_ms: Option<i64>,
         now: MonotonicMs,
     ) -> Result<Execution, EventError> {
+        self.process_schedule_trigger_with_budget_probe(trigger, site, utc_unix_ms, now, None)
+    }
+
+    /// Schedule variant which passes a host-owned elapsed-time probe into the
+    /// Lua instruction hook.
+    pub fn process_schedule_trigger_with_budget_probe(
+        &mut self,
+        trigger: ScheduleTrigger,
+        site: &SiteTimeConfig,
+        utc_unix_ms: Option<i64>,
+        now: MonotonicMs,
+        budget_probe: Option<BudgetProbeHandle>,
+    ) -> Result<Execution, EventError> {
         let public_trigger = Trigger::Schedule(trigger);
         let snapshots = self.input_snapshots(now);
         let state_before = self.state.clone();
@@ -660,11 +680,13 @@ impl Engine {
             &self.pending_timers,
             now,
             &TimeContext::capture(site, utc_unix_ms),
+            &self.limits,
+            budget_probe,
         );
         let mut state_after = state_before.clone();
         let mut pending_timers = self.pending_timers();
         if let Ok(transition) = &outcome {
-            state_after = merge_state(&state_before, &transition.state)
+            state_after = merge_state_with_limits(&state_before, &transition.state, &self.limits)
                 .expect("validated transition state must merge");
             let candidate = apply_timer_effects(
                 &self.pending_timers,
@@ -709,11 +731,15 @@ impl Engine {
             &self.pending_timers,
             MonotonicMs(0),
             &TimeContext::capture(site, utc_unix_ms),
+            &self.limits,
+            None,
         );
         let state_after = outcome
             .as_ref()
             .ok()
-            .and_then(|transition| merge_state(&state_before, &transition.state).ok())
+            .and_then(|transition| {
+                merge_state_with_limits(&state_before, &transition.state, &self.limits).ok()
+            })
             .unwrap_or_else(|| state_before.clone());
         let pending_timers = outcome
             .as_ref()
@@ -886,11 +912,15 @@ impl Engine {
             &timer_map,
             now,
             &unavailable_time_context(),
+            &self.limits,
+            None,
         );
         let state_after = outcome
             .as_ref()
             .ok()
-            .and_then(|transition| merge_state(&state_before, &transition.state).ok())
+            .and_then(|transition| {
+                merge_state_with_limits(&state_before, &transition.state, &self.limits).ok()
+            })
             .unwrap_or_else(|| state_before.clone());
         let pending_timers = outcome
             .as_ref()
@@ -919,56 +949,13 @@ impl Engine {
             None,
         ))
     }
-
-    fn validate_and_build_snapshots(
-        &self,
-        inputs: &[SimulationInput],
-    ) -> Result<Vec<InputSnapshot>, SimulationError> {
-        let mut supplied: Vec<Option<&SimulationInput>> = vec![None; self.config.endpoints.len()];
-        for input in inputs {
-            let Some(index) = self
-                .config
-                .endpoints
-                .iter()
-                .position(|endpoint| endpoint.name == input.endpoint)
-            else {
-                return Err(SimulationError::UnknownEndpoint(input.endpoint.clone()));
-            };
-            let endpoint = &self.config.endpoints[index];
-            if endpoint.direction != EndpointDirection::Input {
-                return Err(SimulationError::EndpointNotInput {
-                    endpoint: input.endpoint.clone(),
-                    actual: endpoint.direction,
-                });
-            }
-            if supplied[index].is_some() {
-                return Err(SimulationError::DuplicateInput(input.endpoint.clone()));
-            }
-            validate_simulation_input(endpoint, input)?;
-            supplied[index] = Some(input);
-        }
-        self.config
-            .endpoints
-            .iter()
-            .enumerate()
-            .filter_map(|(index, endpoint)| {
-                (endpoint.direction == EndpointDirection::Input).then(|| {
-                    supplied[index]
-                        .ok_or_else(|| SimulationError::MissingInput(endpoint.name.clone()))
-                        .map(|input| InputSnapshot {
-                            endpoint: endpoint.name.clone(),
-                            dpt: endpoint.dpt,
-                            value: input.value,
-                            valid: input.valid,
-                            age_ms: input.age_ms,
-                        })
-                })
-            })
-            .collect()
-    }
 }
 
+include!("engine_simulation.rs");
+
 include!("engine_input_updates.rs");
+
+include!("engine_model.rs");
 
 impl Default for InputState {
     fn default() -> Self {

@@ -3,7 +3,7 @@ import type {
   DisplayExecutionEffect, DisplayExecutionInput, DisplayExecutionTrigger, DisplayInputExecutionTrigger,
   DisplayBlock, DisplayBlockSchedule, DisplayCausalLink, DisplayDateTimeValue, DisplayLastResult, DisplayLogicError, DisplayLog, DisplayPendingTimer, DisplayScheduleExecutionTrigger, DisplayScheduleKind, DisplayScheduleOccurrence, DisplaySchedulePreview, DisplaySignal, DisplaySignalBinding, DisplaySignalChange, DisplaySignalConsumer, DisplaySignalEffect, DisplaySignalProducer, DisplaySimulation, DisplaySiteTime, DisplaySnapshot, DisplayState,
   DisplayStateValue, DisplaySunContext, DisplayTelegram, DisplayTimeContext, DisplayTimer, DisplayTimerEffect, DisplayTimerEffectAction,
-  DisplayTransition, DisplayTimerExecutionTrigger, DisplayWrite, SimulationScenario, SimulationTypedValue,
+  DisplayTransition, DisplayTimerExecutionTrigger, DisplayWrite, DisplayOperations, DisplayOperationsBlockHealth, SimulationScenario, SimulationTypedValue,
   TimerState, WriteStatus, DisplayExecutionOrigin, DisplayExternalConsumer, DisplayExternalHealth, DisplayExternalInputs, DisplayExternalValue, DisplayHttpPoll, DisplayWebhookInput
 } from './state';
 import { encodeRevisionToken, parseRevisionToken, type RevisionToken } from './revision';
@@ -566,13 +566,83 @@ function decodeDisplayBlock(value: unknown, index: number): DisplayBlock {
 function blockSnapshot(root: JsonObject): DisplayBlock[] {
   const logicStatus = isObject(field(root, 'snapshot', 'logic')) ? object(field(root, 'snapshot', 'logic'), 'logic') : null; const raw = field(root, 'snapshot', 'blocks', 'logic_blocks', 'logicBlocks') ?? (logicStatus ? field(logicStatus, 'logic', 'blocks') : undefined); if (raw === undefined) return []; const rawBlocks = array(raw, 'blocks'); if (rawBlocks.length === 0) throw new ApiDecodeError('blocks', 'must contain at least one block'); if (rawBlocks.length > 64) throw new ApiDecodeError('blocks', 'must contain at most 64 blocks'); const decoded = rawBlocks.map((item, index) => decodeDisplayBlock(item, index)); const seen = new Set<string>(); decoded.forEach((item, index) => { if (!/^[a-z][a-z0-9_]*$/.test(item.id) || new TextEncoder().encode(item.id).byteLength > 64) throw new ApiDecodeError(`blocks[${index}].id`, 'invalid block ID'); if (seen.has(item.id)) throw new ApiDecodeError(`blocks[${index}].id`, `duplicate block id ${item.id}`); seen.add(item.id); }); return decoded;
 }
+function operationsSnapshot(root: JsonObject): DisplaySnapshot['operations'] {
+  const raw = field(root, 'snapshot', 'operations');
+  if (raw === undefined || raw === null) return undefined;
+  const source = object(raw, 'operations');
+  const status = stringValue(required(field(source, 'operations', 'status'), 'operations.status'), 'operations.status');
+  const queuesRaw = object(required(field(source, 'operations', 'queues'), 'operations.queues'), 'operations.queues');
+  const queues: Record<string, DisplayOperations['queues'][string]> = {};
+  for (const [name, value] of Object.entries(queuesRaw)) {
+    const queue = object(value, `operations.queues.${name}`);
+    queues[name] = {
+      capacity: integer(required(field(queue, `operations.queues.${name}`, 'capacity'), `operations.queues.${name}.capacity`), `operations.queues.${name}.capacity`),
+      depth: integer(required(field(queue, `operations.queues.${name}`, 'depth'), `operations.queues.${name}.depth`), `operations.queues.${name}.depth`),
+      highWater: integer(required(field(queue, `operations.queues.${name}`, 'high_water', 'highWater'), `operations.queues.${name}.high_water`), `operations.queues.${name}.high_water`),
+      accepted: integer(required(field(queue, `operations.queues.${name}`, 'accepted'), `operations.queues.${name}.accepted`), `operations.queues.${name}.accepted`),
+      rejected: integer(required(field(queue, `operations.queues.${name}`, 'rejected'), `operations.queues.${name}.rejected`), `operations.queues.${name}.rejected`)
+    };
+  }
+  const coreRaw = object(required(field(source, 'operations', 'core'), 'operations.core'), 'operations.core');
+  const capacity = (name: string) => {
+    const value = object(required(field(coreRaw, 'operations.core', name), `operations.core.${name}`), `operations.core.${name}`);
+    return {
+      used: integer(required(field(value, `operations.core.${name}`, 'used'), `operations.core.${name}.used`), `operations.core.${name}.used`),
+      capacity: integer(required(field(value, `operations.core.${name}`, 'capacity'), `operations.core.${name}.capacity`), `operations.core.${name}.capacity`)
+    };
+  };
+  const turnRaw = object(required(field(source, 'operations', 'host_turn', 'hostTurn'), 'operations.host_turn'), 'operations.host_turn');
+  const healthRaw = object(required(field(source, 'operations', 'block_health', 'blockHealth'), 'operations.block_health'), 'operations.block_health');
+  const blockHealth: Record<string, DisplayOperationsBlockHealth> = {};
+  for (const [id, value] of Object.entries(healthRaw)) {
+    const health = object(value, `operations.block_health.${id}`);
+    const errorRaw = field(health, `operations.block_health.${id}`, 'last_error', 'lastError');
+    blockHealth[id] = {
+      status: stringValue(required(field(health, `operations.block_health.${id}`, 'status'), `operations.block_health.${id}.status`), `operations.block_health.${id}.status`),
+      consecutiveFailures: integer(required(field(health, `operations.block_health.${id}`, 'consecutive_failures', 'consecutiveFailures'), `operations.block_health.${id}.consecutive_failures`), `operations.block_health.${id}.consecutive_failures`),
+      liveExecutionsLastSecond: integer(required(field(health, `operations.block_health.${id}`, 'live_executions_last_second', 'liveExecutionsLastSecond'), `operations.block_health.${id}.live_executions_last_second`), `operations.block_health.${id}.live_executions_last_second`),
+      lastSuspension: optionalString(field(health, `operations.block_health.${id}`, 'last_suspension', 'lastSuspension'), `operations.block_health.${id}.last_suspension`),
+      lastExecutionAtMs: optionalInteger(field(health, `operations.block_health.${id}`, 'last_execution_at_ms', 'lastExecutionAtMs'), `operations.block_health.${id}.last_execution_at_ms`),
+      lastFailureAtMs: optionalInteger(field(health, `operations.block_health.${id}`, 'last_failure_at_ms', 'lastFailureAtMs'), `operations.block_health.${id}.last_failure_at_ms`),
+      lastError: errorRaw === undefined || errorRaw === null ? null : logicError(errorRaw, `operations.block_health.${id}.last_error`)
+    };
+  }
+  const turn = {
+    lastDurationUs: integer(required(field(turnRaw, 'operations.host_turn', 'last_duration_us', 'lastDurationUs'), 'operations.host_turn.last_duration_us'), 'operations.host_turn.last_duration_us'),
+    maxDurationUs: integer(required(field(turnRaw, 'operations.host_turn', 'max_duration_us', 'maxDurationUs'), 'operations.host_turn.max_duration_us'), 'operations.host_turn.max_duration_us'),
+    overBudgetCount: integer(required(field(turnRaw, 'operations.host_turn', 'over_budget_count', 'overBudgetCount'), 'operations.host_turn.over_budget_count'), 'operations.host_turn.over_budget_count'),
+    warningCount: integer(required(field(turnRaw, 'operations.host_turn', 'warning_count', 'warningCount'), 'operations.host_turn.warning_count'), 'operations.host_turn.warning_count'),
+    lastOverBudget: booleanField(turnRaw, 'operations.host_turn', 'last_over_budget'),
+    lastWarning: booleanField(turnRaw, 'operations.host_turn', 'last_warning')
+  };
+  return {
+    profile: stringValue(required(field(source, 'operations', 'profile'), 'operations.profile'), 'operations.profile'),
+    status,
+    queues,
+    core: {
+      logicBlocks: capacity('logic_blocks'),
+      signals: capacity('signals'),
+      signalBindings: capacity('signal_bindings'),
+      logicSourceBytes: capacity('logic_source_bytes'),
+      stateEntries: capacity('state_entries'),
+      stateBytes: capacity('state_bytes'),
+      pendingTimers: capacity('pending_timers')
+    },
+    hostTurn: turn,
+    blockHealth,
+    pendingKnxWrites: integer(required(field(source, 'operations', 'pending_knx_writes', 'pendingKnxWrites'), 'operations.pending_knx_writes'), 'operations.pending_knx_writes'),
+    pendingKnxWriteCapacity: integer(required(field(source, 'operations', 'pending_knx_write_capacity', 'pendingKnxWriteCapacity'), 'operations.pending_knx_write_capacity'), 'operations.pending_knx_write_capacity'),
+    pendingWriteTimeouts: integer(required(field(source, 'operations', 'pending_write_timeouts', 'pendingWriteTimeouts'), 'operations.pending_write_timeouts'), 'operations.pending_write_timeouts'),
+    fatal: optionalString(field(source, 'operations', 'fatal'), 'operations.fatal')
+  };
+}
 function decodeMultiSnapshot(root: JsonObject, blocks: DisplayBlock[], receivedAtMs: number): DisplaySnapshot {
   const configRaw = field(root, 'snapshot', 'config'); const config = isObject(configRaw) ? configRaw : {}; const valuesRaw = field(root, 'snapshot', 'values'); const values = isObject(valuesRaw) ? valuesRaw : {}; const first = blocks[0]; const firstInput = first?.inputs[0]; const firstOutput = first?.outputs[0]; const connectionValue = required(field(root, 'snapshot', 'connection'), 'connection'); const telegrams = array(required(field(root, 'snapshot', 'telegrams'), 'telegrams'), 'telegrams').map(telegram); const logs = array(required(field(root, 'snapshot', 'logs'), 'logs'), 'logs').map(log);
   const logicStatus = isObject(field(root, 'snapshot', 'logic')) ? object(field(root, 'snapshot', 'logic'), 'logic') : null; const readLogic = (names: string[]) => logicStatus ? field(logicStatus, 'logic', ...names) : undefined; const activeStructuralRevision = optionalLogicRevision(field(root, 'snapshot', 'active_structural_revision', 'activeStructuralRevision') ?? readLogic(['active_structural_revision', 'activeStructuralRevision']), 'active_structural_revision'); const savedStructuralRevision = optionalLogicRevision(field(root, 'snapshot', 'saved_structural_revision', 'savedStructuralRevision') ?? readLogic(['saved_structural_revision', 'savedStructuralRevision']), 'saved_structural_revision'); const activeLogicRevision = optionalLogicRevision(field(root, 'snapshot', 'active_logic_revision', 'activeLogicRevision') ?? readLogic(['active_logic_revision', 'activeLogicRevision']), 'active_logic_revision'); const savedLogicRevision = optionalLogicRevision(field(root, 'snapshot', 'saved_logic_revision', 'savedLogicRevision') ?? readLogic(['saved_logic_revision', 'savedLogicRevision']), 'saved_logic_revision'); const explicitRestart = field(root, 'snapshot', 'restart_required', 'restartRequired') ?? readLogic(['restart_required', 'restartRequired']); const restartRequired = explicitRestart === true || (activeStructuralRevision !== null && savedStructuralRevision !== null && String(activeStructuralRevision) !== String(savedStructuralRevision));
   const capturedRaw = field(root, 'snapshot', 'captured_at_ms', 'capturedAtMs') ?? readLogic(['captured_at_ms', 'capturedAtMs']); const capturedAtMs = capturedRaw === undefined || capturedRaw === null ? receivedAtMs : nonNegativeNumber(capturedRaw, 'captured_at_ms'); const clockOffsetMs = capturedRaw === undefined || capturedRaw === null || Math.abs(receivedAtMs - capturedAtMs) <= 86_400_000 ? 0 : receivedAtMs - capturedAtMs; const pendingTimers = blocks.flatMap((item) => item.pendingTimers); const executions = blocks.flatMap((item) => item.executions).sort((a, b) => b.executionId - a.executionId); const inputValue = firstInput?.observed ?? null; const outputValue = firstOutput?.observed ?? null; const requested = firstOutput?.requested ?? null; const firstAutomation = first ? { inputs: first.inputs, outputs: first.outputs, bindings: first.bindings, signalBindings: first.signalBindings, source: first.source } : undefined;
   const siteTimeRaw = field(root, 'snapshot', 'site_time', 'siteTime'); const siteTimeValue = siteTimeRaw === undefined || siteTimeRaw === null ? null : siteTime(siteTimeRaw, 'site_time'); const signalsRaw = field(root, 'snapshot', 'signals') ?? readLogic(['signals']); const signals = signalsRaw === undefined || signalsRaw === null ? [] : array(signalsRaw, 'signals').map(signal); const external = externalInputs(root);
   const configInput = field(config, 'input'); const configOutput = field(config, 'output'); const inputEndpoint = configInput === undefined ? { address: firstInput?.address ?? '', dpt: firstInput?.dpt ?? '1.001' } : endpoint(configInput, 'config.input'); const outputEndpoint = configOutput === undefined ? { address: firstOutput?.address ?? '', dpt: firstOutput?.dpt ?? '1.001' } : endpoint(configOutput, 'config.output'); const offDelayRaw = field(config, 'off_delay_ms', 'offDelayMs', 'off_delay');
-  const revisionRaw = required(field(root, 'snapshot', 'revision'), 'revision'); return { revision: revision(revisionRaw, 'revision'), connection: connection(connectionValue), config: { input: inputEndpoint, output: outputEndpoint, offDelayMs: offDelayRaw === undefined || offDelayRaw === null ? 0 : nonNegativeNumber(offDelayRaw, 'config.off_delay_ms') }, values: { input: { observed: inputValue }, output: { observed: outputValue, requested } }, automation: firstAutomation, activeAutomationRevision: optionalRevision(field(root, 'snapshot', 'active_automation_revision', 'activeAutomationRevision'), 'active_automation_revision'), savedAutomationRevision: optionalRevision(field(root, 'snapshot', 'saved_automation_revision', 'savedAutomationRevision'), 'saved_automation_revision'), activeStructuralRevision, savedStructuralRevision, activeLogicRevision, savedLogicRevision, restartRequired, capturedAtMs, clockOffsetMs, state: first?.state ?? {}, pendingTimers, executions, signals, externalInputs: external, siteTime: siteTimeValue, receivedAtMs, write: write(field(root, 'snapshot', 'write') ?? field(root, 'snapshot', 'last_write')), timer: { state: pendingTimers.length ? 'pending' : 'idle', deadlineMs: pendingTimers[0]?.dueAtMs ?? null, remainingMs: null, sampledAtMs: capturedAtMs }, telegrams, logs, blocks };
+  const revisionRaw = required(field(root, 'snapshot', 'revision'), 'revision'); return { revision: revision(revisionRaw, 'revision'), connection: connection(connectionValue), config: { input: inputEndpoint, output: outputEndpoint, offDelayMs: offDelayRaw === undefined || offDelayRaw === null ? 0 : nonNegativeNumber(offDelayRaw, 'config.off_delay_ms') }, values: { input: { observed: inputValue }, output: { observed: outputValue, requested } }, automation: firstAutomation, activeAutomationRevision: optionalRevision(field(root, 'snapshot', 'active_automation_revision', 'activeAutomationRevision'), 'active_automation_revision'), savedAutomationRevision: optionalRevision(field(root, 'snapshot', 'saved_automation_revision', 'savedAutomationRevision'), 'saved_automation_revision'), activeStructuralRevision, savedStructuralRevision, activeLogicRevision, savedLogicRevision, restartRequired, capturedAtMs, clockOffsetMs, state: first?.state ?? {}, pendingTimers, executions, signals, externalInputs: external, siteTime: siteTimeValue, receivedAtMs, write: write(field(root, 'snapshot', 'write') ?? field(root, 'snapshot', 'last_write')), timer: { state: pendingTimers.length ? 'pending' : 'idle', deadlineMs: pendingTimers[0]?.dueAtMs ?? null, remainingMs: null, sampledAtMs: capturedAtMs }, telegrams, logs, blocks, operations: operationsSnapshot(root) };
 }
 
 export function decodeSnapshot(input: unknown, receivedAtMs = Date.now()): DisplaySnapshot {
@@ -631,7 +701,7 @@ export function decodeSnapshot(input: unknown, receivedAtMs = Date.now()): Displ
     automation, activeAutomationRevision, savedAutomationRevision, activeStructuralRevision, savedStructuralRevision, activeLogicRevision, savedLogicRevision,
     restartRequired, capturedAtMs, clockOffsetMs, state: stateMap(stateRaw, 'state'), pendingTimers, executions, signals, externalInputs: external, siteTime: siteTimeValue, receivedAtMs,
     write: write(field(root, 'snapshot', 'write') ?? field(root, 'write', 'write_status', 'last_write')),
-    timer: legacyTimer, telegrams: telegrams as DisplayTelegram[], logs: logs as DisplayLog[], blocks: [{ id: 'default', activeEnabled: true, savedEnabled: true, source: automation?.source ?? '', inputs: automation?.inputs ?? [], outputs: automation?.outputs ?? [], bindings: automation?.bindings ?? [], signalBindings: [], state: stateMap(stateRaw, 'state'), pendingTimers, schedules: [], executions, activeRevision: activeLogicRevision, savedRevision: savedLogicRevision, activeLogicRevision, savedLogicRevision, lastResult: executions[0] ? { status: executions[0].status, executionId: executions[0].executionId, timeMs: executions[0].timeMs, error: executions[0].error } : { status: 'none', executionId: null, timeMs: null, error: null }, lastError: executions[0]?.error ?? null }]
+    timer: legacyTimer, telegrams: telegrams as DisplayTelegram[], logs: logs as DisplayLog[], blocks: [{ id: 'default', activeEnabled: true, savedEnabled: true, source: automation?.source ?? '', inputs: automation?.inputs ?? [], outputs: automation?.outputs ?? [], bindings: automation?.bindings ?? [], signalBindings: [], state: stateMap(stateRaw, 'state'), pendingTimers, schedules: [], executions, activeRevision: activeLogicRevision, savedRevision: savedLogicRevision, activeLogicRevision, savedLogicRevision, lastResult: executions[0] ? { status: executions[0].status, executionId: executions[0].executionId, timeMs: executions[0].timeMs, error: executions[0].error } : { status: 'none', executionId: null, timeMs: null, error: null }, lastError: executions[0]?.error ?? null }], operations: operationsSnapshot(root)
   };
 }
 function parseJson(value: string, path: string): unknown { try { return JSON.parse(value) as unknown; } catch { throw new ApiDecodeError(path, 'expected valid JSON'); } }

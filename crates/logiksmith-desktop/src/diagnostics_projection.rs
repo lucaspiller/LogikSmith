@@ -481,7 +481,19 @@ fn schedule_config_snapshot(schedule: &crate::AutomationSchedule) -> ScheduleCon
 fn format_utc_ms(utc_ms: i64, timezone: &str) -> Option<(String, i64)> {
     use jiff::{Timestamp, tz::TimeZone};
     let timestamp = Timestamp::from_millisecond(utc_ms).ok()?;
-    let zoned = timestamp.to_zoned(TimeZone::get(timezone).ok()?);
+    let zone = if timezone == "UTC" {
+        TimeZone::UTC
+    } else {
+        #[cfg(feature = "timezones")]
+        {
+            TimeZone::get(timezone).ok()?
+        }
+        #[cfg(not(feature = "timezones"))]
+        {
+            return None;
+        }
+    };
+    let zoned = timestamp.to_zoned(zone);
     let datetime = zoned.datetime();
     let offset = zoned.offset().seconds();
     Some((
@@ -659,7 +671,19 @@ fn schedule_occurrence_snapshot(
 ) -> Option<ScheduleOccurrenceSnapshot> {
     use jiff::{Timestamp, tz::TimeZone};
     let timestamp = Timestamp::from_millisecond(occurrence.utc_ms).ok()?;
-    let zoned = timestamp.to_zoned(TimeZone::get(timezone).ok()?);
+    let zone = if timezone == "UTC" {
+        TimeZone::UTC
+    } else {
+        #[cfg(feature = "timezones")]
+        {
+            TimeZone::get(timezone).ok()?
+        }
+        #[cfg(not(feature = "timezones"))]
+        {
+            return None;
+        }
+    };
+    let zoned = timestamp.to_zoned(zone);
     let datetime = zoned.datetime();
     Some(ScheduleOccurrenceSnapshot {
         utc_ms: occurrence.utc_ms,

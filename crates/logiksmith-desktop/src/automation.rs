@@ -12,6 +12,9 @@ use tokio::sync::oneshot;
 /// engine, so activation is acknowledged on that same task between events.
 pub struct ActivationRequest {
     pub updates: Vec<CoreBlockActivation>,
+    /// Optional operational resume action. This does not mutate the persisted
+    /// document or create a synthetic execution.
+    pub resume_block: Option<BlockId>,
     pub document_revision: u64,
     /// The saved document whose source/enabled fields are represented by the
     /// activation. The session copies this into its active projection only

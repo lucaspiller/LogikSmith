@@ -1,0 +1,24 @@
+# Docker desktop configuration. Copy this file to local.toml in the mounted
+# config directory before starting docker-compose.example.yml.
+
+[knx]
+connection_type = "tunneling"
+# Replace the TEST-NET placeholder with the KNXnet/IP tunnelling gateway.
+gateway_ip = "192.0.2.1"
+gateway_port = 3671
+
+[bridge]
+# The image installs the bridge dependencies into its system Python.
+python = "/usr/local/bin/python"
+
+[time]
+timezone = "UTC"
+
+[logging]
+level = "info"
+bridge_level = "info"
+
+[web]
+# Docker publishes this container port on the host.
+listen_ip = "0.0.0.0"
+listen_port = 8080

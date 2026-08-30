@@ -51,11 +51,21 @@ impl Runtime {
         event: InputEvent,
         now: MonotonicMs,
     ) -> Result<Vec<BlockExecution>, RuntimeEventError> {
+        let checkpoint = self.clone();
         let Some(root) = self.process_input(block_id, event, now)? else {
             return Ok(Vec::new());
         };
         let mut executions = vec![root];
-        self.propagate_from_execution(0, now, None, &mut executions)?;
+        if let Err(error) = self.propagate_from_execution(0, now, None, None, &mut executions) {
+            if should_rollback_after_propagation(&error) {
+                *self = checkpoint;
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.validate_usage() {
+            *self = checkpoint;
+            return Err(error);
+        }
         Ok(executions)
     }
 
@@ -65,16 +75,67 @@ impl Runtime {
         event: InputEvent,
         sample: ClockSample,
     ) -> Result<Vec<BlockExecution>, RuntimeEventError> {
-        let Some(root) = self.process_input_sampled(block_id, event, sample)? else {
+        self.process_input_cascade_sampled_with_probe(block_id, event, sample, None)
+    }
+
+    /// ClockSample cascade variant which applies one host-owned budget probe
+    /// to the root handler and every internal-signal child.
+    pub fn process_input_cascade_sampled_with_budget_probe(
+        &mut self,
+        block_id: &BlockId,
+        event: InputEvent,
+        sample: ClockSample,
+        budget_probe: BudgetProbeHandle,
+    ) -> Result<Vec<BlockExecution>, RuntimeEventError> {
+        self.process_input_cascade_sampled_with_probe(
+            block_id,
+            event,
+            sample,
+            Some(budget_probe),
+        )
+    }
+
+    fn process_input_cascade_sampled_with_probe(
+        &mut self,
+        block_id: &BlockId,
+        event: InputEvent,
+        sample: ClockSample,
+        budget_probe: Option<BudgetProbeHandle>,
+    ) -> Result<Vec<BlockExecution>, RuntimeEventError> {
+        let checkpoint = self.clone();
+        let root = match match budget_probe.clone() {
+            Some(budget_probe) => {
+                self.check_cascade_budget(budget_probe.as_ref())?;
+                self.process_input_sampled_with_budget_probe(block_id, event, sample, budget_probe)
+            }
+            None => self.process_input_sampled(block_id, event, sample),
+        } {
+            Ok(root) => root,
+            Err(error) => {
+                *self = checkpoint;
+                return Err(error);
+            }
+        };
+        let Some(root) = root else {
             return Ok(Vec::new());
         };
         let mut executions = vec![root];
-        self.propagate_from_execution(
+        if let Err(error) = self.propagate_from_execution(
             0,
             sample.monotonic_ms,
             sample.utc_unix_ms,
+            budget_probe,
             &mut executions,
-        )?;
+        ) {
+            if should_rollback_after_propagation(&error) {
+                *self = checkpoint;
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.validate_usage() {
+            *self = checkpoint;
+            return Err(error);
+        }
         Ok(executions)
     }
 
@@ -82,11 +143,21 @@ impl Runtime {
         &mut self,
         now: MonotonicMs,
     ) -> Result<Vec<BlockExecution>, RuntimeEventError> {
+        let checkpoint = self.clone();
         let Some(root) = self.process_next_due_timer(now)? else {
             return Ok(Vec::new());
         };
         let mut executions = vec![root];
-        self.propagate_from_execution(0, now, None, &mut executions)?;
+        if let Err(error) = self.propagate_from_execution(0, now, None, None, &mut executions) {
+            if should_rollback_after_propagation(&error) {
+                *self = checkpoint;
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.validate_usage() {
+            *self = checkpoint;
+            return Err(error);
+        }
         Ok(executions)
     }
 
@@ -94,16 +165,49 @@ impl Runtime {
         &mut self,
         sample: ClockSample,
     ) -> Result<Vec<BlockExecution>, RuntimeEventError> {
-        let Some(root) = self.process_next_due_timer_sampled(sample)? else {
+        self.process_next_due_timer_cascade_sampled_with_probe(sample, None)
+    }
+
+    /// ClockSample timer cascade variant which applies one host-owned
+    /// elapsed-time probe to the handler and every internal-signal child.
+    pub fn process_next_due_timer_cascade_sampled_with_budget_probe(
+        &mut self,
+        sample: ClockSample,
+        budget_probe: BudgetProbeHandle,
+    ) -> Result<Vec<BlockExecution>, RuntimeEventError> {
+        self.process_next_due_timer_cascade_sampled_with_probe(sample, Some(budget_probe))
+    }
+
+    fn process_next_due_timer_cascade_sampled_with_probe(
+        &mut self,
+        sample: ClockSample,
+        budget_probe: Option<BudgetProbeHandle>,
+    ) -> Result<Vec<BlockExecution>, RuntimeEventError> {
+        let checkpoint = self.clone();
+        let root = match budget_probe.clone() {
+            Some(probe) => self.process_next_due_timer_sampled_with_budget_probe(sample, probe),
+            None => self.process_next_due_timer_sampled(sample),
+        }?;
+        let Some(root) = root else {
             return Ok(Vec::new());
         };
         let mut executions = vec![root];
-        self.propagate_from_execution(
+        if let Err(error) = self.propagate_from_execution(
             0,
             sample.monotonic_ms,
             sample.utc_unix_ms,
+            budget_probe,
             &mut executions,
-        )?;
+        ) {
+            if should_rollback_after_propagation(&error) {
+                *self = checkpoint;
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.validate_usage() {
+            *self = checkpoint;
+            return Err(error);
+        }
         Ok(executions)
     }
 
@@ -111,16 +215,27 @@ impl Runtime {
         &mut self,
         trigger: ScheduleTrigger,
     ) -> Result<Vec<BlockExecution>, RuntimeEventError> {
+        let checkpoint = self.clone();
         let Some(root) = self.process_schedule(trigger.clone())? else {
             return Ok(Vec::new());
         };
         let mut executions = vec![root];
-        self.propagate_from_execution(
+        if let Err(error) = self.propagate_from_execution(
             0,
             self.last_accepted_at.unwrap_or_default(),
             Some(trigger.scheduled_for_utc_ms),
+            None,
             &mut executions,
-        )?;
+        ) {
+            if should_rollback_after_propagation(&error) {
+                *self = checkpoint;
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.validate_usage() {
+            *self = checkpoint;
+            return Err(error);
+        }
         Ok(executions)
     }
 
@@ -129,16 +244,51 @@ impl Runtime {
         trigger: ScheduleTrigger,
         sample: ClockSample,
     ) -> Result<Vec<BlockExecution>, RuntimeEventError> {
-        let Some(root) = self.process_schedule_sampled(trigger, sample)? else {
+        self.process_schedule_cascade_sampled_with_probe(trigger, sample, None)
+    }
+
+    /// ClockSample schedule cascade variant which applies one host-owned
+    /// elapsed-time probe to the handler and every internal-signal child.
+    pub fn process_schedule_cascade_sampled_with_budget_probe(
+        &mut self,
+        trigger: ScheduleTrigger,
+        sample: ClockSample,
+        budget_probe: BudgetProbeHandle,
+    ) -> Result<Vec<BlockExecution>, RuntimeEventError> {
+        self.process_schedule_cascade_sampled_with_probe(trigger, sample, Some(budget_probe))
+    }
+
+    fn process_schedule_cascade_sampled_with_probe(
+        &mut self,
+        trigger: ScheduleTrigger,
+        sample: ClockSample,
+        budget_probe: Option<BudgetProbeHandle>,
+    ) -> Result<Vec<BlockExecution>, RuntimeEventError> {
+        let checkpoint = self.clone();
+        let root = match budget_probe.clone() {
+            Some(probe) => self.process_schedule_sampled_with_budget_probe(trigger, sample, probe),
+            None => self.process_schedule_sampled(trigger, sample),
+        }?;
+        let Some(root) = root else {
             return Ok(Vec::new());
         };
         let mut executions = vec![root];
-        self.propagate_from_execution(
+        if let Err(error) = self.propagate_from_execution(
             0,
             sample.monotonic_ms,
             sample.utc_unix_ms,
+            budget_probe,
             &mut executions,
-        )?;
+        ) {
+            if should_rollback_after_propagation(&error) {
+                *self = checkpoint;
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.validate_usage() {
+            *self = checkpoint;
+            return Err(error);
+        }
         Ok(executions)
     }
 
@@ -157,8 +307,12 @@ impl Runtime {
         execution_index: usize,
         now: MonotonicMs,
         utc_unix_ms: Option<i64>,
+        budget_probe: Option<BudgetProbeHandle>,
         executions: &mut Vec<BlockExecution>,
     ) -> Result<(), RuntimeEventError> {
+        if let Some(budget_probe) = budget_probe.as_deref() {
+            self.check_cascade_budget(budget_probe)?;
+        }
         let block_id = executions[execution_index].block_id.clone();
         let execution_id = executions[execution_index].execution.id;
         let outputs = match &executions[execution_index].execution.outcome {
@@ -214,7 +368,9 @@ impl Runtime {
                         .iter()
                         .filter(|consumer| {
                             self.block(&consumer.block_id)
-                                .is_some_and(|block| block.enabled())
+                                .is_some_and(|block| {
+                                    block.enabled() && block.health() == BlockHealth::Active
+                                })
                         })
                         .cloned(),
                 );
@@ -256,7 +412,28 @@ impl Runtime {
                     .name
                     .clone();
                 let event = InputEvent::new(input_name.clone(), output.value);
-                if !self.blocks[consumer_index].config.enabled {
+                if !self.blocks[consumer_index].config.enabled
+                    || self.blocks[consumer_index].health() != BlockHealth::Active
+                {
+                    self.blocks[consumer_index]
+                        .engine
+                        .observe_input(InputObservation::new(input_name, output.value), now)
+                        .map_err(|error| RuntimeEventError::Block {
+                            block_id: consumer.block_id.clone(),
+                            error,
+                        })?;
+                    continue;
+                }
+                if executions.len() >= self.limits.max_cascade_executions {
+                    return Err(RuntimeEventError::CascadeLimit {
+                        actual: executions.len().saturating_add(1),
+                        maximum: self.limits.max_cascade_executions,
+                    });
+                }
+                if !self.blocks[consumer_index].admit_live_execution(
+                    now,
+                    self.limits.max_live_executions_per_block_per_second,
+                ) {
                     self.blocks[consumer_index]
                         .engine
                         .observe_input(InputObservation::new(input_name, output.value), now)
@@ -267,16 +444,27 @@ impl Runtime {
                     continue;
                 }
                 let child = if utc_unix_ms.is_some() {
-                    self.blocks[consumer_index]
-                        .engine
-                        .process_input_sampled(
+                    match budget_probe.clone() {
+                        Some(budget_probe) => self.blocks[consumer_index]
+                            .engine
+                            .process_input_sampled_with_budget_probe(
+                                event,
+                                ClockSample {
+                                    monotonic_ms: now,
+                                    utc_unix_ms,
+                                },
+                                &self.site,
+                                budget_probe,
+                            ),
+                        None => self.blocks[consumer_index].engine.process_input_sampled(
                             event,
                             ClockSample {
                                 monotonic_ms: now,
                                 utc_unix_ms,
                             },
                             &self.site,
-                        )
+                        ),
+                    }
                 } else {
                     self.blocks[consumer_index].engine.process_input(event, now)
                 }
@@ -286,13 +474,20 @@ impl Runtime {
                 })?;
                 self.last_accepted_at = Some(now);
                 let mut child = child;
+                self.blocks[consumer_index].record_live_execution(&child);
                 self.assign_execution_id(&mut child, execution_id);
                 let child_index = executions.len();
                 executions.push(BlockExecution {
                     block_id: consumer.block_id.clone(),
                     execution: child,
                 });
-                self.propagate_from_execution(child_index, now, utc_unix_ms, executions)?;
+                self.propagate_from_execution(
+                    child_index,
+                    now,
+                    utc_unix_ms,
+                    budget_probe.clone(),
+                    executions,
+                )?;
             }
         }
         Ok(())
@@ -352,4 +547,11 @@ impl Runtime {
         }
         execution.set_signal_metadata(effects, eligible);
     }
+}
+
+fn should_rollback_after_propagation(error: &RuntimeEventError) -> bool {
+    !matches!(
+        error,
+        RuntimeEventError::CascadeLimit { .. } | RuntimeEventError::CascadeTimeLimit { .. }
+    )
 }

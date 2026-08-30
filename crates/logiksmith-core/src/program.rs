@@ -1,6 +1,7 @@
 use std::{error::Error, fmt};
 
-use crate::lua::validate_logic_source;
+use crate::RuntimeLimits;
+use crate::lua::validate_logic_source_with_limits;
 use crate::{
     Dpt, EndpointDirection, EndpointName, LogicRevision, MonotonicMs, PendingTimer, StateError,
     TimerName, TransientState, TypedValue, ValueError,
@@ -26,8 +27,15 @@ impl LogicProgram {
 
     /// Builds and validates a source program in a throwaway restricted VM.
     pub fn try_new(source: impl Into<String>) -> Result<Self, LogicError> {
+        Self::try_new_with_limits(source, RuntimeLimits::desktop())
+    }
+
+    pub fn try_new_with_limits(
+        source: impl Into<String>,
+        limits: RuntimeLimits,
+    ) -> Result<Self, LogicError> {
         let program = Self::new(source);
-        validate_logic_source(&program.source)?;
+        validate_logic_source_with_limits(&program.source, &limits, None)?;
         Ok(program)
     }
 
@@ -60,6 +68,7 @@ pub enum LogicErrorKind {
     Runtime,
     InstructionLimit,
     MemoryLimit,
+    HandlerTimeLimit,
     InvalidResult,
 }
 
@@ -71,6 +80,7 @@ impl LogicErrorKind {
             Self::Runtime => "runtime",
             Self::InstructionLimit => "instruction_limit",
             Self::MemoryLimit => "memory_limit",
+            Self::HandlerTimeLimit => "handler_time_limit",
             Self::InvalidResult => "invalid_result",
         }
     }
@@ -111,6 +121,10 @@ pub enum LogicError {
         message: String,
         line: Option<usize>,
     },
+    HandlerTimeLimit {
+        message: String,
+        line: Option<usize>,
+    },
     InvalidResult {
         message: String,
         line: Option<usize>,
@@ -127,6 +141,7 @@ impl LogicError {
             Self::Runtime { .. } => LogicErrorKind::Runtime,
             Self::InstructionLimit { .. } => LogicErrorKind::InstructionLimit,
             Self::MemoryLimit { .. } => LogicErrorKind::MemoryLimit,
+            Self::HandlerTimeLimit { .. } => LogicErrorKind::HandlerTimeLimit,
             Self::InvalidResult { .. } => LogicErrorKind::InvalidResult,
         }
     }
@@ -142,6 +157,7 @@ impl LogicError {
             | Self::Runtime { line, .. }
             | Self::InstructionLimit { line, .. }
             | Self::MemoryLimit { line, .. }
+            | Self::HandlerTimeLimit { line, .. }
             | Self::InvalidResult { line, .. } => *line,
             Self::EmptySource | Self::SourceTooLarge { .. } => None,
         }
@@ -156,6 +172,7 @@ impl LogicError {
             | Self::Runtime { message, .. }
             | Self::InstructionLimit { message, .. }
             | Self::MemoryLimit { message, .. }
+            | Self::HandlerTimeLimit { message, .. }
             | Self::InvalidResult { message, .. } => message,
         }
     }
@@ -181,6 +198,7 @@ impl Error for LogicError {}
 /// Configuration errors found before the engine starts processing events.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfigError {
+    TooManyEndpoints { actual: usize, maximum: usize },
     DuplicateEndpoint(EndpointName),
     UnsupportedEndpointDpt { endpoint: EndpointName, dpt: Dpt },
     InvalidLogic(LogicError),
@@ -189,6 +207,10 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TooManyEndpoints { actual, maximum } => write!(
+                formatter,
+                "block defines {actual} endpoints; maximum is {maximum}"
+            ),
             Self::DuplicateEndpoint(endpoint) => {
                 write!(formatter, "duplicate endpoint name {endpoint}")
             }

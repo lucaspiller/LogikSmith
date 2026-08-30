@@ -7,6 +7,12 @@ fn map_lua_error(error: mlua::Error, phase: LuaPhase) -> LogicError {
             line,
         };
     }
+    if error.to_string().contains(HANDLER_TIME_LIMIT_MARKER) {
+        return LogicError::HandlerTimeLimit {
+            message: text,
+            line,
+        };
+    }
     if contains_memory_error(&error) {
         return LogicError::MemoryLimit {
             message: text,

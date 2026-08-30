@@ -170,6 +170,25 @@ export async function setBlockEnabled(options: SetBlockEnabledOptions): Promise<
   try { return decodeMutation(payload, options.blockId, options.expectedRevision); } catch (error) { throw new BlockApiError(200, error instanceof Error ? error.message : String(error)); }
 }
 
+export interface ResumeBlockOptions {
+  blockId: string;
+  expectedRevision: RevisionToken;
+  expectedStructuralRevision: RevisionToken | null;
+  fetchImpl?: FetchLike;
+}
+
+export async function resumeBlock(options: ResumeBlockOptions): Promise<BlockMutationResult> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const body: JsonObject = {
+    expected_revision: encodeRevisionToken(options.expectedRevision),
+    ...(options.expectedStructuralRevision === null ? {} : { expected_structural_revision: encodeRevisionToken(options.expectedStructuralRevision) })
+  };
+  const response = await fetchImpl(`/api/blocks/${encodeURIComponent(options.blockId)}/resume`, { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const payload = await jsonOrNull(response);
+  if (!response.ok) throw responseError(response.status, payload, 'Resume');
+  try { return decodeMutation(payload, options.blockId, options.expectedRevision); } catch (error) { throw new BlockApiError(200, error instanceof Error ? error.message : String(error)); }
+}
+
 /**
  * Simulate a draft against the block-scoped endpoint. `SimulationScenario` is
  * accepted so the existing scenario editor and generic decoder remain shared.
@@ -202,4 +221,3 @@ export async function simulateBlockDraft(blockId: string, source: string, scenar
     return result;
   } catch (error) { throw new BlockApiError(200, error instanceof Error ? error.message : String(error)); }
 }
-

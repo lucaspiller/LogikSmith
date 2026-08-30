@@ -65,6 +65,7 @@ fn store(runtime: &logiksmith_desktop::AutomationRuntime) -> DiagnosticStore {
 }
 
 #[test]
+#[cfg(all(feature = "http-inputs", feature = "webhook-inputs"))]
 fn external_source_health_and_execution_origin_are_projected() {
     let runtime = build_automation(AutomationDocument {
         signals: Vec::new(),
@@ -500,6 +501,32 @@ fn dashboard_json_exposes_ordered_blocks() {
     assert_eq!(blocks[0]["id"], "test");
     assert!(blocks[0].get("state").is_some());
     assert!(blocks[0].get("pending_timers").is_some());
+    assert_eq!(value["operations"]["profile"], "desktop");
+    assert_eq!(value["operations"]["core"]["logic_blocks"]["used"], 1);
+    assert_eq!(value["operations"]["core"]["logic_blocks"]["capacity"], 64);
+}
+
+#[test]
+fn embedded_profile_trims_diagnostic_histories_to_profile_capacity() {
+    let runtime = make_runtime("function handle(event, input, meta) return nil end");
+    let mut engine = Runtime::new(runtime.core_config.clone());
+    let store = store(&runtime);
+    store.set_host_limits(logiksmith_desktop::HostLimits::embedded_baseline());
+    for index in 0..9u64 {
+        let execution = engine
+            .process_input(
+                &BlockId::parse("test").unwrap(),
+                bool_event("wall_switch", index % 2 == 0),
+                MonotonicMs(index + 1),
+            )
+            .unwrap()
+            .unwrap();
+        store.record_block_execution(&execution, MonotonicMs(index + 1), index, &runtime, None);
+    }
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.blocks[0].executions.len(), 8);
+    assert_eq!(snapshot.operations.profile, "embedded-baseline");
+    assert_eq!(snapshot.operations.core.logic_blocks.capacity, 32);
 }
 
 #[test]

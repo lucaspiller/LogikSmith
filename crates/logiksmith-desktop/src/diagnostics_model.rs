@@ -1,7 +1,7 @@
 // Bounded, read-only diagnostic state for the desktop dashboard.
 
 use crate::{
-    AutomationRuntime, BoolValueMessage, DptMessage, GroupAddress, ValueMessage,
+    AutomationRuntime, BoolValueMessage, CompiledCapabilities, DptMessage, GroupAddress, ValueMessage,
     ValidatedKnxEvent,
 };
 use logiksmith_core::{
@@ -27,7 +27,6 @@ pub const MAX_TELEGRAMS: usize = 200;
 pub const MAX_LOGS: usize = 500;
 pub const MAX_EXECUTIONS: usize = 50;
 pub const JOURNAL_CAPACITY: usize = 512;
-const MAX_PENDING_WRITES: usize = 200;
 const MAX_LOGIC_ERROR: usize = 2_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -42,6 +41,8 @@ pub enum ConnectionState {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Snapshot {
+    /// Immutable capabilities compiled into this host binary.
+    pub capabilities: CompiledCapabilities,
     pub revision: u64,
     pub connection: ConnectionSnapshot,
     pub config: ConfigSnapshot,
@@ -64,6 +65,79 @@ pub struct Snapshot {
     pub signals: Vec<SignalSnapshot>,
     /// Host-owned HTTP poll and webhook health/value projections.
     pub external_inputs: ExternalInputsSnapshot,
+    /// Host capacity, queue pressure, and fatal-state projection used by the
+    /// Operations view and container health tooling.
+    pub operations: OperationsSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct OperationsSnapshot {
+    pub profile: String,
+    pub status: String,
+    pub queues: BTreeMap<String, QueueSnapshot>,
+    pub core: CoreUsageSnapshot,
+    /// Host event-loop timing against the selected profile's optional
+    /// embedded/OpenKNX thresholds.  These are diagnostics only; the host
+    /// never turns a slow desktop turn into a transport failure.
+    pub host_turn: HostTurnSnapshot,
+    /// Per-block health and rate projections.  Suspension state is populated
+    /// by the core when that API is available; the desktop still reports the
+    /// observed execution/failure counters today.
+    pub block_health: BTreeMap<String, BlockHealthSnapshot>,
+    pub pending_knx_writes: usize,
+    pub pending_knx_write_capacity: usize,
+    pub pending_write_timeouts: u64,
+    pub fatal: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CoreUsageSnapshot {
+    pub logic_blocks: CapacitySnapshot,
+    pub signals: CapacitySnapshot,
+    pub signal_bindings: CapacitySnapshot,
+    pub logic_source_bytes: CapacitySnapshot,
+    pub state_entries: CapacitySnapshot,
+    pub state_bytes: CapacitySnapshot,
+    pub pending_timers: CapacitySnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct CapacitySnapshot {
+    pub used: usize,
+    pub capacity: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct HostTurnSnapshot {
+    pub last_duration_us: u64,
+    pub max_duration_us: u64,
+    pub over_budget_count: u64,
+    pub warning_count: u64,
+    pub last_over_budget: bool,
+    pub last_warning: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct BlockHealthSnapshot {
+    /// `active` and `failure_threshold_reached` are desktop projections. The
+    /// core owns actual suspension and will add an authoritative suspended
+    /// status without changing this JSON shape.
+    pub status: String,
+    pub consecutive_failures: u32,
+    pub live_executions_last_second: u32,
+    pub last_suspension: Option<String>,
+    pub last_execution_at_ms: Option<u64>,
+    pub last_failure_at_ms: Option<u64>,
+    pub last_error: Option<LogicErrorRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct QueueSnapshot {
+    pub capacity: usize,
+    pub depth: usize,
+    pub high_water: usize,
+    pub accepted: u64,
+    pub rejected: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -784,6 +858,20 @@ struct Inner {
     /// Structural schedule definitions per block, read from the active
     /// runtime at store construction.
     block_schedules: BTreeMap<String, Vec<ScheduleConfigSnapshot>>,
+    operations: OperationsSnapshot,
+    block_health_runtime: BTreeMap<String, BlockHealthRuntime>,
+    limits: crate::HostLimits,
+}
+
+/// Internal rolling counters used to project block health without retaining
+/// an unbounded execution-rate history.
+#[derive(Default)]
+struct BlockHealthRuntime {
+    consecutive_failures: u32,
+    executions_ms: VecDeque<u64>,
+    last_execution_at_ms: Option<u64>,
+    last_failure_at_ms: Option<u64>,
+    last_error: Option<LogicErrorRecord>,
 }
 #[derive(Clone, Debug)]
 struct ScheduleConfigSnapshot {

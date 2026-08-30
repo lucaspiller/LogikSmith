@@ -38,6 +38,21 @@ struct BlockEnabledRequest {
     expected_structural_revision: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlockResumeRequest {
+    #[serde(alias = "expectedRevision", alias = "expectedActiveRevision")]
+    #[serde(deserialize_with = "crate::wire_revision::deserialize")]
+    expected_revision: u64,
+    #[serde(
+        default,
+        alias = "expectedStructuralRevision",
+        alias = "expectedActiveStructuralRevision"
+    )]
+    #[serde(deserialize_with = "crate::wire_revision::deserialize_option")]
+    expected_structural_revision: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 struct BlockValidationResponse {
     status: &'static str,
@@ -344,21 +359,34 @@ async fn finish_mutation(
         );
     }
     let (reply, result) = tokio::sync::oneshot::channel();
-    if activation
-        .send(ActivationRequest {
+    let request = ActivationRequest {
             updates: vec![update],
+            resume_block: None,
             document_revision: prepared.document_revision,
             document: prepared.candidate.clone(),
             reply,
-        })
-        .await
-        .is_err()
-    {
-        let _ = restore_document(&state.store.automation_path(), &prepared.previous);
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "runtime activation service is unavailable".to_owned(),
-        );
+        };
+    match activation.try_send(request) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            let _ = restore_document(&state.store.automation_path(), &prepared.previous);
+            state.host.health.fail(format!(
+                "runtime overload in activation queue (capacity={}, depth={})",
+                state.host.limits.activation_queue,
+                state.host.limits.activation_queue,
+            ));
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime overload; container will restart".to_owned(),
+            );
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            let _ = restore_document(&state.store.automation_path(), &prepared.previous);
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime activation service is unavailable".to_owned(),
+            );
+        }
     }
     let activation = match result.await {
         Ok(Ok(activation)) => activation,
@@ -520,6 +548,90 @@ async fn set_block_enabled(
         None,
     )
     .await
+}
+
+async fn resume_block(
+    AxumPath(block_id): AxumPath<String>,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    let request = match malformed_block_json::<BlockResumeRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let snapshot = state.store.snapshot();
+    if let Err(response) = check_block_cas(
+        &snapshot,
+        &block_id,
+        request.expected_revision,
+        request.expected_structural_revision,
+    ) {
+        return response;
+    }
+    let Some(activation) = state.activation.clone() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime activation service is unavailable".to_owned(),
+        );
+    };
+    let block_id_value = match block_id.parse::<logiksmith_core::BlockId>() {
+        Ok(block_id) => block_id,
+        Err(_) => return json_error(StatusCode::NOT_FOUND, "unknown logic block".to_owned()),
+    };
+    let (reply, result) = tokio::sync::oneshot::channel();
+    let request = ActivationRequest {
+        updates: Vec::new(),
+        resume_block: Some(block_id_value),
+        document_revision: snapshot.active_automation_revision,
+        document: state.store.active_document(),
+        reply,
+    };
+    match activation.try_send(request) {
+        Ok(()) => {
+            let depth = state
+                .host
+                .limits
+                .activation_queue
+                .saturating_sub(activation.capacity());
+            state.store.record_queue_admitted("activation", depth);
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            state.store.record_queue_rejected(
+                "activation",
+                state.host.limits.activation_queue,
+                true,
+            );
+            state.host.health.fail(format!(
+                "runtime overload in activation queue (capacity={}, depth={})",
+                state.host.limits.activation_queue,
+                state.host.limits.activation_queue,
+            ));
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime overload; container will restart".to_owned(),
+            );
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime activation service is unavailable".to_owned(),
+            );
+        }
+    }
+    match result.await {
+        Ok(Ok(_)) => mutation_response(
+            &state.store.snapshot(),
+            &block_id,
+            Vec::new(),
+            None,
+            Some("block resumed".to_owned()),
+        ),
+        Ok(Err(error)) => json_error(StatusCode::SERVICE_UNAVAILABLE, error),
+        Err(_) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime activation service is unavailable".to_owned(),
+        ),
+    }
 }
 
 async fn simulate_block(

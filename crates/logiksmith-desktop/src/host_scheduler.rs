@@ -41,16 +41,23 @@ async fn drain_due_timers(
     runtime: &mut CoreRuntime,
     store: &DiagnosticStore,
     config: &RuntimeConfig,
-    mut bridge: Option<(&mut ChildStdin, &mut u64, &mut HashSet<u64>)>,
+    mut bridge: Option<(&mut ChildStdin, &mut u64, &mut PendingWrites)>,
+    limits: HostLimits,
 ) -> Result<(), HostError> {
     let now = store.now();
+    let mut processed = 0usize;
     while runtime
         .next_timer_deadline()
         .is_some_and(|deadline| deadline <= now)
+        && processed < limits.due_work_batch
     {
+        processed += 1;
         let started = Instant::now();
         let sample = clock_sample(store);
-        let executions = match runtime.process_next_due_timer_cascade_sampled(sample) {
+        let executions = match match live_budget_probe(limits) {
+            Some(probe) => runtime.process_next_due_timer_cascade_sampled_with_budget_probe(sample, probe),
+            None => runtime.process_next_due_timer_cascade_sampled(sample),
+        } {
             Ok(executions) if executions.is_empty() => break,
             Ok(executions) => executions,
             Err(error) => {
@@ -74,6 +81,15 @@ async fn drain_due_timers(
         )
         .await?;
     }
+    if processed == limits.due_work_batch
+        && runtime
+            .next_timer_deadline()
+            .is_some_and(|deadline| deadline <= now)
+    {
+        // Let connection/control lanes win the next select before a timer
+        // storm is resumed by the caller's immediate sleep.
+        tokio::task::yield_now().await;
+    }
     Ok(())
 }
 
@@ -84,7 +100,7 @@ async fn record_and_dispatch_cascade(
     executions: Vec<logiksmith_core::BlockExecution>,
     now: logiksmith_core::MonotonicMs,
     duration_us: u64,
-    bridge: Option<(&mut ChildStdin, &mut u64, &mut HashSet<u64>)>,
+    bridge: Option<(&mut ChildStdin, &mut u64, &mut PendingWrites)>,
     schedule_handling: Option<ScheduleHandling>,
 ) -> Result<(), HostError> {
     record_and_dispatch_cascade_with_origin(
@@ -108,7 +124,7 @@ async fn record_and_dispatch_cascade_with_origin(
     executions: Vec<logiksmith_core::BlockExecution>,
     now: logiksmith_core::MonotonicMs,
     duration_us: u64,
-    mut bridge: Option<(&mut ChildStdin, &mut u64, &mut HashSet<u64>)>,
+    mut bridge: Option<(&mut ChildStdin, &mut u64, &mut PendingWrites)>,
     schedule_handling: Option<ScheduleHandling>,
     origin: Option<diagnostics::ExecutionOrigin>,
 ) -> Result<(), HostError> {
@@ -208,7 +224,8 @@ async fn poll_and_process_schedules(
     runtime: &mut CoreRuntime,
     store: &DiagnosticStore,
     config: &RuntimeConfig,
-    mut bridge: Option<(&mut ChildStdin, &mut u64, &mut HashSet<u64>)>,
+    mut bridge: Option<(&mut ChildStdin, &mut u64, &mut PendingWrites)>,
+    limits: HostLimits,
 ) -> Result<(), HostError> {
     let sample = clock_sample(store);
     let utc_unix_ms = sample.utc_unix_ms;
@@ -232,7 +249,10 @@ async fn poll_and_process_schedules(
         // A second SystemTime read could cross a wall-clock correction and
         // make queue delay disagree with the scheduler's detection instant.
         let handled_at_utc_ms = utc_unix_ms.unwrap_or(0);
-        let executions = match runtime.process_schedule_cascade_sampled(trigger, sample) {
+        let executions = match match live_budget_probe(limits) {
+            Some(probe) => runtime.process_schedule_cascade_sampled_with_budget_probe(trigger, sample, probe),
+            None => runtime.process_schedule_cascade_sampled(trigger, sample),
+        } {
             Ok(executions) if executions.is_empty() => {
                 // Stale structural revision, disabled block, or unknown
                 // schedule; the core decided not to deliver.

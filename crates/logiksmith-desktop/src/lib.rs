@@ -1,18 +1,22 @@
 //! Tokio desktop host for the platform-independent LogikSmith engine.
 
 mod automation;
+pub mod capabilities;
 mod configuration;
 pub mod diagnostics;
 mod external;
 mod host;
+mod host_limits;
 mod protocol;
 mod simulation;
 pub mod web;
 
 pub use automation::*;
+pub use capabilities::*;
 pub use configuration::*;
 pub use external::*;
 pub use host::*;
+pub use host_limits::*;
 pub use protocol::*;
 pub use simulation::*;
 

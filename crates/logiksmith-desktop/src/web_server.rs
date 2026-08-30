@@ -2,24 +2,30 @@
 
 use crate::{
     ActivationRequest, AutomationBlock, AutomationBlockStatus, AutomationDocument,
-    AutomationEnvelope, FieldError, SimulationOutcome, SimulationPayload, SimulationRequest,
-    WebConfig, build_automation,
+    AutomationEnvelope, AutomationRuntime, CompiledCapabilities, FieldError, HostHealth, HostLimits, SimulationOutcome,
+    SimulationPayload, SimulationRequest, WebConfig, WebhookInputRuntime, build_automation,
     diagnostics::{BlockSnapshot, DiagnosticStore, DiagnosticUpdate, Replay, Snapshot},
+    external::ExternalInputMessage,
     load_automation, serialize_automation, structural_revision,
-    external::{self, ExternalInputMessage},
-    AutomationRuntime, WebhookInputRuntime,
 };
 use axum::{
     Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Json as ExtractJson, Path as AxumPath, Query, State, rejection::JsonRejection},
-    http::{HeaderMap, StatusCode},
+    extract::{
+        DefaultBodyLimit, Json as ExtractJson, Path as AxumPath, Query, State,
+        rejection::JsonRejection,
+    },
+    http::StatusCode,
     response::{
         IntoResponse, Json, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post, put},
 };
+#[cfg(feature = "webhook-inputs")]
+use crate::external;
+#[cfg(feature = "webhook-inputs")]
+use axum::http::HeaderMap;
 use futures_util::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -62,6 +68,13 @@ struct AppState {
     simulation: Option<mpsc::Sender<SimulationRequest>>,
     external: Option<mpsc::Sender<ExternalInputMessage>>,
     webhooks: Arc<std::collections::HashMap<String, WebhookInputRuntime>>,
+    host: HostRuntimeState,
+}
+
+#[derive(Clone)]
+struct HostRuntimeState {
+    limits: HostLimits,
+    health: HostHealth,
 }
 
 fn block_statuses(snapshot: &Snapshot) -> Vec<AutomationBlockStatus> {
@@ -127,7 +140,7 @@ pub async fn start_web_server_with_assets(
     config: WebConfig,
     root: &Path,
 ) -> Result<WebServer, WebError> {
-    start_web_server_with_assets_and_activation(
+    start_web_server_with_assets_and_activation_with_host(
         store,
         config,
         root,
@@ -135,6 +148,8 @@ pub async fn start_web_server_with_assets(
         None,
         None,
         Arc::new(Default::default()),
+        HostLimits::desktop(),
+        HostHealth::new(HostLimits::desktop()),
     )
     .await
 }
@@ -155,7 +170,7 @@ pub async fn start_web_server_with_activation(
             .join("../..")
             .join(STATIC_ASSET_ROOT)
     };
-    start_web_server_with_assets_and_activation(
+    start_web_server_with_assets_and_activation_with_host(
         store,
         config,
         &root,
@@ -163,6 +178,8 @@ pub async fn start_web_server_with_activation(
         None,
         None,
         Arc::new(Default::default()),
+        HostLimits::desktop(),
+        HostHealth::new(HostLimits::desktop()),
     )
     .await
 }
@@ -175,7 +192,18 @@ pub async fn start_web_server_with_runtime(
     activation: mpsc::Sender<ActivationRequest>,
     simulation: mpsc::Sender<SimulationRequest>,
 ) -> Result<WebServer, WebError> {
-    start_web_server_with_assets_and_activation(store, config, &root_for_assets(), Some(activation), Some(simulation), None, Arc::new(Default::default())).await
+    start_web_server_with_assets_and_activation_with_host(
+        store,
+        config,
+        &root_for_assets(),
+        Some(activation),
+        Some(simulation),
+        None,
+        Arc::new(Default::default()),
+        HostLimits::desktop(),
+        HostHealth::new(HostLimits::desktop()),
+    )
+    .await
 }
 
 /// Starts the dashboard with runtime channels and configured webhook inputs.
@@ -188,6 +216,32 @@ pub async fn start_web_server_with_runtime_and_sources(
     automation: &AutomationRuntime,
     external: mpsc::Sender<ExternalInputMessage>,
 ) -> Result<WebServer, WebError> {
+    start_web_server_with_runtime_and_sources_with_host(
+        store,
+        config,
+        activation,
+        simulation,
+        automation,
+        external,
+        HostLimits::desktop(),
+        HostHealth::new(HostLimits::desktop()),
+    )
+    .await
+}
+
+/// Starts the dashboard with an explicitly selected host profile and health
+/// state.  Runtime channels are still owned and drained by the host session;
+/// this function only admits bounded requests and exposes status endpoints.
+pub async fn start_web_server_with_runtime_and_sources_with_host(
+    store: DiagnosticStore,
+    config: WebConfig,
+    activation: mpsc::Sender<ActivationRequest>,
+    simulation: mpsc::Sender<SimulationRequest>,
+    automation: &AutomationRuntime,
+    external: mpsc::Sender<ExternalInputMessage>,
+    limits: HostLimits,
+    health: HostHealth,
+) -> Result<WebServer, WebError> {
     let relative = Path::new(STATIC_ASSET_ROOT);
     let root = if relative.is_dir() {
         relative.to_path_buf()
@@ -196,23 +250,41 @@ pub async fn start_web_server_with_runtime_and_sources(
             .join("../..")
             .join(STATIC_ASSET_ROOT)
     };
-    start_web_server_with_assets_and_activation(
+    start_web_server_with_assets_and_activation_with_host(
         store,
         config,
         &root,
         Some(activation),
         Some(simulation),
         Some(external),
-        Arc::new(automation.webhook_inputs.iter().cloned().map(|source| (source.name.clone(), source)).collect()),
+        Arc::new(
+            automation
+                .webhook_inputs
+                .iter()
+                .cloned()
+                .map(|source| (source.name.clone(), source))
+                .collect(),
+        ),
+        limits,
+        health,
     )
     .await
 }
 
 fn root_for_assets() -> PathBuf {
     let relative = Path::new(STATIC_ASSET_ROOT);
-    if relative.is_dir() { relative.to_path_buf() } else { Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(STATIC_ASSET_ROOT) }
+    if relative.is_dir() {
+        relative.to_path_buf()
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(STATIC_ASSET_ROOT)
+    }
 }
 
+/// Compatibility helper retained for the in-crate HTTP tests and callers
+/// which do not need to share a runtime health object.
+#[allow(dead_code)]
 async fn start_web_server_with_assets_and_activation(
     store: DiagnosticStore,
     config: WebConfig,
@@ -221,6 +293,31 @@ async fn start_web_server_with_assets_and_activation(
     simulation: Option<mpsc::Sender<SimulationRequest>>,
     external: Option<mpsc::Sender<ExternalInputMessage>>,
     webhooks: Arc<std::collections::HashMap<String, WebhookInputRuntime>>,
+) -> Result<WebServer, WebError> {
+    start_web_server_with_assets_and_activation_with_host(
+        store,
+        config,
+        root,
+        activation,
+        simulation,
+        external,
+        webhooks,
+        HostLimits::desktop(),
+        HostHealth::new(HostLimits::desktop()),
+    )
+    .await
+}
+
+async fn start_web_server_with_assets_and_activation_with_host(
+    store: DiagnosticStore,
+    config: WebConfig,
+    root: &Path,
+    activation: Option<mpsc::Sender<ActivationRequest>>,
+    simulation: Option<mpsc::Sender<SimulationRequest>>,
+    external: Option<mpsc::Sender<ExternalInputMessage>>,
+    webhooks: Arc<std::collections::HashMap<String, WebhookInputRuntime>>,
+    limits: HostLimits,
+    health: HostHealth,
 ) -> Result<WebServer, WebError> {
     let root = root.to_path_buf();
     let index = root.join("index.html");
@@ -242,6 +339,8 @@ async fn start_web_server_with_assets_and_activation(
         .local_addr()
         .map_err(|source| WebError::Bind { address, source })?;
     let router = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/api/snapshot", get(snapshot))
         .route("/api/automation", get(get_automation).put(put_automation))
         .route("/api/simulate", post(simulate))
@@ -261,12 +360,23 @@ async fn start_web_server_with_assets_and_activation(
             "/api/blocks/{block_id}/enabled",
             put(set_block_enabled).layer(DefaultBodyLimit::max(crate::MAX_HTTP_BODY_BYTES)),
         )
-        .route("/api/schedules/preview", post(preview_schedule))
-        .route("/api/schedules/simulate", post(simulate_schedule))
         .route(
-            "/api/webhooks/{source}",
-            post(webhook).layer(DefaultBodyLimit::max(crate::MAX_HTTP_BODY_BYTES)),
+            "/api/blocks/{block_id}/resume",
+            post(resume_block).layer(DefaultBodyLimit::max(crate::MAX_HTTP_BODY_BYTES)),
         )
+        .route("/api/schedules/preview", post(preview_schedule))
+        .route("/api/schedules/simulate", post(simulate_schedule));
+    #[cfg(feature = "webhook-inputs")]
+    let router = router.route(
+        "/api/webhooks/{source}",
+        post(webhook).layer(DefaultBodyLimit::max(crate::MAX_HTTP_BODY_BYTES)),
+    );
+    #[cfg(not(feature = "webhook-inputs"))]
+    let router = router.route(
+        "/api/webhooks/{source}",
+        post(webhook_disabled).layer(DefaultBodyLimit::max(crate::MAX_HTTP_BODY_BYTES)),
+    );
+    let router = router
         .route("/api/events", get(events))
         .fallback_service(ServeDir::new(&root).not_found_service(ServeFile::new(index)))
         .with_state(AppState {
@@ -276,6 +386,7 @@ async fn start_web_server_with_assets_and_activation(
             simulation,
             external,
             webhooks,
+            host: HostRuntimeState { limits, health },
         });
     let (sender, receiver) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -299,6 +410,73 @@ async fn snapshot(State(state): State<AppState>) -> Json<Snapshot> {
     Json(state.store.snapshot())
 }
 
+#[cfg(not(feature = "webhook-inputs"))]
+async fn webhook_disabled() -> StatusCode {
+    // Keep a stable 404 for callers which retained an old route, while
+    // compiling out webhook parsing and delivery logic.
+    StatusCode::NOT_FOUND
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    ready: bool,
+    profile: &'static str,
+    fatal: Option<String>,
+    capabilities: CompiledCapabilities,
+}
+
+async fn healthz(State(state): State<AppState>) -> Response {
+    let health = state.host.health.snapshot();
+    let status_code = if health.fatal.is_some() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (
+        status_code,
+        Json(HealthResponse {
+            status: if health.fatal.is_some() {
+                "failed"
+            } else {
+                "ok"
+            },
+            ready: health.ready,
+            profile: health.profile.as_str(),
+            fatal: health.fatal,
+            capabilities: crate::capabilities::compiled_capabilities(),
+        }),
+    )
+        .into_response()
+}
+
+async fn readyz(State(state): State<AppState>) -> Response {
+    let health = state.host.health.snapshot();
+    let ready = health.ready && health.fatal.is_none();
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(HealthResponse {
+            status: if ready {
+                "ready"
+            } else if health.fatal.is_some() {
+                "failed"
+            } else {
+                "starting"
+            },
+            ready,
+            profile: health.profile.as_str(),
+            fatal: health.fatal,
+            capabilities: crate::capabilities::compiled_capabilities(),
+        }),
+    )
+        .into_response()
+}
+
+#[cfg(feature = "webhook-inputs")]
 async fn webhook(
     AxumPath(source_name): AxumPath<String>,
     State(state): State<AppState>,
@@ -361,12 +539,47 @@ async fn webhook(
     let message = ExternalInputMessage {
         source: source_name.clone(),
         update: external::ExternalInputUpdate::Trigger(value),
-        kind: external::ExternalInputKind::Webhook { source: source_name.clone() },
+        kind: external::ExternalInputKind::Webhook {
+            source: source_name.clone(),
+        },
         reply: Some(reply),
     };
-    if sender.send(message).await.is_err() {
-        state.store.record_webhook_rejected(&source_name);
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    match sender.try_send(message) {
+        Ok(()) => {
+            if state.host.health.snapshot().ready {
+                let depth = state
+                    .host
+                    .limits
+                    .external_input_queue
+                    .saturating_sub(sender.capacity());
+                state.store.record_queue_admitted("external_input", depth);
+            }
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_message)) => {
+            state.store.record_webhook_rejected(&source_name);
+            state.store.record_queue_rejected(
+                "external_input",
+                state.host.limits.external_input_queue,
+                true,
+            );
+            state.store.record_runtime_fatal(
+                format!(
+                    "runtime overload in external input queue (capacity={}, depth={})",
+                    state.host.limits.external_input_queue,
+                    state.host.limits.external_input_queue,
+                ),
+                true,
+            );
+            state.host.health.fail(format!(
+                "runtime overload in external input queue (capacity={}, depth={})",
+                state.host.limits.external_input_queue, state.host.limits.external_input_queue,
+            ));
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_message)) => {
+            state.store.record_webhook_rejected(&source_name);
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     }
     match tokio::time::timeout(Duration::from_secs(10), response).await {
         Ok(Ok(Ok(()))) => {

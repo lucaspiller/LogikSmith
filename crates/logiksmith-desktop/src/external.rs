@@ -5,9 +5,12 @@
 //! observation, trigger, or invalidation for each bound block.
 
 use crate::{
-    AutomationRuntime, HttpPollRuntime, HttpPollValueRuntime, MAX_HTTP_BODY_BYTES,
-    WebhookInputRuntime, diagnostics::DiagnosticStore,
+    AutomationRuntime, HostHealth, HostLimits, MAX_HTTP_BODY_BYTES, WebhookInputRuntime,
+    diagnostics::DiagnosticStore,
 };
+#[cfg(feature = "http-inputs")]
+use crate::{HttpPollRuntime, HttpPollValueRuntime};
+#[cfg(feature = "http-inputs")]
 use futures_util::StreamExt;
 use logiksmith_core::{Dpt, TypedValue, Value};
 use serde_json::Value as JsonValue;
@@ -18,17 +21,21 @@ use tokio::{
     time,
 };
 
-const HTTP_RETRY_LIMIT: u8 = 3;
-const HTTP_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+#[cfg(feature = "http-inputs")]
+const HTTP_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(60),
+    Duration::from_secs(5 * 60),
+];
 
+#[cfg(feature = "http-inputs")]
 fn failure_delay(retry_count: &mut u8, normal_interval: Duration) -> Duration {
-    if *retry_count < HTTP_RETRY_LIMIT {
-        *retry_count += 1;
-        HTTP_RETRY_INTERVAL
-    } else {
-        *retry_count = 0;
-        normal_interval
-    }
+    let index = usize::from((*retry_count).min((HTTP_RETRY_DELAYS.len() - 1) as u8));
+    *retry_count = retry_count
+        .saturating_add(1)
+        .min(HTTP_RETRY_DELAYS.len() as u8);
+    HTTP_RETRY_DELAYS[index].min(normal_interval)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -115,28 +122,45 @@ pub fn spawn_http_polls(
     automation: &AutomationRuntime,
     sender: mpsc::Sender<ExternalInputMessage>,
     store: DiagnosticStore,
+    limits: HostLimits,
+    health: HostHealth,
 ) -> ExternalTasks {
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-    let mut joins = Vec::new();
-    for poll in automation.http_polls.clone() {
-        let sender = sender.clone();
-        let shutdown = shutdown_receiver.clone();
-        let store = store.clone();
-        joins.push(tokio::spawn(async move {
-            poll_loop(poll, sender, shutdown, store).await;
-        }));
-    }
+    let joins = {
+        #[cfg(feature = "http-inputs")]
+        {
+            let mut joins = Vec::new();
+            for poll in automation.http_polls.clone() {
+                let sender = sender.clone();
+                let shutdown = shutdown_receiver.clone();
+                let store = store.clone();
+                let health = health.clone();
+                joins.push(tokio::spawn(async move {
+                    poll_loop(poll, sender, shutdown, store, limits, health).await;
+                }));
+            }
+            joins
+        }
+        #[cfg(not(feature = "http-inputs"))]
+        {
+            let _ = (automation, sender, store, limits, health, shutdown_receiver);
+            Vec::new()
+        }
+    };
     ExternalTasks {
         shutdown: shutdown_sender,
         joins,
     }
 }
 
+#[cfg(feature = "http-inputs")]
 async fn poll_loop(
     poll: HttpPollRuntime,
     sender: mpsc::Sender<ExternalInputMessage>,
     mut shutdown: watch::Receiver<bool>,
     store: DiagnosticStore,
+    limits: HostLimits,
+    health: HostHealth,
 ) {
     let client = match reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -169,19 +193,36 @@ async fn poll_loop(
         let now = time::Instant::now();
         if !stale_sent && stale_at.is_some_and(|deadline| now >= deadline) {
             for value in &poll.values {
-                if sender
-                    .send(ExternalInputMessage {
-                        source: value.name.clone(),
-                        update: ExternalInputUpdate::Invalidate,
-                        kind: ExternalInputKind::HttpPoll {
-                            poll: poll.name.clone(),
-                        },
-                        reply: None,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
+                let message = ExternalInputMessage {
+                    source: value.name.clone(),
+                    update: ExternalInputUpdate::Invalidate,
+                    kind: ExternalInputKind::HttpPoll {
+                        poll: poll.name.clone(),
+                    },
+                    reply: None,
+                };
+                match sender.try_send(message) {
+                    Ok(()) => {
+                        if health.snapshot().ready {
+                            let depth = limits
+                                .external_input_queue
+                                .saturating_sub(sender.capacity());
+                            store.record_queue_admitted("external_input", depth);
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        store.record_queue_rejected(
+                            "external_input",
+                            limits.external_input_queue,
+                            true,
+                        );
+                        health.fail(format!(
+                            "runtime overload in external input queue (capacity={}, depth={})",
+                            limits.external_input_queue, limits.external_input_queue,
+                        ));
+                        return;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
                 }
             }
             store.record_external_poll_stale(&poll.name);
@@ -212,19 +253,36 @@ async fn poll_loop(
                         Some(previous) if previous == typed => ExternalInputUpdate::Observe(typed),
                         _ => ExternalInputUpdate::Trigger(typed),
                     };
-                    if sender
-                        .send(ExternalInputMessage {
-                            source: value.name.clone(),
-                            update,
-                            kind: ExternalInputKind::HttpPoll {
-                                poll: poll.name.clone(),
-                            },
-                            reply: None,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return;
+                    let message = ExternalInputMessage {
+                        source: value.name.clone(),
+                        update,
+                        kind: ExternalInputKind::HttpPoll {
+                            poll: poll.name.clone(),
+                        },
+                        reply: None,
+                    };
+                    match sender.try_send(message) {
+                        Ok(()) => {
+                            if health.snapshot().ready {
+                                let depth = limits
+                                    .external_input_queue
+                                    .saturating_sub(sender.capacity());
+                                store.record_queue_admitted("external_input", depth);
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            store.record_queue_rejected(
+                                "external_input",
+                                limits.external_input_queue,
+                                true,
+                            );
+                            health.fail(format!(
+                                "runtime overload in external input queue (capacity={}, depth={})",
+                                limits.external_input_queue, limits.external_input_queue,
+                            ));
+                            return;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => return,
                     }
                 }
                 poll.every
@@ -247,6 +305,7 @@ async fn poll_loop(
     }
 }
 
+#[cfg(feature = "http-inputs")]
 async fn fetch_poll(
     client: &reqwest::Client,
     poll: &HttpPollRuntime,
@@ -399,6 +458,7 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "http-inputs")]
     #[test]
     fn open_meteo_values_are_extracted_with_strict_temperature_precision() {
         let document = serde_json::json!({
@@ -447,6 +507,7 @@ mod tests {
         assert!(!json.is_empty());
     }
 
+    #[cfg(feature = "webhook-inputs")]
     #[test]
     fn webhook_auth_and_scalar_conversion_are_exact() {
         let source = WebhookInputRuntime {
@@ -484,23 +545,42 @@ mod tests {
         assert!(typed_value(Dpt::BOOL, &serde_json::json!(1)).is_err());
     }
 
+    #[cfg(feature = "http-inputs")]
     #[test]
-    fn failed_polls_use_three_fixed_retries_then_normal_interval() {
+    fn failed_polls_use_progressive_backoff_capped_by_normal_interval() {
         let mut retry_count = 0;
         let normal_interval = Duration::from_secs(3600);
+        let expected = [
+            Duration::from_secs(5),
+            Duration::from_secs(15),
+            Duration::from_secs(60),
+            Duration::from_secs(5 * 60),
+            Duration::from_secs(5 * 60),
+        ];
 
-        for expected_count in 1..=HTTP_RETRY_LIMIT {
+        for (expected_count, expected_delay) in expected.into_iter().enumerate() {
             let delay = failure_delay(&mut retry_count, normal_interval);
-            assert_eq!(delay, HTTP_RETRY_INTERVAL);
-            assert_eq!(retry_count, expected_count);
+            assert_eq!(delay, expected_delay);
+            assert_eq!(retry_count, (expected_count + 1).min(4) as u8);
         }
 
-        let delay = failure_delay(&mut retry_count, normal_interval);
-        assert_eq!(delay, normal_interval);
-        assert_eq!(retry_count, 0);
-
-        let delay = failure_delay(&mut retry_count, normal_interval);
-        assert_eq!(delay, HTTP_RETRY_INTERVAL);
-        assert_eq!(retry_count, 1);
+        let mut retry_count = 0;
+        let normal_interval = Duration::from_secs(30);
+        assert_eq!(
+            failure_delay(&mut retry_count, normal_interval),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            failure_delay(&mut retry_count, normal_interval),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            failure_delay(&mut retry_count, normal_interval),
+            normal_interval
+        );
+        assert_eq!(
+            failure_delay(&mut retry_count, normal_interval),
+            normal_interval
+        );
     }
 }

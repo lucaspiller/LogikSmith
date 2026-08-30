@@ -87,6 +87,7 @@ fn snapshot_locked(inner: &Inner, now: logiksmith_core::MonotonicMs) -> Snapshot
             .map(|observed| now.0.saturating_sub(observed));
     }
     Snapshot {
+        capabilities: crate::capabilities::compiled_capabilities(),
         revision: inner.revision,
         connection: ConnectionSnapshot {
             state: inner.connection,
@@ -118,5 +119,6 @@ fn snapshot_locked(inner: &Inner, now: logiksmith_core::MonotonicMs) -> Snapshot
         blocks,
         signals: inner.signals.clone(),
         external_inputs,
+        operations: inner.operations.clone(),
     }
 }

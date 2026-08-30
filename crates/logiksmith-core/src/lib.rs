@@ -9,6 +9,7 @@ mod blocks;
 mod engine;
 mod engine_config;
 mod identifiers;
+mod limits;
 mod lua;
 mod noaa;
 mod program;
@@ -23,6 +24,7 @@ pub use engine::*;
 pub use engine_config::*;
 pub(crate) use identifiers::validate_endpoint_name;
 pub use identifiers::*;
+pub use limits::*;
 pub use program::*;
 pub use runtime::*;
 pub use schedule::*;
@@ -34,6 +36,7 @@ pub const MAX_LOGIC_INSTRUCTIONS: u32 = 100_000;
 pub const MAX_LOGIC_MEMORY_BYTES: usize = 1024 * 1024;
 
 const INSTRUCTION_LIMIT_MARKER: &str = "logiksmith instruction limit exceeded";
+const HANDLER_TIME_LIMIT_MARKER: &str = "logiksmith handler time limit exceeded";
 
 #[cfg(test)]
 mod legacy_behavior_tests {
@@ -62,4 +65,10 @@ mod signal_tests {
 #[cfg(test)]
 mod temperature_input_tests {
     include!("temperature_input_tests.rs");
+}
+
+#[cfg(test)]
+mod limits_tests {
+    use super::*;
+    include!("limits_tests.rs");
 }

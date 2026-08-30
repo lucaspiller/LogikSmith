@@ -6,10 +6,25 @@ pub(crate) fn apply_activation(
 ) {
     let ActivationRequest {
         updates,
+        resume_block,
         document_revision,
         document,
         reply,
     } = request;
+    if let Some(block_id) = resume_block {
+        let result = runtime
+            .resume_block(&block_id)
+            .map(|()| CoreActivationResult {
+                document_revision,
+                result: logiksmith_core::ActivationResult::default(),
+            })
+            .map_err(|error| error.to_string());
+        if result.is_ok() {
+            store.set_runtime_projection_from_runtime(runtime, clock_sample(store).monotonic_ms);
+        }
+        let _ = reply.send(result);
+        return;
+    }
     let result = runtime
         .activate(logiksmith_core::RuntimeActivation::new(updates))
         .map(|activation| {

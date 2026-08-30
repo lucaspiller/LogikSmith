@@ -39,9 +39,29 @@ pub struct TimeZoneId(String);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimeZoneIdError(String);
 
+fn timezone_for(id: &TimeZoneId) -> Option<TimeZone> {
+    #[cfg(feature = "timezones")]
+    {
+        TimeZone::get(id.as_str()).ok()
+    }
+    #[cfg(not(feature = "timezones"))]
+    {
+        (id.as_str() == "UTC").then_some(TimeZone::UTC)
+    }
+}
+
 impl TimeZoneId {
     /// Validates `value` against the bundled IANA time zone database.
     pub fn new(value: &str) -> Result<Self, TimeZoneIdError> {
+        if value == "UTC" {
+            return Ok(Self(value.to_owned()));
+        }
+        #[cfg(not(feature = "timezones"))]
+        if value != "UTC" {
+            return Err(TimeZoneIdError(format!(
+                "time zone {value:?} requires the `timezones` feature"
+            )));
+        }
         TimeZone::get(value).map_err(|_| TimeZoneIdError(value.to_owned()))?;
         Ok(Self(value.to_owned()))
     }
@@ -275,6 +295,11 @@ impl ScheduleRule {
                 }
                 Ok(())
             }
+            #[cfg(not(feature = "astronomy"))]
+            ScheduleRule::Astronomical { .. } => Err(ScheduleError::FeatureDisabled {
+                feature: "astronomy",
+            }),
+            #[cfg(feature = "astronomy")]
             ScheduleRule::Astronomical { offset_seconds, .. } => {
                 if !(-MAX_ASTRONOMICAL_OFFSET_SECONDS..=MAX_ASTRONOMICAL_OFFSET_SECONDS)
                     .contains(offset_seconds)
@@ -390,7 +415,7 @@ impl TimeContext {
         let Some(utc) = utc_unix_ms else {
             return TimeContext::unavailable();
         };
-        let Ok(tz) = TimeZone::get(site.timezone.as_str()) else {
+        let Some(tz) = timezone_for(&site.timezone) else {
             return TimeContext::unavailable();
         };
         let Some(now) = local_datetime_of(&tz, utc) else {
@@ -408,6 +433,9 @@ impl TimeContext {
             instant: Some(utc),
         };
         let sun = match site.coordinates {
+            #[cfg(not(feature = "astronomy"))]
+            Some(_) => SunContext::unavailable(),
+            #[cfg(feature = "astronomy")]
             Some(coordinates) => {
                 let position =
                     noaa::solar_position_utc(utc, coordinates.latitude, coordinates.longitude);
@@ -740,6 +768,9 @@ pub enum ScheduleError {
     InvalidAstronomicalOffset {
         offset_seconds: i32,
     },
+    FeatureDisabled {
+        feature: &'static str,
+    },
 }
 
 impl fmt::Display for ScheduleError {
@@ -768,6 +799,9 @@ impl fmt::Display for ScheduleError {
                 formatter,
                 "astronomical offset_seconds must be within -{MAX_ASTRONOMICAL_OFFSET_SECONDS}..={MAX_ASTRONOMICAL_OFFSET_SECONDS}, got {offset_seconds}"
             ),
+            Self::FeatureDisabled { feature } => {
+                write!(formatter, "feature `{feature}` is disabled in this build")
+            }
         }
     }
 }
@@ -828,7 +862,7 @@ pub(crate) fn next_occurrence_after(
             if !is_valid_local_time(at) {
                 return None;
             }
-            let tz = TimeZone::get(site.timezone.as_str()).ok()?;
+            let tz = timezone_for(&site.timezone)?;
             let baseline_date = local_date_of_utc(&tz, after_utc_ms)?;
             for day in 0..SEARCH_DAY_LIMIT {
                 let anchor = baseline_date.checked_add(Span::new().days(day)).ok()?;
@@ -866,8 +900,15 @@ pub(crate) fn next_occurrence_after(
             offset_seconds,
             weekdays,
         } => {
+            #[cfg(not(feature = "astronomy"))]
+            {
+                let _ = (anchor, offset_seconds, weekdays);
+                return None;
+            }
+            #[cfg(feature = "astronomy")]
+            {
             let coordinates = site.coordinates?;
-            let tz = TimeZone::get(site.timezone.as_str()).ok()?;
+            let tz = timezone_for(&site.timezone)?;
             let baseline_date = local_date_of_utc(&tz, after_utc_ms)?;
             let mut best: Option<i64> = None;
             // Anchors start one day before the baseline date: a signed offset
@@ -896,6 +937,7 @@ pub(crate) fn next_occurrence_after(
                 }
             }
             best
+            }
         }
     }
 }

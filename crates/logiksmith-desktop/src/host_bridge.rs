@@ -42,7 +42,7 @@ async fn dispatch_effects(
     block_id: &BlockId,
     effects: Vec<OutputEffect>,
     next_request_id: &mut u64,
-    pending: &mut HashSet<u64>,
+    pending: &mut PendingWrites,
 ) -> Result<(), HostError> {
     for effect in effects {
         let endpoint = effect.endpoint;
@@ -73,7 +73,20 @@ async fn dispatch_effects(
             tracing::error!(target: "logiksmith", endpoint = %endpoint, "core returned an output value with the wrong DPT");
             continue;
         }
-        pending.insert(request_id);
+        pending.insert(request_id, Instant::now()).map_err(|error| {
+            store.record_runtime_fatal(
+                format!(
+                    "pending KNX write capacity exhausted (capacity={}, depth={})",
+                    error.limit, error.depth
+                ),
+                true,
+            );
+            HostError::PendingWriteCapacity {
+                capacity: error.limit,
+                depth: error.depth,
+            }
+        })?;
+        store.set_pending_knx_writes(pending.len());
         store.record_write_requested(
             request_id,
             block_id,
@@ -91,7 +104,8 @@ async fn dispatch_effects(
             value: ValueMessage::from_core(value),
         });
         if let Err(error) = send_message(stdin, &message).await {
-            pending.remove(&request_id);
+            pending.remove(request_id);
+            store.set_pending_knx_writes(pending.len());
             store.record_write_result(request_id, false, Some(error.to_string()));
             return Err(error);
         }
@@ -99,6 +113,7 @@ async fn dispatch_effects(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn read_message(reader: &mut BufReader<ChildStdout>) -> Result<Message, HostError> {
     let mut line = String::new();
     let bytes = reader.read_line(&mut line).await?;

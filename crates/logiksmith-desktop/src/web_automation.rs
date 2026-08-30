@@ -130,30 +130,66 @@ async fn put_automation(
                             .collect::<Vec<_>>();
                         let request = ActivationRequest {
                             updates,
+                            resume_block: None,
                             document_revision: u64::from(revision),
                             document: document.clone(),
                             reply,
                         };
-                        if activation.send(request).await.is_ok() {
-                            if let Some(activation) =
-                                tokio::time::timeout(Duration::from_secs(2), result)
-                                    .await
-                                    .ok()
-                                    .and_then(|result| result.ok())
-                                    .and_then(Result::ok)
-                            {
-                                logic_activated = true;
-                                cancelled_timers = activation
-                                    .result
-                                    .blocks
-                                    .into_iter()
-                                    .flat_map(|block| {
-                                        block.cancelled_timers.into_iter().map(move |timer| {
-                                            format!("{}.{}", block.block_id, timer)
+                        match activation.try_send(request) {
+                            Ok(()) => {
+                                if state.host.health.snapshot().ready {
+                                    let depth = state
+                                        .host
+                                        .limits
+                                        .activation_queue
+                                        .saturating_sub(activation.capacity());
+                                    state.store.record_queue_admitted("activation", depth);
+                                }
+                                if let Some(activation) =
+                                    tokio::time::timeout(Duration::from_secs(2), result)
+                                        .await
+                                        .ok()
+                                        .and_then(|result| result.ok())
+                                        .and_then(Result::ok)
+                                {
+                                    logic_activated = true;
+                                    cancelled_timers = activation
+                                        .result
+                                        .blocks
+                                        .into_iter()
+                                        .flat_map(|block| {
+                                            block.cancelled_timers.into_iter().map(move |timer| {
+                                                format!("{}.{}", block.block_id, timer)
+                                            })
                                         })
-                                    })
-                                    .collect();
+                                        .collect();
+                                }
                             }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                state.store.record_queue_rejected(
+                                    "activation",
+                                    state.host.limits.activation_queue,
+                                    true,
+                                );
+                                state.store.record_runtime_fatal(
+                                    format!(
+                                        "runtime overload in activation queue (capacity={}, depth={})",
+                                        state.host.limits.activation_queue,
+                                        state.host.limits.activation_queue,
+                                    ),
+                                    true,
+                                );
+                                state.host.health.fail(format!(
+                                    "runtime overload in activation queue (capacity={}, depth={})",
+                                    state.host.limits.activation_queue,
+                                    state.host.limits.activation_queue,
+                                ));
+                                return json_error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "runtime overload; container will restart".to_owned(),
+                                );
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
                         }
                     }
                     restart_required = !logic_activated;

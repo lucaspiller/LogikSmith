@@ -164,6 +164,7 @@
     }
 
     #[test]
+    #[cfg(feature = "astronomy")]
     fn schedule_rule_bounds_are_validated() {
         let cases: Vec<(ScheduleRule, ScheduleError)> = vec![
             (
@@ -250,6 +251,7 @@
     // --- time context --------------------------------------------------------
 
     #[test]
+    #[cfg(feature = "astronomy")]
     fn capture_builds_now_and_sun_fields() {
         let context = TimeContext::capture(&utc_site(), Some(utc_ms(2026, 6, 4, 13, 45, 30)));
         assert!(context.now.available);
@@ -320,6 +322,7 @@
     }
 
     #[test]
+    #[cfg(feature = "timezones")]
     fn ctx_exposes_fields_and_comparisons() {
         let mut engine = ctx_engine(
             r#"
@@ -385,6 +388,7 @@
     }
 
     #[test]
+    #[cfg(feature = "timezones")]
     fn ctx_datetime_values_compare_with_local_time_strings() {
         let mut engine = ctx_engine(
             r#"

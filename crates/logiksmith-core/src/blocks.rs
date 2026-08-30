@@ -67,10 +67,26 @@ impl BlockConfig {
     }
 
     pub fn validate(&self) -> Result<(), BlockConfigError> {
-        if self.schedules.len() > MAX_SCHEDULES_PER_BLOCK {
+        self.validate_with_limits(&RuntimeLimits::desktop())
+    }
+
+    pub fn validate_with_limits(&self, limits: &RuntimeLimits) -> Result<(), BlockConfigError> {
+        if self.endpoints.len() > limits.max_endpoints_per_block {
+            return Err(BlockConfigError::TooManyEndpoints {
+                actual: self.endpoints.len(),
+                maximum: limits.max_endpoints_per_block,
+            });
+        }
+        if self.logic.source.len() > limits.max_logic_source_bytes_per_block {
+            return Err(BlockConfigError::LogicSourceTooLarge {
+                actual: self.logic.source.len(),
+                maximum: limits.max_logic_source_bytes_per_block,
+            });
+        }
+        if self.schedules.len() > limits.max_schedules_per_block {
             return Err(BlockConfigError::TooManySchedules {
                 actual: self.schedules.len(),
-                maximum: MAX_SCHEDULES_PER_BLOCK,
+                maximum: limits.max_schedules_per_block,
             });
         }
         for (index, schedule) in self.schedules.iter().enumerate() {
@@ -112,7 +128,7 @@ impl BlockConfig {
             };
         }
         EngineConfig::with_program(self.endpoints.clone(), self.logic.clone())
-            .validate()
+            .validate_with_limits(limits)
             .map_err(BlockConfigError::Engine)
     }
 }
@@ -129,6 +145,14 @@ impl BlockConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlockConfigError {
+    TooManyEndpoints {
+        actual: usize,
+        maximum: usize,
+    },
+    LogicSourceTooLarge {
+        actual: usize,
+        maximum: usize,
+    },
     TooManySchedules {
         actual: usize,
         maximum: usize,
@@ -150,6 +174,14 @@ pub enum BlockConfigError {
 impl fmt::Display for BlockConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TooManyEndpoints { actual, maximum } => write!(
+                formatter,
+                "block defines {actual} endpoints; maximum is {maximum}"
+            ),
+            Self::LogicSourceTooLarge { actual, maximum } => write!(
+                formatter,
+                "logic source is {actual} bytes; maximum is {maximum}"
+            ),
             Self::TooManySchedules { actual, maximum } => write!(
                 formatter,
                 "block defines {actual} schedules; maximum is {maximum}"
@@ -275,19 +307,23 @@ impl RuntimeConfig {
     }
 
     pub fn validate(&self) -> Result<(), RuntimeConfigError> {
+        self.validate_with_limits(&RuntimeLimits::desktop())
+    }
+
+    pub fn validate_with_limits(&self, limits: &RuntimeLimits) -> Result<(), RuntimeConfigError> {
         if self.blocks.is_empty() {
             return Err(RuntimeConfigError::Empty);
         }
-        if self.blocks.len() > MAX_BLOCKS {
+        if self.blocks.len() > limits.max_logic_blocks {
             return Err(RuntimeConfigError::TooMany {
                 actual: self.blocks.len(),
-                maximum: MAX_BLOCKS,
+                maximum: limits.max_logic_blocks,
             });
         }
-        if self.signals.len() > MAX_SIGNALS {
+        if self.signals.len() > limits.max_signals {
             return Err(RuntimeConfigError::TooManySignals {
                 actual: self.signals.len(),
-                maximum: MAX_SIGNALS,
+                maximum: limits.max_signals,
             });
         }
         let mut signal_names = std::collections::BTreeSet::new();
@@ -307,10 +343,10 @@ impl RuntimeConfig {
             .iter()
             .map(|block| block.signal_bindings.len())
             .sum();
-        if binding_count > MAX_SIGNAL_BINDINGS {
+        if binding_count > limits.max_signal_bindings {
             return Err(RuntimeConfigError::TooManySignalBindings {
                 actual: binding_count,
-                maximum: MAX_SIGNAL_BINDINGS,
+                maximum: limits.max_signal_bindings,
             });
         }
         for (index, block) in self.blocks.iter().enumerate() {
@@ -322,12 +358,21 @@ impl RuntimeConfig {
             {
                 return Err(RuntimeConfigError::DuplicateId(block.id.clone()));
             }
-            block
-                .validate()
-                .map_err(|error| RuntimeConfigError::InvalidBlock {
+            block.validate_with_limits(limits).map_err(|error| {
+                RuntimeConfigError::InvalidBlock {
                     block_id: block.id.clone(),
                     error,
-                })?;
+                }
+            })?;
+        }
+        let source_bytes: usize = self.blocks.iter().fold(0usize, |total, block| {
+            total.saturating_add(block.logic.source.len())
+        });
+        if source_bytes > limits.max_logic_source_bytes_total {
+            return Err(RuntimeConfigError::TooMuchLogicSource {
+                actual: source_bytes,
+                maximum: limits.max_logic_source_bytes_total,
+            });
         }
         let mut producers: std::collections::BTreeMap<SignalName, SignalEndpointId> =
             std::collections::BTreeMap::new();
@@ -392,8 +437,40 @@ impl RuntimeConfig {
             }
         }
         detect_signal_cycle(&self.blocks, &edges)?;
+        let cascade_executions = self
+            .blocks
+            .iter()
+            .map(|block| cascade_size(&block.id, &edges, &mut std::collections::BTreeMap::new()))
+            .max()
+            .unwrap_or(0);
+        if cascade_executions > limits.max_cascade_executions {
+            return Err(RuntimeConfigError::CascadeLimit {
+                actual: cascade_executions,
+                maximum: limits.max_cascade_executions,
+            });
+        }
         Ok(())
     }
+}
+
+fn cascade_size(
+    id: &BlockId,
+    edges: &std::collections::BTreeMap<BlockId, Vec<BlockId>>,
+    memo: &mut std::collections::BTreeMap<BlockId, usize>,
+) -> usize {
+    if let Some(size) = memo.get(id) {
+        return *size;
+    }
+    let size = 1usize.saturating_add(
+        edges
+            .get(id)
+            .into_iter()
+            .flatten()
+            .map(|child| cascade_size(child, edges, memo))
+            .sum(),
+    );
+    memo.insert(id.clone(), size);
+    size
 }
 
 fn detect_signal_cycle(
@@ -467,6 +544,14 @@ pub enum RuntimeConfigError {
         actual: usize,
         maximum: usize,
     },
+    TooMuchLogicSource {
+        actual: usize,
+        maximum: usize,
+    },
+    CascadeLimit {
+        actual: usize,
+        maximum: usize,
+    },
     UnknownSignal {
         block_id: BlockId,
         endpoint: EndpointName,
@@ -515,6 +600,14 @@ impl fmt::Display for RuntimeConfigError {
             Self::TooManySignalBindings { actual, maximum } => write!(
                 formatter,
                 "runtime contains {actual} signal bindings; maximum is {maximum}"
+            ),
+            Self::TooMuchLogicSource { actual, maximum } => write!(
+                formatter,
+                "runtime logic sources use {actual} bytes; maximum is {maximum}"
+            ),
+            Self::CascadeLimit { actual, maximum } => write!(
+                formatter,
+                "maximum signal cascade contains {actual} executions; maximum is {maximum}"
             ),
             Self::UnknownSignal {
                 block_id,
@@ -566,17 +659,7 @@ impl Error for RuntimeConfigError {
     }
 }
 
-/// A public view of one block's current semantic state.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BlockSnapshot {
-    pub id: BlockId,
-    pub enabled: bool,
-    pub logic_revision: LogicRevision,
-    pub inputs: Vec<InputSnapshot>,
-    pub known_inputs: Vec<(EndpointName, TypedValue)>,
-    pub state: TransientState,
-    pub pending_timers: Vec<PendingTimer>,
-}
+include!("block_health.rs");
 
 /// A public view of every block in declaration order.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -691,6 +774,19 @@ pub enum RuntimeEventError {
         previous: MonotonicMs,
         current: MonotonicMs,
     },
+    CascadeLimit {
+        actual: usize,
+        maximum: usize,
+    },
+    ResourceLimit {
+        resource: &'static str,
+        actual: usize,
+        maximum: usize,
+    },
+    CascadeTimeLimit {
+        elapsed_ms: u64,
+        maximum_ms: u64,
+    },
 }
 
 impl fmt::Display for RuntimeEventError {
@@ -711,6 +807,22 @@ impl fmt::Display for RuntimeEventError {
                     "event time {current:?} is earlier than the last accepted time {previous:?}"
                 )
             }
+            Self::CascadeLimit { actual, maximum } => write!(
+                formatter,
+                "signal cascade contains {actual} executions; maximum is {maximum}"
+            ),
+            Self::ResourceLimit {
+                resource,
+                actual,
+                maximum,
+            } => write!(formatter, "{resource} uses {actual}; maximum is {maximum}"),
+            Self::CascadeTimeLimit {
+                elapsed_ms,
+                maximum_ms,
+            } => write!(
+                formatter,
+                "signal cascade took {elapsed_ms} ms; maximum is {maximum_ms} ms"
+            ),
         }
     }
 }

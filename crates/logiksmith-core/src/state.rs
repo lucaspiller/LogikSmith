@@ -356,10 +356,17 @@ pub(crate) fn validate_state_entry(key: &str, value: &StateValue) -> Result<(), 
 }
 
 pub(crate) fn validate_state_map(state: &TransientState) -> Result<(), StateError> {
-    if state.len() > MAX_STATE_ENTRIES {
+    validate_state_map_with_limits(state, &RuntimeLimits::desktop())
+}
+
+pub(crate) fn validate_state_map_with_limits(
+    state: &TransientState,
+    limits: &RuntimeLimits,
+) -> Result<(), StateError> {
+    if state.len() > limits.max_state_entries_per_block {
         return Err(StateError::TooManyEntries {
             actual: state.len(),
-            maximum: MAX_STATE_ENTRIES,
+            maximum: limits.max_state_entries_per_block,
         });
     }
     let mut total = 0usize;
@@ -370,18 +377,19 @@ pub(crate) fn validate_state_map(state: &TransientState) -> Result<(), StateErro
             total = total.saturating_add(value.len());
         }
     }
-    if total > MAX_STATE_TOTAL_BYTES {
+    if total > limits.max_state_bytes_per_block {
         return Err(StateError::TotalTooLarge {
             actual: total,
-            maximum: MAX_STATE_TOTAL_BYTES,
+            maximum: limits.max_state_bytes_per_block,
         });
     }
     Ok(())
 }
 
-pub(crate) fn validate_pending_timers(
+pub(crate) fn validate_pending_timers_with_limits(
     timers: &[PendingTimer],
     active_revision: LogicRevision,
+    limits: &RuntimeLimits,
 ) -> Result<(), SimulationError> {
     let mut map = BTreeMap::new();
     for timer in timers {
@@ -389,17 +397,18 @@ pub(crate) fn validate_pending_timers(
             return Err(SimulationError::DuplicateTimer(timer.name.clone()));
         }
     }
-    validate_pending_timer_map(&map, active_revision)
+    validate_pending_timer_map_with_limits(&map, active_revision, limits)
 }
 
-pub(crate) fn validate_pending_timer_map(
+pub(crate) fn validate_pending_timer_map_with_limits(
     timers: &BTreeMap<TimerName, PendingTimer>,
     active_revision: LogicRevision,
+    limits: &RuntimeLimits,
 ) -> Result<(), SimulationError> {
-    if timers.len() > MAX_PENDING_TIMERS {
+    if timers.len() > limits.max_pending_timers_per_block {
         return Err(SimulationError::InvalidState(StateError::TooManyEntries {
             actual: timers.len(),
-            maximum: MAX_PENDING_TIMERS,
+            maximum: limits.max_pending_timers_per_block,
         }));
     }
     for timer in timers.values() {
@@ -414,15 +423,16 @@ pub(crate) fn validate_pending_timer_map(
     Ok(())
 }
 
-pub(crate) fn merge_state(
+pub(crate) fn merge_state_with_limits(
     current: &TransientState,
     patch: &StatePatch,
+    limits: &RuntimeLimits,
 ) -> Result<TransientState, StateError> {
     let mut merged = current.clone();
     for (key, value) in patch {
         merged.insert(key.clone(), value.clone());
     }
-    validate_state_map(&merged)?;
+    validate_state_map_with_limits(&merged, limits)?;
     Ok(merged)
 }
 

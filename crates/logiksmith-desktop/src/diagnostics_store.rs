@@ -15,6 +15,9 @@ fn unique_execution_id(inner: &Inner, requested: Option<u64>) -> u64 {
     }
     candidate
 }
+
+include!("diagnostics_store_operations.rs");
+
 impl DiagnosticStore {
     pub fn new(runtime: &AutomationRuntime, automation_path: PathBuf, revision: u64) -> Self {
         let (events, _) = broadcast::channel(JOURNAL_CAPACITY);
@@ -96,6 +99,21 @@ impl DiagnosticStore {
         let automation = automation_snapshot(runtime);
         let signals = signal_snapshots(runtime);
         let external_inputs = external_inputs_snapshot(runtime);
+        let block_health_runtime: BTreeMap<_, _> = blocks
+            .keys()
+            .cloned()
+            .map(|block_id| (block_id, BlockHealthRuntime::default()))
+            .collect();
+        let mut operations = operations_snapshot(crate::HostLimits::desktop());
+        operations.core = core_usage_snapshot(
+            logiksmith_core::RuntimeProfile::Desktop,
+            logiksmith_core::Runtime::new(runtime.core_config.clone()).usage(),
+        );
+        operations.block_health = blocks
+            .keys()
+            .cloned()
+            .map(|block_id| (block_id, BlockHealthSnapshot::default()))
+            .collect();
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 revision: 0,
@@ -151,11 +169,149 @@ impl DiagnosticStore {
                 signals,
                 external_inputs,
                 last_clock_sample: None,
+                operations,
+                block_health_runtime,
+                limits: crate::HostLimits::desktop(),
             })),
             events,
             origin: Instant::now(),
         }
     }
+    /// Selects the host profile shown in Operations and establishes its
+    /// bounded queue capacities before the session starts admitting work.
+    pub fn set_host_limits(&self, limits: crate::HostLimits) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = inner.operations.clone();
+        let mut next = operations_snapshot(limits);
+        next.fatal = previous.fatal;
+        next.status = previous.status;
+        next.host_turn = previous.host_turn;
+        next.block_health = previous.block_health;
+        next.core = core_usage_snapshot(
+            limits.profile,
+            logiksmith_core::RuntimeUsage {
+                logic_blocks: previous.core.logic_blocks.used,
+                signals: previous.core.signals.used,
+                signal_bindings: previous.core.signal_bindings.used,
+                logic_source_bytes: previous.core.logic_source_bytes.used,
+                state_entries: previous.core.state_entries.used,
+                state_bytes: previous.core.state_bytes.used,
+                pending_timers: previous.core.pending_timers.used,
+            },
+        );
+        next.pending_knx_writes = previous.pending_knx_writes;
+        next.pending_write_timeouts = previous.pending_write_timeouts;
+        inner.operations = next;
+        inner.limits = limits;
+        while inner.telegrams.len() > limits.recent_telegrams {
+            inner.telegrams.pop_front();
+        }
+        while inner.logs.len() > limits.runtime_logs {
+            inner.logs.pop_front();
+        }
+        while inner.journal.len() > limits.diagnostic_journal {
+            inner.journal.pop_front();
+        }
+        for block in inner.blocks.values_mut() {
+            while block.executions.len() > limits.execution_history_per_block {
+                block.executions.pop_front();
+            }
+        }
+        self.publish_locked(&mut inner);
+    }
+
+    pub fn record_queue_admitted(&self, lane: &str, depth: usize) {
+        self.update_operations(|operations| {
+            if let Some(queue) = operations.queues.get_mut(lane) {
+                queue.depth = depth;
+                queue.high_water = queue.high_water.max(depth);
+                queue.accepted = queue.accepted.saturating_add(1);
+            }
+        });
+    }
+
+    pub fn record_queue_rejected(&self, lane: &str, depth: usize, fatal: bool) {
+        self.update_operations(|operations| {
+            if let Some(queue) = operations.queues.get_mut(lane) {
+                queue.depth = depth;
+                queue.high_water = queue.high_water.max(depth);
+                queue.rejected = queue.rejected.saturating_add(1);
+            }
+            if fatal {
+                operations.status = "overloaded".to_owned();
+            }
+        });
+    }
+
+    pub fn set_pending_knx_writes(&self, depth: usize) {
+        self.update_operations(|operations| {
+            operations.pending_knx_writes = depth;
+        });
+    }
+
+    pub fn record_pending_write_timeout(&self, request_id: u64) {
+        self.update_operations(|operations| {
+            operations.pending_write_timeouts = operations.pending_write_timeouts.saturating_add(1);
+            operations.status = "degraded".to_owned();
+            operations.fatal = Some(format!("pending KNX write timed out request_id={request_id}"));
+        });
+    }
+
+    pub fn record_runtime_fatal(&self, reason: impl Into<String>, overloaded: bool) {
+        self.update_operations(|operations| {
+            operations.fatal = Some(reason.into());
+            operations.status = if overloaded { "overloaded" } else { "degraded" }.to_owned();
+        });
+    }
+
+    /// Records one serial host turn against the optional embedded/OpenKNX
+    /// timing thresholds.  Desktop's profile deliberately has no threshold;
+    /// it still exposes the measured duration and maximum for diagnostics.
+    pub fn record_host_turn(&self, duration_us: u64, limits: crate::HostLimits) {
+        let runtime_limits = limits.profile.limits();
+        let over_budget = runtime_limits
+            .signal_cascade_time_budget_ms
+            .is_some_and(|budget_ms| duration_us > budget_ms.saturating_mul(1_000));
+        let warning = runtime_limits
+            .openknx_loop_warning_threshold_ms
+            .is_some_and(|threshold_ms| duration_us > threshold_ms.saturating_mul(1_000));
+        self.update_operations(|operations| {
+            operations.host_turn.last_duration_us = duration_us;
+            operations.host_turn.max_duration_us =
+                operations.host_turn.max_duration_us.max(duration_us);
+            operations.host_turn.last_over_budget = over_budget;
+            operations.host_turn.last_warning = warning;
+            if over_budget {
+                operations.host_turn.over_budget_count =
+                    operations.host_turn.over_budget_count.saturating_add(1);
+            }
+            if warning {
+                operations.host_turn.warning_count =
+                    operations.host_turn.warning_count.saturating_add(1);
+            }
+        });
+        if warning {
+            tracing::warn!(
+                target: "logiksmith",
+                duration_us,
+                threshold_ms = runtime_limits.openknx_loop_warning_threshold_ms.unwrap_or_default(),
+                "host turn exceeded OpenKNX loop warning threshold"
+            );
+        }
+    }
+
+    fn update_operations(&self, update: impl FnOnce(&mut OperationsSnapshot)) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        update(&mut inner.operations);
+        self.publish_locked(&mut inner);
+    }
+
     pub fn now(&self) -> logiksmith_core::MonotonicMs {
         logiksmith_core::MonotonicMs(
             u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -367,7 +523,7 @@ impl DiagnosticStore {
                 message: "source activation cancelled pending timers".to_owned(),
                 fields,
             });
-            while inner.logs.len() > MAX_LOGS {
+            while inner.logs.len() > inner.limits.runtime_logs {
                 inner.logs.pop_front();
             }
         }
@@ -416,10 +572,12 @@ impl DiagnosticStore {
         now: logiksmith_core::MonotonicMs,
     ) {
         let snapshot = runtime.snapshot_at(now);
+        let usage = runtime.usage();
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.operations.core = core_usage_snapshot(inner.limits.profile, usage);
         for block in &snapshot.blocks {
             let id = block.id.to_string();
             let revision = inner
@@ -458,6 +616,43 @@ impl DiagnosticStore {
                     }
                 }
             }
+            let previous_error = inner
+                .operations
+                .block_health
+                .get(&id)
+                .and_then(|health| health.last_error.clone());
+            let health_runtime = inner
+                .block_health_runtime
+                .entry(id.clone())
+                .or_default();
+            health_runtime.consecutive_failures = block.consecutive_failures;
+            health_runtime.executions_ms.clear();
+            for _ in 0..block.live_executions_in_window {
+                health_runtime.executions_ms.push_back(now.0);
+            }
+            if block.consecutive_failures == 0 {
+                health_runtime.last_error = previous_error.clone();
+            }
+            let last_execution_at_ms = health_runtime.last_execution_at_ms;
+            let last_failure_at_ms = health_runtime.last_failure_at_ms;
+            let last_error = health_runtime.last_error.clone().or(previous_error);
+            let last_suspension = block.last_suspension.map(|suspension| match suspension {
+                logiksmith_core::BlockSuspension::ScriptFailures => "script_failures",
+                logiksmith_core::BlockSuspension::EventRate => "event_rate",
+            }.to_owned());
+            inner.operations.block_health.insert(
+                id,
+                BlockHealthSnapshot {
+                    status: block.health.as_str().to_owned(),
+                    consecutive_failures: block.consecutive_failures,
+                    live_executions_last_second: u32::try_from(block.live_executions_in_window)
+                        .unwrap_or(u32::MAX),
+                    last_suspension,
+                    last_execution_at_ms,
+                    last_failure_at_ms,
+                    last_error,
+                },
+            );
         }
         let previous_signals = inner.signals.clone();
         let structural_revision = inner.active_structural_revision;
@@ -558,6 +753,8 @@ impl DiagnosticStore {
                 Some(logic_error_record(error)),
             ),
         };
+        let failed = semantic.outcome.is_err();
+        let health_error = error.clone();
         let execution_id = unique_execution_id(&inner, semantic.id);
         inner.next_execution_id = inner.next_execution_id.max(execution_id.saturating_add(1));
         let first_block_id = inner.block_order.first().cloned();
@@ -609,6 +806,7 @@ impl DiagnosticStore {
             origin,
             error: error.clone(),
         };
+        let max_history = inner.limits.execution_history_per_block;
         let (block_revision, block_state, block_pending, block_executions) = {
             let block =
                 inner
@@ -639,7 +837,7 @@ impl DiagnosticStore {
                 error,
             });
             block.executions.push_back(record);
-            while block.executions.len() > MAX_EXECUTIONS {
+            while block.executions.len() > max_history {
                 block.executions.pop_front();
             }
             (
@@ -656,6 +854,47 @@ impl DiagnosticStore {
             inner.pending_timers = block_pending;
             inner.executions = block_executions;
         }
+        let health_snapshot = {
+            let health_runtime = inner
+                .block_health_runtime
+                .entry(block_id.clone())
+                .or_default();
+            while health_runtime
+                .executions_ms
+                .front()
+                .is_some_and(|timestamp| *timestamp < now.0.saturating_sub(1_000))
+            {
+                health_runtime.executions_ms.pop_front();
+            }
+            health_runtime.executions_ms.push_back(now.0);
+            health_runtime.last_execution_at_ms = Some(now.0);
+            if failed {
+                health_runtime.consecutive_failures = health_runtime.consecutive_failures.saturating_add(1);
+                health_runtime.last_failure_at_ms = Some(now.0);
+                health_runtime.last_error = health_error;
+            } else {
+                health_runtime.consecutive_failures = 0;
+                health_runtime.last_error = None;
+            }
+            BlockHealthSnapshot {
+                status: if health_runtime.consecutive_failures >= 5 {
+                    "failure_threshold_reached".to_owned()
+                } else {
+                    "active".to_owned()
+                },
+                consecutive_failures: health_runtime.consecutive_failures,
+                live_executions_last_second: u32::try_from(health_runtime.executions_ms.len())
+                    .unwrap_or(u32::MAX),
+                last_suspension: None,
+                last_execution_at_ms: health_runtime.last_execution_at_ms,
+                last_failure_at_ms: health_runtime.last_failure_at_ms,
+                last_error: health_runtime.last_error.clone(),
+            }
+        };
+        inner.operations.block_health.insert(
+            block_id,
+            health_snapshot,
+        );
         self.publish_locked(&mut inner);
     }
     /// Applies the core's atomic source/enabled activation result to
@@ -717,7 +956,7 @@ impl DiagnosticStore {
                     message: "block activation cancelled pending timers".to_owned(),
                     fields,
                 });
-                while inner.logs.len() > MAX_LOGS {
+                while inner.logs.len() > inner.limits.runtime_logs {
                     inner.logs.pop_front();
                 }
             }
@@ -730,258 +969,11 @@ impl DiagnosticStore {
         );
         let _ = snapshot;
     }
-    /// Stores one immutable semantic core execution with host-only timing and
-    /// resolved KNX destinations. The core outcome is intentionally handled
-    /// here so zero-effect successes and contained Lua failures are retained.
-    pub fn record_execution(
-        &self,
-        execution: &Execution,
-        duration_us: u64,
-        automation: &AutomationRuntime,
-    ) {
-        self.record_execution_at(execution, self.now(), duration_us, automation);
-    }
-    pub fn record_execution_at(
-        &self,
-        execution: &Execution,
-        now: logiksmith_core::MonotonicMs,
-        duration_us: u64,
-        automation: &AutomationRuntime,
-    ) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let execution_id = unique_execution_id(&inner, execution.id);
-        inner.next_execution_id = inner.next_execution_id.max(execution_id.saturating_add(1));
-        let document_revision = inner.active_logic_revision;
-        let signal_effects = signal_effect_records(&execution.signal_effects);
-        let (status, effects, transition, error) = match &execution.outcome {
-            Ok(effects) => (
-                LogicExecutionStatus::Succeeded,
-                effects
-                    .outputs
-                    .iter()
-                    .filter_map(|effect| effect_record(effect, automation))
-                    .collect(),
-                Some({
-                    let mut transition = transition_record(effects, automation);
-                    transition.signal_effects = signal_effects.clone();
-                    transition
-                }),
-                None,
-            ),
-            Err(error) => (
-                LogicExecutionStatus::Failed,
-                Vec::new(),
-                None,
-                Some(logic_error_record(error)),
-            ),
-        };
-        let block_id = automation
-                .blocks
-                .first()
-                .map(|block| block.id.to_string())
-                .unwrap_or_default();
-        let causal_producer_execution_id = execution.causal_producer;
-        let causal_producer_block_id = causal_producer_execution_id.and_then(|id| {
-            inner
-                .executions
-                .iter()
-                .find(|record| record.execution_id == id)
-                .map(|record| record.block_id.clone())
-        });
-        let causal_links = causal_producer_execution_id
-            .map(|producer_execution_id| {
-                vec![CausalLinkSnapshot {
-                    producer_execution_id,
-                    consumer_execution_id: execution_id,
-                    signal: None,
-                    producer_block_id: causal_producer_block_id.clone(),
-                    consumer_block_id: Some(block_id.clone()),
-                }]
-            })
-            .unwrap_or_default();
-        inner.executions.push_back(ExecutionRecord {
-            block_id,
-            execution_id,
-            time_ms: now.0,
-            duration_us,
-            logic_revision: document_revision,
-            status,
-            trigger: trigger_record(&execution.trigger, document_revision, None),
-            time_context: time_context_record(&execution.time_context),
-            inputs: execution.inputs.iter().map(input_snapshot_record).collect(),
-            state_before: state_record(&execution.state_before),
-            state_after: state_record(&execution.state_after),
-            timer_effects: transition
-                .as_ref()
-                .map(|transition| transition.timers.clone())
-                .unwrap_or_default(),
-            transition,
-            effects,
-            signal_effects,
-            causal_producer_execution_id,
-            causal_producer_block_id,
-            causal_signal: None,
-            causal_links,
-            origin: None,
-            error,
-        });
-        inner.state = state_record(&execution.state_after);
-        inner.pending_timers = execution
-            .pending_timers
-            .iter()
-            .map(|timer| pending_timer_record(timer, document_revision))
-            .collect();
-        while inner.executions.len() > MAX_EXECUTIONS {
-            inner.executions.pop_front();
-        }
-        self.publish_locked(&mut inner);
-    }
-    pub fn record_telegram(&self, mut telegram: TelegramRecord) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if telegram.endpoint.is_none() {
-            let address = telegram.address;
-            telegram.endpoint = inner
-                .endpoint_values
-                .iter()
-                .find(|(_, state)| state.address == Some(address))
-                .map(|(name, _)| name.to_string());
-        }
-        if let (Some(endpoint), Some(value)) =
-            (telegram.endpoint.as_deref(), telegram.value.as_ref())
-            && let Ok(endpoint) = endpoint.parse::<EndpointName>()
-            && let Some(state) = inner.endpoint_values.get_mut(&endpoint)
-        {
-            state.observed = Some(value.clone());
-        }
-        if let Some(value) = telegram.value.as_ref() {
-            let address = telegram.address;
-            for state in inner.block_endpoint_values.values_mut() {
-                if state.address == Some(address) && state.direction == EndpointDirection::Input {
-                    state.observed = Some(value.clone());
-                }
-            }
-        }
-        inner.telegrams.push_back(telegram);
-        while inner.telegrams.len() > MAX_TELEGRAMS {
-            inner.telegrams.pop_front();
-        }
-        self.publish_locked(&mut inner);
-    }
-    pub fn record_write_requested(
-        &self,
-        request_id: u64,
-        block_id: &logiksmith_core::BlockId,
-        endpoint: EndpointName,
-        destination: GroupAddress,
-        dpt: Dpt,
-        value: TypedValue,
-    ) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let value = ValueMessage::from_core(value);
-        let execution_id = inner
-            .blocks
-            .get(block_id.as_str())
-            .and_then(|block| block.last_result.as_ref())
-            .map(|result| result.execution_id);
-        if let Some(block_state) = inner
-            .block_endpoint_values
-            .get_mut(&(block_id.to_string(), endpoint.clone()))
-        {
-            block_state.requested = Some(value.clone());
-        }
-        if let Some(state) = inner.endpoint_values.get_mut(&endpoint) {
-            state.requested = Some(value.clone());
-            if state.address == Some(destination) && state.direction == EndpointDirection::Output {
-                inner.last_write = WriteSnapshot {
-                    status: WriteStatus::Pending,
-                    request_id: Some(request_id),
-                    block_id: Some(block_id.to_string()),
-                    execution_id,
-                    value: Some(value.clone()),
-                    error: None,
-                };
-            }
-        }
-        let _ = dpt;
-        if inner.pending_writes.len() >= MAX_PENDING_WRITES
-            && let Some(oldest) = inner.pending_writes.keys().next().copied()
-        {
-            inner.pending_writes.remove(&oldest);
-        }
-        inner.pending_writes.insert(request_id, WriteState);
-        self.publish_locked(&mut inner);
-    }
-    pub fn record_write_result(&self, request_id: u64, ok: bool, error: Option<String>) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if inner.pending_writes.remove(&request_id).is_some()
-            && inner.last_write.request_id == Some(request_id)
-        {
-            inner.last_write.status = if ok {
-                WriteStatus::Succeeded
-            } else {
-                WriteStatus::Failed
-            };
-            inner.last_write.error = if ok { None } else { error };
-        }
-        self.publish_locked(&mut inner);
-    }
-    pub fn record_log(
-        &self,
-        level: impl Into<String>,
-        target: impl Into<String>,
-        message: impl Into<String>,
-        fields: BTreeMap<String, String>,
-    ) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.logs.push_back(LogRecord {
-            time_ms: self.now().0,
-            level: level.into(),
-            target: target.into(),
-            message: message.into(),
-            fields,
-        });
-        while inner.logs.len() > MAX_LOGS {
-            inner.logs.pop_front();
-        }
-        self.publish_locked(&mut inner);
-    }
-    pub fn subscribe(&self, since: Option<u64>) -> EventSubscription {
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let receiver = self.events.subscribe();
-        let since = since.unwrap_or(0);
-        let replay = match inner.journal.front().map(|update| update.revision) {
-            Some(first) if since.saturating_add(1) < first => Replay::Resync {
-                revision: inner.revision,
-            },
-            _ => Replay::Updates(
-                inner
-                    .journal
-                    .iter()
-                    .filter(|update| update.revision > since)
-                    .cloned()
-                    .collect(),
-            ),
-        };
-        EventSubscription { replay, receiver }
-    }
+}
+
+include!("diagnostics_store_history.rs");
+
+impl DiagnosticStore {
     fn publish_locked(&self, inner: &mut Inner) {
         inner.revision = inner.revision.saturating_add(1);
         inner.captured_at_ms = self.now().0;
@@ -990,9 +982,11 @@ impl DiagnosticStore {
             snapshot: snapshot_locked(inner, self.now()),
         };
         inner.journal.push_back(update.clone());
-        while inner.journal.len() > JOURNAL_CAPACITY {
+        while inner.journal.len() > inner.limits.diagnostic_journal {
             inner.journal.pop_front();
         }
         let _ = self.events.send(update);
     }
 }
+
+include!("diagnostics_store_transport.rs");

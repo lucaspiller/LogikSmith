@@ -1,4 +1,5 @@
 use std::{cell::Cell, collections::BTreeMap, rc::Rc};
+use std::sync::Arc;
 
 use mlua::{
     Function, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Value as LuaValue, VmState,
@@ -14,27 +15,27 @@ enum LuaPhase {
     InvalidResult,
 }
 
-fn check_source_size(source: &str) -> Result<(), LogicError> {
+fn check_source_size_with_limits(source: &str, limits: &RuntimeLimits) -> Result<(), LogicError> {
     if source.trim().is_empty() {
         return Err(LogicError::EmptySource);
     }
-    if source.len() > MAX_LOGIC_SOURCE_BYTES {
+    if source.len() > limits.max_logic_source_bytes_per_block {
         return Err(LogicError::SourceTooLarge {
             actual: source.len(),
-            maximum: MAX_LOGIC_SOURCE_BYTES,
+            maximum: limits.max_logic_source_bytes_per_block,
         });
     }
     Ok(())
 }
 
-fn new_lua() -> Result<Lua, mlua::Error> {
+fn new_lua(limits: &RuntimeLimits) -> Result<Lua, mlua::Error> {
     // Base functions are always initialized by Lua, but the explicit library
     // list ensures package/io/os/debug/coroutine are never loaded at all.
     let lua = Lua::new_with(
         StdLib::MATH | StdLib::STRING | StdLib::TABLE | StdLib::UTF8,
         LuaOptions::default(),
     )?;
-    lua.set_memory_limit(MAX_LOGIC_MEMORY_BYTES)?;
+    lua.set_memory_limit(limits.max_logic_memory_bytes)?;
     Ok(lua)
 }
 
@@ -193,16 +194,28 @@ fn readonly_proxy(lua: &Lua, backing: Table) -> Result<Table, mlua::Error> {
     Ok(proxy)
 }
 
-fn install_instruction_hook(lua: &Lua) {
+fn install_instruction_hook(
+    lua: &Lua,
+    limits: &RuntimeLimits,
+    budget_probe: Option<Arc<dyn BudgetProbe>>,
+) {
     let count = Rc::new(Cell::new(0_u32));
+    let maximum = limits.max_logic_instructions;
+    let time_limit = limits.logic_handler_time_budget_ms;
     lua.set_hook(
         HookTriggers::new().every_nth_instruction(1),
         move |_lua, _debug| {
             let next = count.get().saturating_add(1);
             count.set(next);
-            if next >= MAX_LOGIC_INSTRUCTIONS {
+            if next >= maximum {
                 Err(mlua::Error::RuntimeError(
                     INSTRUCTION_LIMIT_MARKER.to_owned(),
+                ))
+            } else if time_limit.is_some_and(|limit| {
+                budget_probe.as_ref().is_some_and(|probe| probe.elapsed_ms() >= limit)
+            }) {
+                Err(mlua::Error::RuntimeError(
+                    HANDLER_TIME_LIMIT_MARKER.to_owned(),
                 ))
             } else {
                 Ok(VmState::Continue)
@@ -211,12 +224,16 @@ fn install_instruction_hook(lua: &Lua) {
     );
 }
 
-pub(crate) fn validate_logic_source(source: &str) -> Result<(), LogicError> {
-    check_source_size(source)?;
-    let lua = new_lua().map_err(|error| map_lua_error(error, LuaPhase::Load))?;
+pub(crate) fn validate_logic_source_with_limits(
+    source: &str,
+    limits: &RuntimeLimits,
+    budget_probe: Option<Arc<dyn BudgetProbe>>,
+) -> Result<(), LogicError> {
+    check_source_size_with_limits(source, limits)?;
+    let lua = new_lua(limits).map_err(|error| map_lua_error(error, LuaPhase::Load))?;
     let environment =
         restricted_environment(&lua).map_err(|error| map_lua_error(error, LuaPhase::Load))?;
-    install_instruction_hook(&lua);
+    install_instruction_hook(&lua, limits, budget_probe);
 
     let chunk = lua
         .load(source)

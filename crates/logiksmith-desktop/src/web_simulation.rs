@@ -205,15 +205,47 @@ async fn simulate_payload(state: AppState, payload: SimulationPayload) -> Respon
         );
     };
     let (reply, result) = oneshot::channel();
-    if simulation
-        .send(SimulationRequest { payload, reply })
-        .await
-        .is_err()
-    {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "simulation runtime is unavailable".to_owned(),
-        );
+    match simulation.try_send(SimulationRequest { payload, reply }) {
+        Ok(()) => {
+            if state.host.health.snapshot().ready {
+                let depth = state
+                    .host
+                    .limits
+                    .simulation_queue
+                    .saturating_sub(simulation.capacity());
+                state.store.record_queue_admitted("simulation", depth);
+            }
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            state.store.record_queue_rejected(
+                "simulation",
+                state.host.limits.simulation_queue,
+                true,
+            );
+            state.store.record_runtime_fatal(
+                format!(
+                    "runtime overload in simulation queue (capacity={}, depth={})",
+                    state.host.limits.simulation_queue,
+                    state.host.limits.simulation_queue,
+                ),
+                true,
+            );
+            state.host.health.fail(format!(
+                "runtime overload in simulation queue (capacity={}, depth={})",
+                state.host.limits.simulation_queue,
+                state.host.limits.simulation_queue,
+            ));
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime overload; container will restart".to_owned(),
+            );
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "simulation runtime is unavailable".to_owned(),
+            );
+        }
     }
     let result = match time::timeout(Duration::from_secs(2), result).await {
         Ok(Ok(result)) => result,

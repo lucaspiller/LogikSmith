@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+target
+**/target
+logiksmith-web/node_modules
+logiksmith-web/playwright-report
+logiksmith-web/test-results
+logiksmith-web/dist
+config/local.toml
+config/automation.toml
+docs/local
+*.swp

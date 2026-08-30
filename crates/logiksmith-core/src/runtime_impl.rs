@@ -4,12 +4,26 @@ impl Runtime {
     }
 
     pub fn try_new(config: RuntimeConfig) -> Result<Self, RuntimeConfigError> {
-        config.validate()?;
+        Self::try_new_with_limits(config, RuntimeLimits::desktop())
+    }
+
+    pub fn try_new_with_profile(
+        config: RuntimeConfig,
+        profile: RuntimeProfile,
+    ) -> Result<Self, RuntimeConfigError> {
+        Self::try_new_with_limits(config, profile.limits())
+    }
+
+    pub fn try_new_with_limits(
+        config: RuntimeConfig,
+        limits: RuntimeLimits,
+    ) -> Result<Self, RuntimeConfigError> {
+        config.validate_with_limits(&limits)?;
         let site = config.site.clone();
         let blocks = config
             .blocks
             .into_iter()
-            .map(LogicBlock::try_new)
+            .map(|block| LogicBlock::try_new(block, &limits))
             .collect::<Result<Vec<_>, _>>()?;
         let mut signal_indexes = BTreeMap::new();
         let mut signals = config
@@ -49,6 +63,7 @@ impl Runtime {
             }
         }
         Ok(Self {
+            limits,
             blocks,
             signals,
             signal_indexes,
@@ -61,8 +76,103 @@ impl Runtime {
         })
     }
 
+    pub fn usage(&self) -> RuntimeUsage {
+        RuntimeUsage {
+            logic_blocks: self.blocks.len(),
+            signals: self.signals.len(),
+            signal_bindings: self
+                .blocks
+                .iter()
+                .map(|block| block.config.signal_bindings.len())
+                .sum(),
+            logic_source_bytes: self
+                .blocks
+                .iter()
+                .map(|block| block.config.logic.source.len())
+                .sum(),
+            state_entries: self
+                .blocks
+                .iter()
+                .map(|block| block.engine.state().len())
+                .sum(),
+            state_bytes: self
+                .blocks
+                .iter()
+                .map(|block| {
+                    block
+                        .engine
+                        .state()
+                        .iter()
+                        .map(|(key, value)| {
+                            key.len()
+                                + match value {
+                                    StateValue::String(value) => value.len(),
+                                    _ => 0,
+                                }
+                        })
+                        .sum::<usize>()
+                })
+                .sum(),
+            pending_timers: self
+                .blocks
+                .iter()
+                .map(|block| block.engine.pending_timers.len())
+                .sum(),
+        }
+    }
+
+    pub fn validate_usage(&self) -> Result<(), RuntimeEventError> {
+        let usage = self.usage();
+        let checks = [
+            (usage.logic_source_bytes, self.limits.max_logic_source_bytes_total, "logic_source"),
+            (usage.state_bytes, self.limits.max_state_bytes_total, "state"),
+            (usage.pending_timers, self.limits.max_pending_timers_total, "pending_timers"),
+        ];
+        for (actual, maximum, resource) in checks {
+            if actual > maximum {
+                return Err(RuntimeEventError::ResourceLimit {
+                    resource,
+                    actual,
+                    maximum,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks the host-owned elapsed-time probe against the embedded cascade
+    /// budget. Hosts can call this at each propagation step or at turn end.
+    pub fn check_cascade_budget(
+        &self,
+        budget_probe: &dyn BudgetProbe,
+    ) -> Result<(), RuntimeEventError> {
+        if let Some(maximum_ms) = self.limits.signal_cascade_time_budget_ms {
+            let elapsed_ms = budget_probe.elapsed_ms();
+            if elapsed_ms >= maximum_ms {
+                return Err(RuntimeEventError::CascadeTimeLimit {
+                    elapsed_ms,
+                    maximum_ms,
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn block(&self, id: &BlockId) -> Option<&LogicBlock> {
         self.blocks.iter().find(|block| block.id() == id)
+    }
+
+    /// Resumes a suspended block without creating a synthetic execution or
+    /// restoring timers cancelled by the suspension.
+    pub fn resume_block(&mut self, block_id: &BlockId) -> Result<(), RuntimeEventError> {
+        let index = self.block_index(block_id)?;
+        self.blocks[index].resume_health();
+        Ok(())
+    }
+
+    /// Alias used by hosts exposing a generic block reset action.
+    pub fn reset_block_health(&mut self, block_id: &BlockId) -> Result<(), RuntimeEventError> {
+        self.resume_block(block_id)
     }
 
     pub fn blocks(&self) -> &[LogicBlock] {
@@ -78,14 +188,6 @@ impl Runtime {
             self.signals.iter().map(|signal| signal.config.clone()).collect(),
             self.site.clone(),
         )
-    }
-
-    pub fn block_ids(&self) -> Vec<BlockId> {
-        self.blocks.iter().map(|block| block.id().clone()).collect()
-    }
-
-    pub fn last_accepted_at(&self) -> Option<MonotonicMs> {
-        self.last_accepted_at
     }
 
     pub fn snapshot(&self) -> RuntimeSnapshot {
@@ -150,7 +252,11 @@ impl Runtime {
                 error,
             })?;
         self.ensure_time(Some(block_id), now)?;
-        if !self.blocks[index].config.enabled {
+        if !self.blocks[index].config.enabled
+            || self.blocks[index].health() != BlockHealth::Active
+            || !self.blocks[index]
+                .admit_live_execution(now, self.limits.max_live_executions_per_block_per_second)
+        {
             self.blocks[index]
                 .engine
                 .observe_input(InputObservation::new(event.endpoint, event.value), now)
@@ -169,6 +275,7 @@ impl Runtime {
                 error,
             })?;
         let mut execution = execution;
+        self.blocks[index].record_live_execution(&execution);
         self.assign_execution_id(&mut execution, None);
         self.last_accepted_at = Some(now);
         Ok(Some(BlockExecution {
@@ -194,7 +301,13 @@ impl Runtime {
                 error,
             })?;
         self.ensure_time(Some(block_id), sample.monotonic_ms)?;
-        if !self.blocks[index].config.enabled {
+        if !self.blocks[index].config.enabled
+            || self.blocks[index].health() != BlockHealth::Active
+            || !self.blocks[index].admit_live_execution(
+                sample.monotonic_ms,
+                self.limits.max_live_executions_per_block_per_second,
+            )
+        {
             self.blocks[index]
                 .engine
                 .observe_input(
@@ -216,6 +329,62 @@ impl Runtime {
                 error,
             })?;
         let mut execution = execution;
+        self.blocks[index].record_live_execution(&execution);
+        self.assign_execution_id(&mut execution, None);
+        self.last_accepted_at = Some(sample.monotonic_ms);
+        Ok(Some(BlockExecution {
+            block_id: block_id.clone(),
+            execution,
+        }))
+    }
+
+    /// ClockSample variant which passes the host-owned elapsed-time probe to
+    /// the handler while retaining the non-cascade execution API.
+    pub fn process_input_sampled_with_budget_probe(
+        &mut self,
+        block_id: &BlockId,
+        event: InputEvent,
+        sample: ClockSample,
+        budget_probe: BudgetProbeHandle,
+    ) -> Result<Option<BlockExecution>, RuntimeEventError> {
+        let index = self.block_index(block_id)?;
+        self.blocks[index]
+            .engine
+            .validate_input(&event.endpoint, event.value)
+            .map_err(|error| RuntimeEventError::Block {
+                block_id: block_id.clone(),
+                error,
+            })?;
+        self.ensure_time(Some(block_id), sample.monotonic_ms)?;
+        if !self.blocks[index].config.enabled
+            || self.blocks[index].health() != BlockHealth::Active
+            || !self.blocks[index].admit_live_execution(
+                sample.monotonic_ms,
+                self.limits.max_live_executions_per_block_per_second,
+            )
+        {
+            self.blocks[index]
+                .engine
+                .observe_input(
+                    InputObservation::new(event.endpoint, event.value),
+                    sample.monotonic_ms,
+                )
+                .map_err(|error| RuntimeEventError::Block {
+                    block_id: block_id.clone(),
+                    error,
+                })?;
+            self.last_accepted_at = Some(sample.monotonic_ms);
+            return Ok(None);
+        }
+        let execution = self.blocks[index]
+            .engine
+            .process_input_sampled_with_budget_probe(event, sample, &self.site, budget_probe)
+            .map_err(|error| RuntimeEventError::Block {
+                block_id: block_id.clone(),
+                error,
+            })?;
+        let mut execution = execution;
+        self.blocks[index].record_live_execution(&execution);
         self.assign_execution_id(&mut execution, None);
         self.last_accepted_at = Some(sample.monotonic_ms);
         Ok(Some(BlockExecution {
@@ -244,7 +413,7 @@ impl Runtime {
             .blocks
             .iter()
             .enumerate()
-            .filter(|(_, block)| block.enabled())
+            .filter(|(_, block)| block.enabled() && block.health() == BlockHealth::Active)
             .flat_map(|(index, block)| {
                 block
                     .engine
@@ -268,6 +437,13 @@ impl Runtime {
             return Ok(None);
         };
         let block_id = self.blocks[index].id().clone();
+        if !self.blocks[index].admit_live_execution(
+            now,
+            self.limits.max_live_executions_per_block_per_second,
+        ) {
+            self.last_accepted_at = Some(now);
+            return Ok(None);
+        }
         let execution = self.blocks[index]
             .engine
             .process_next_due_timer(now)
@@ -276,6 +452,9 @@ impl Runtime {
                 error,
             })?;
         let mut execution = execution;
+        if let Some(execution) = execution.as_ref() {
+            self.blocks[index].record_live_execution(execution);
+        }
         if let Some(execution) = execution.as_mut() {
             self.assign_execution_id(execution, None);
         }
@@ -300,12 +479,30 @@ impl Runtime {
         &mut self,
         sample: ClockSample,
     ) -> Result<Option<BlockExecution>, RuntimeEventError> {
+        self.process_next_due_timer_sampled_with_probe(sample, None)
+    }
+
+    /// ClockSample timer variant which applies a host-owned elapsed-time
+    /// probe to the handler.
+    pub fn process_next_due_timer_sampled_with_budget_probe(
+        &mut self,
+        sample: ClockSample,
+        budget_probe: BudgetProbeHandle,
+    ) -> Result<Option<BlockExecution>, RuntimeEventError> {
+        self.process_next_due_timer_sampled_with_probe(sample, Some(budget_probe))
+    }
+
+    fn process_next_due_timer_sampled_with_probe(
+        &mut self,
+        sample: ClockSample,
+        budget_probe: Option<BudgetProbeHandle>,
+    ) -> Result<Option<BlockExecution>, RuntimeEventError> {
         self.ensure_time(None, sample.monotonic_ms)?;
         let selected = self
             .blocks
             .iter()
             .enumerate()
-            .filter(|(_, block)| block.enabled())
+            .filter(|(_, block)| block.enabled() && block.health() == BlockHealth::Active)
             .flat_map(|(index, block)| {
                 block
                     .engine
@@ -329,14 +526,29 @@ impl Runtime {
             return Ok(None);
         };
         let block_id = self.blocks[index].id().clone();
-        let execution = self.blocks[index]
-            .engine
-            .process_next_due_timer_sampled(sample, &self.site)
+        if !self.blocks[index].admit_live_execution(
+            sample.monotonic_ms,
+            self.limits.max_live_executions_per_block_per_second,
+        ) {
+            self.last_accepted_at = Some(sample.monotonic_ms);
+            return Ok(None);
+        }
+        let execution = match budget_probe {
+            Some(probe) => self.blocks[index]
+                .engine
+                .process_next_due_timer_sampled_with_budget_probe(sample, &self.site, probe),
+            None => self.blocks[index]
+                .engine
+                .process_next_due_timer_sampled(sample, &self.site),
+        }
             .map_err(|error| RuntimeEventError::Block {
                 block_id: block_id.clone(),
                 error,
             })?;
         let mut execution = execution;
+        if let Some(execution) = execution.as_ref() {
+            self.blocks[index].record_live_execution(execution);
+        }
         if let Some(execution) = execution.as_mut() {
             self.assign_execution_id(execution, None);
         }
@@ -639,6 +851,26 @@ impl Runtime {
         trigger: ScheduleTrigger,
         sample: ClockSample,
     ) -> Result<Option<BlockExecution>, RuntimeEventError> {
+        self.process_schedule_sampled_with_probe(trigger, sample, None)
+    }
+
+    /// ClockSample schedule variant which applies a host-owned elapsed-time
+    /// probe to the handler.
+    pub fn process_schedule_sampled_with_budget_probe(
+        &mut self,
+        trigger: ScheduleTrigger,
+        sample: ClockSample,
+        budget_probe: BudgetProbeHandle,
+    ) -> Result<Option<BlockExecution>, RuntimeEventError> {
+        self.process_schedule_sampled_with_probe(trigger, sample, Some(budget_probe))
+    }
+
+    fn process_schedule_sampled_with_probe(
+        &mut self,
+        trigger: ScheduleTrigger,
+        sample: ClockSample,
+        budget_probe: Option<BudgetProbeHandle>,
+    ) -> Result<Option<BlockExecution>, RuntimeEventError> {
         self.ensure_time(None, sample.monotonic_ms)?;
         self.last_accepted_at = Some(sample.monotonic_ms);
         let Some(index) = self
@@ -650,7 +882,7 @@ impl Runtime {
         };
         {
             let block = &self.blocks[index];
-            if !block.enabled() {
+            if !block.enabled() || block.health() != BlockHealth::Active {
                 return Ok(None);
             }
             let Some(block_schedule) = block
@@ -676,19 +908,27 @@ impl Runtime {
         }
         let scheduled_for = trigger.scheduled_for_utc_ms;
         let block_id = self.blocks[index].id().clone();
+        if !self.blocks[index].admit_live_execution(
+            sample.monotonic_ms,
+            self.limits.max_live_executions_per_block_per_second,
+        ) {
+            return Ok(None);
+        }
         let execution = self.blocks[index]
             .engine
-            .process_schedule_trigger(
+            .process_schedule_trigger_with_budget_probe(
                 trigger,
                 &self.site,
                 Some(scheduled_for),
                 sample.monotonic_ms,
+                budget_probe,
             )
             .map_err(|error| RuntimeEventError::Block {
                 block_id: block_id.clone(),
                 error,
             })?;
         let mut execution = execution;
+        self.blocks[index].record_live_execution(&execution);
         self.assign_execution_id(&mut execution, None);
         Ok(Some(BlockExecution {
             block_id,
@@ -739,91 +979,6 @@ impl Runtime {
         statuses
     }
 
-    /// Validates every source in the batch before changing any active block.
-    pub fn activate(
-        &mut self,
-        candidate: RuntimeActivation,
-    ) -> Result<ActivationResult, ActivationError> {
-        let mut indexes = Vec::with_capacity(candidate.blocks.len());
-        let mut programs = Vec::with_capacity(candidate.blocks.len());
-        for update in &candidate.blocks {
-            if update.source.is_none() && update.enabled.is_none() {
-                return Err(ActivationError::EmptyUpdate(update.block_id.clone()));
-            }
-            let index = self
-                .blocks
-                .iter()
-                .position(|block| block.id() == &update.block_id)
-                .ok_or_else(|| ActivationError::UnknownBlock(update.block_id.clone()))?;
-            if indexes.contains(&index) {
-                return Err(ActivationError::DuplicateBlock(update.block_id.clone()));
-            }
-            indexes.push(index);
-            programs.push(
-                update
-                    .source
-                    .as_deref()
-                    .map(LogicProgram::try_new)
-                    .transpose()
-                    .map_err(|error| ActivationError::InvalidSource {
-                        block_id: update.block_id.clone(),
-                        error,
-                    })?,
-            );
-        }
-
-        let mut results = Vec::with_capacity(candidate.blocks.len());
-        for ((update, index), program) in candidate.blocks.into_iter().zip(indexes).zip(programs) {
-            let block = &mut self.blocks[index];
-            let mut cancelled_timers = Vec::new();
-            let source_changed = if let Some(program) = program {
-                if program.revision == block.active_logic_revision() {
-                    false
-                } else {
-                    cancelled_timers = block.engine.pending_timers.keys().cloned().collect();
-                    block.engine.config.logic = program.clone();
-                    block.engine.pending_timers.clear();
-                    block.config.logic = program;
-                    true
-                }
-            } else {
-                false
-            };
-            let enabled_changed = update
-                .enabled
-                .is_some_and(|enabled| enabled != block.config.enabled);
-            if enabled_changed {
-                if !update.enabled.unwrap_or(block.config.enabled) {
-                    cancelled_timers.extend(block.engine.pending_timers.keys().cloned());
-                    block.engine.pending_timers.clear();
-                }
-                block.config.enabled = update.enabled.expect("enabled_changed implies value");
-                // A block re-enable must establish a new future-only
-                // baseline. Marking the cursors here keeps activation free of
-                // host clock access; the desktop can immediately call
-                // `rebaseline_block_schedules` with its paired sample, while
-                // the next valid poll remains a safe fallback.
-                for ((cursor_block_id, _), cursor) in self.schedule_cursors.iter_mut() {
-                    if cursor_block_id == block.id() {
-                        cursor.next_occurrence_utc_ms = None;
-                        cursor.needs_rebaseline = true;
-                    }
-                }
-            }
-            cancelled_timers.sort();
-            cancelled_timers.dedup();
-            results.push(BlockActivationResult {
-                block_id: block.id().clone(),
-                logic_revision: block.active_logic_revision(),
-                enabled: block.enabled(),
-                source_changed,
-                enabled_changed,
-                cancelled_timers,
-            });
-        }
-        Ok(ActivationResult { blocks: results })
-    }
-
     fn block_index(&self, id: &BlockId) -> Result<usize, RuntimeEventError> {
         self.blocks
             .iter()
@@ -831,75 +986,12 @@ impl Runtime {
             .ok_or_else(|| RuntimeEventError::UnknownBlock(id.clone()))
     }
 
-    fn ensure_time(
-        &self,
-        block_id: Option<&BlockId>,
-        now: MonotonicMs,
-    ) -> Result<(), RuntimeEventError> {
-        if let Some(previous) = self.last_accepted_at
-            && now < previous
-        {
-            return Err(RuntimeEventError::TimeWentBackwards {
-                block_id: block_id.cloned(),
-                previous,
-                current: now,
-            });
-        }
-        Ok(())
-    }
-
-    fn ensure_schedule_time(&self, now: MonotonicMs) -> Result<(), TimeError> {
-        if let Some(previous) = self.last_accepted_at
-            && now < previous
-        {
-            return Err(TimeError::MonotonicWentBackwards {
-                previous,
-                current: now,
-            });
-        }
-        Ok(())
-    }
-
-    /// Recomputes every schedule cursor strictly after `now_utc`, retaining a
-    /// previously delivered occurrence as a lower bound. The latter is what
-    /// prevents a backward wall-clock correction from replaying an occurrence
-    /// that was already delivered before the correction.
-    fn recompute_schedule_cursors(&mut self, now_utc: i64) {
-        let structural_revision = self.schedule_structural_revision.unwrap_or(0);
-        let schedules: Vec<(BlockId, ScheduleName, ScheduleRule)> = self
-            .blocks
-            .iter()
-            .flat_map(|block| {
-                block.config.schedules.iter().map(|block_schedule| {
-                    (
-                        block.id().clone(),
-                        block_schedule.name.clone(),
-                        block_schedule.rule.clone(),
-                    )
-                })
-            })
-            .collect();
-        for (block_id, name, rule) in schedules {
-            let key = (block_id, name);
-            let cursor =
-                self.schedule_cursors
-                    .entry(key)
-                    .or_insert_with(|| schedule::ScheduleCursor {
-                        last_delivered_utc_ms: None,
-                        next_occurrence_utc_ms: None,
-                        structural_revision,
-                        needs_rebaseline: true,
-                    });
-            cursor.structural_revision = structural_revision;
-            cursor.next_occurrence_utc_ms = next_occurrence_after_not_before(
-                &rule,
-                &self.site,
-                now_utc,
-                cursor.last_delivered_utc_ms,
-            );
-            cursor.needs_rebaseline = false;
-        }
-    }
 }
 
+include!("runtime_time_helpers.rs");
+
 include!("runtime_input_updates.rs");
+
+include!("runtime_activation.rs");
+
+include!("runtime_accessors.rs");

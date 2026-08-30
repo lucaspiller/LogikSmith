@@ -67,6 +67,35 @@ describe('dashboard API and state', () => {
     expect(mapped.logs[0].fields.phase).toBe('startup');
   });
 
+  it('decodes the bounded operations projection and core usage counters', () => {
+    const mapped = decodeSnapshot(snapshot(3, {
+      operations: {
+        profile: 'embedded-baseline',
+        status: 'degraded',
+        queues: { activation: { capacity: 2, depth: 1, high_water: 2, accepted: 4, rejected: 1 } },
+        core: {
+          logic_blocks: { used: 2, capacity: 32 },
+          signals: { used: 1, capacity: 64 },
+          signal_bindings: { used: 2, capacity: 128 },
+          logic_source_bytes: { used: 512, capacity: 131072 },
+          state_entries: { used: 3, capacity: 512 },
+          state_bytes: { used: 64, capacity: 32768 },
+          pending_timers: { used: 1, capacity: 64 }
+        },
+        host_turn: { last_duration_us: 4_100, max_duration_us: 8_000, over_budget_count: 1, warning_count: 1, last_over_budget: true, last_warning: true },
+        block_health: {},
+        pending_knx_writes: 1,
+        pending_knx_write_capacity: 64,
+        pending_write_timeouts: 0,
+        fatal: null
+      }
+    }));
+    expect(mapped.operations?.profile).toBe('embedded-baseline');
+    expect(mapped.operations?.queues.activation.depth).toBe(1);
+    expect(mapped.operations?.core.logicBlocks.capacity).toBe(32);
+    expect(mapped.operations?.hostTurn.lastOverBudget).toBe(true);
+  });
+
   it('loads a snapshot through the HTTP client', async () => {
     const fetchImpl: typeof fetch = async () => new Response(JSON.stringify(snapshot()), {
       status: 200,

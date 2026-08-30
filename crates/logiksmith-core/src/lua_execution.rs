@@ -12,14 +12,16 @@ pub(crate) fn execute_logic(
     pending_timers: &BTreeMap<TimerName, PendingTimer>,
     now: MonotonicMs,
     time_context: &TimeContext,
+    limits: &RuntimeLimits,
+    budget_probe: Option<std::sync::Arc<dyn BudgetProbe>>,
 ) -> Result<Transition, LogicError> {
     // Validate size even though an active program was previously checked. It
     // keeps this boundary correct if a LogicProgram is constructed directly.
-    check_source_size(&program.source)?;
-    let lua = new_lua().map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    check_source_size_with_limits(&program.source, limits)?;
+    let lua = new_lua(limits).map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
     let environment =
         restricted_environment(&lua).map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
-    install_instruction_hook(&lua);
+    install_instruction_hook(&lua, limits, budget_probe);
 
     let chunk = lua
         .load(program.source.as_str())
@@ -254,5 +256,5 @@ pub(crate) fn execute_logic(
             line: None,
         });
     }
-    convert_result(endpoints, result, state, pending_timers, now)
+    convert_result(endpoints, result, state, pending_timers, now, limits)
 }

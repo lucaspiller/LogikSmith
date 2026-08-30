@@ -58,6 +58,7 @@ fn convert_result(
     current_state: &TransientState,
     pending_timers: &BTreeMap<TimerName, PendingTimer>,
     now: MonotonicMs,
+    limits: &RuntimeLimits,
 ) -> Result<Transition, LogicError> {
     let result_table = match result {
         LuaValue::Nil => {
@@ -150,13 +151,24 @@ fn convert_result(
             }
         }
     }
-    merge_state(current_state, &state_patch).map_err(|error| LogicError::InvalidResult {
+    if state_patch.len() > limits.max_state_patch_entries_per_execution {
+        return Err(LogicError::InvalidResult {
+            message: format!(
+                "state patch has {}; maximum is {}",
+                state_patch.len(),
+                limits.max_state_patch_entries_per_execution
+            ),
+            line: None,
+        });
+    }
+    merge_state_with_limits(current_state, &state_patch, limits).map_err(|error| LogicError::InvalidResult {
         message: error.to_string(),
         line: None,
     })?;
 
     let Some(outputs_table) = outputs else {
-        let timers = convert_timers(timers, pending_timers, now)?;
+        let timers = convert_timers(timers, pending_timers, now, limits)?;
+        check_combined_effects(state_patch.len(), 0, timers.len(), limits)?;
         return Ok(Transition {
             state: state_patch,
             outputs: Vec::new(),
@@ -214,7 +226,8 @@ fn convert_result(
                 .flatten()
         })
         .collect::<Vec<_>>();
-    let timers = convert_timers(timers, pending_timers, now)?;
+    let timers = convert_timers(timers, pending_timers, now, limits)?;
+    check_combined_effects(state_patch.len(), outputs.len(), timers.len(), limits)?;
     Ok(Transition {
         state: state_patch,
         outputs,
@@ -226,6 +239,7 @@ fn convert_timers(
     timers: Option<Table>,
     pending: &BTreeMap<TimerName, PendingTimer>,
     now: MonotonicMs,
+    limits: &RuntimeLimits,
 ) -> Result<Vec<TimerEffect>, LogicError> {
     let Some(timers) = timers else {
         return Ok(Vec::new());
@@ -347,13 +361,53 @@ fn convert_timers(
             }
         }
     }
-    if candidate.len() > MAX_PENDING_TIMERS {
+    if raw.len() > limits.max_timer_effects_per_execution {
         return Err(LogicError::InvalidResult {
-            message: format!("pending timers exceed maximum of {MAX_PENDING_TIMERS}"),
+            message: format!(
+                "timer effects exceed maximum of {}",
+                limits.max_timer_effects_per_execution
+            ),
+            line: None,
+        });
+    }
+    if candidate.len() > limits.max_pending_timers_per_block {
+        return Err(LogicError::InvalidResult {
+            message: format!(
+                "pending timers exceed maximum of {}",
+                limits.max_pending_timers_per_block
+            ),
             line: None,
         });
     }
     Ok(raw)
+}
+
+fn check_combined_effects(
+    state: usize,
+    outputs: usize,
+    timers: usize,
+    limits: &RuntimeLimits,
+) -> Result<(), LogicError> {
+    if outputs > limits.max_output_effects_per_execution {
+        return Err(LogicError::InvalidResult {
+            message: format!(
+                "output effects exceed maximum of {}",
+                limits.max_output_effects_per_execution
+            ),
+            line: None,
+        });
+    }
+    let total = state.saturating_add(outputs).saturating_add(timers);
+    if total > limits.max_combined_effects_per_execution {
+        return Err(LogicError::InvalidResult {
+            message: format!(
+                "combined effects exceed maximum of {}",
+                limits.max_combined_effects_per_execution
+            ),
+            line: None,
+        });
+    }
+    Ok(())
 }
 
 fn lua_duration_ms(value: LuaValue) -> Result<u32, LogicError> {
