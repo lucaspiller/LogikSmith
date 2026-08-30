@@ -114,12 +114,70 @@ function blocks() {
     schedules,
     executions: [scheduleExecution(), timerExecution()],
     last_result: { status: 'succeeded', execution_id: 8, time_ms: 1_756_500_123, error: null }
+  }, {
+    id: 'occupancy_source',
+    activeEnabled: true,
+    savedEnabled: true,
+    activeRevision: '3',
+    savedRevision: '3',
+    activeLogicRevision: 3,
+    savedLogicRevision: 3,
+    source: 'return nil',
+    inputs: [{ name: 'wall_switch', dpt: '1.001', address: '1/2/3', bindingKind: 'knx', observed: { kind: 'bool', value: true } }],
+    outputs: [{ name: 'occupied', dpt: '1.001', bindingKind: 'signal', signal: 'house_occupied', observed: { kind: 'bool', value: true } }],
+    knxBindings: [{ endpoint: 'wall_switch', groupAddress: '1/2/3' }],
+    signalBindings: [{ endpoint: 'occupied', signal: 'house_occupied' }],
+    state: {},
+    pendingTimers: [],
+    schedules: [],
+    executions: [{ id: 101, timeMs: 1200, durationUs: 42, logicRevision: '3', status: 'succeeded', trigger: { type: 'input', endpoint: 'wall_switch', dpt: '1.001', value: { kind: 'bool', value: true }, previous: null, changed: true, rising: true, falling: false }, inputs: [], stateBefore: {}, stateAfter: {}, transition: { state: {}, effects: [], signalEffects: [{ endpoint: 'occupied', signal: 'house_occupied', dpt: '1.001', value: { kind: 'bool', value: true }, changed: true, producer: { blockId: 'occupancy_source', endpoint: 'occupied' }, producingExecutionId: 101, consumers: [{ blockId: 'lighting_policy', endpoint: 'occupied' }] }], timers: [] }, signalEffects: [{ endpoint: 'occupied', signal: 'house_occupied', dpt: '1.001', value: { kind: 'bool', value: true }, changed: true, producer: { blockId: 'occupancy_source', endpoint: 'occupied' }, producingExecutionId: 101, consumers: [{ blockId: 'lighting_policy', endpoint: 'occupied' }] }], causalProducerExecutionId: null, error: null }],
+    lastResult: { status: 'succeeded', executionId: 101, timeMs: 1200, error: null }
+  }, {
+    id: 'lighting_policy',
+    activeEnabled: true,
+    savedEnabled: true,
+    activeRevision: '4',
+    savedRevision: '4',
+    activeLogicRevision: 4,
+    savedLogicRevision: 4,
+    source: 'return nil',
+    inputs: [{ name: 'occupied', dpt: '1.001', bindingKind: 'signal', signal: 'house_occupied', observed: { kind: 'bool', value: true } }],
+    outputs: [{ name: 'allowed', dpt: '1.001', bindingKind: 'signal', signal: 'lighting_allowed', observed: { kind: 'bool', value: true } }],
+    signalBindings: [{ endpoint: 'occupied', signal: 'house_occupied' }, { endpoint: 'allowed', signal: 'lighting_allowed' }],
+    state: {},
+    pendingTimers: [],
+    schedules: [],
+    executions: [{ id: 102, timeMs: 1210, durationUs: 43, logicRevision: '4', status: 'succeeded', trigger: { type: 'input', endpoint: 'occupied', dpt: '1.001', value: { kind: 'bool', value: true }, previous: null, changed: true, rising: true, falling: false }, inputs: [], stateBefore: {}, stateAfter: {}, transition: { state: {}, effects: [], signalEffects: [{ endpoint: 'allowed', signal: 'lighting_allowed', dpt: '1.001', value: { kind: 'bool', value: true }, changed: true, producer: { blockId: 'lighting_policy', endpoint: 'allowed' }, producingExecutionId: 102, consumers: [{ blockId: 'hall_light', endpoint: 'allowed' }] }], timers: [] }, signalEffects: [{ endpoint: 'allowed', signal: 'lighting_allowed', dpt: '1.001', value: { kind: 'bool', value: true }, changed: true, producer: { blockId: 'lighting_policy', endpoint: 'allowed' }, producingExecutionId: 102, consumers: [{ blockId: 'hall_light', endpoint: 'allowed' }] }], causalProducerExecutionId: 101, causalSignal: 'house_occupied', causalProducerBlockId: 'occupancy_source', error: null }],
+    lastResult: { status: 'succeeded', executionId: 102, timeMs: 1210, error: null }
+  }, {
+    id: 'hall_light',
+    activeEnabled: false,
+    savedEnabled: false,
+    activeRevision: '5',
+    savedRevision: '5',
+    activeLogicRevision: 5,
+    savedLogicRevision: 5,
+    source: 'return nil',
+    inputs: [{ name: 'allowed', dpt: '1.001', bindingKind: 'signal', signal: 'lighting_allowed', observed: { kind: 'bool', value: true } }],
+    outputs: [{ name: 'actuator', dpt: '1.001', address: '1/2/4', bindingKind: 'knx', observed: { kind: 'bool', value: false }, requested: null }],
+    knxBindings: [{ endpoint: 'actuator', groupAddress: '1/2/4' }],
+    signalBindings: [{ endpoint: 'allowed', signal: 'lighting_allowed' }],
+    state: {},
+    pendingTimers: [],
+    schedules: [],
+    executions: [],
+    lastResult: { status: 'none', executionId: null, timeMs: null, error: null }
   }];
 }
 function snapshot() {
-  return { revision: 4, captured_at_ms: 1_000, connection: { state: 'connected' }, site_time: siteTime, active_structural_revision: 1, saved_structural_revision: 1, active_logic_revision: 12, saved_logic_revision: 12, restart_required: false, blocks: blocks(), telegrams: [], logs: [] };
+  return { revision: 4, captured_at_ms: 1_000, connection: { state: 'connected' }, site_time: siteTime, active_structural_revision: 1, saved_structural_revision: 1, active_logic_revision: 12, saved_logic_revision: 12, restart_required: false, signals: [{ name: 'house_occupied', dpt: '1.001', value: { kind: 'bool', value: true }, status: 'valid', observedAtMs: 1200, changedAtMs: 1200, producer: { blockId: 'occupancy_source', endpoint: 'occupied' }, producingExecutionId: 101, consumers: [{ blockId: 'lighting_policy', endpoint: 'occupied' }], recentChanges: [{ value: { kind: 'bool', value: true }, observedAtMs: 1200, changedAtMs: 1200, executionId: 101 }], structuralRevision: '1' }, { name: 'lighting_allowed', dpt: '1.001', value: { kind: 'bool', value: true }, status: 'valid', observedAtMs: 1210, changedAtMs: 1210, producer: { blockId: 'lighting_policy', endpoint: 'allowed' }, producingExecutionId: 102, consumers: [{ blockId: 'hall_light', endpoint: 'allowed' }], recentChanges: [{ value: { kind: 'bool', value: true }, observedAtMs: 1210, changedAtMs: 1210, executionId: 102 }], structuralRevision: '1' }, { name: 'night_mode', dpt: '1.001', value: null, status: 'unknown', observedAtMs: null, changedAtMs: null, producer: null, producingExecutionId: null, consumers: [], recentChanges: [], structuralRevision: '1' }, { name: 'fallback_mode', dpt: '1.001', value: { kind: 'bool', value: false }, status: 'producer_disabled', observedAtMs: 1200, changedAtMs: null, producer: { blockId: 'hall_light', endpoint: 'allowed' }, producingExecutionId: null, consumers: [], recentChanges: [], structuralRevision: '1' }], blocks: blocks(), telegrams: [], logs: [] };
 }
 function simulation(body) {
+  if (body.block_id === 'occupancy_source' && body.trigger?.type === 'input') {
+    const effect = { endpoint: 'occupied', signal: 'house_occupied', dpt: '1.001', value: { kind: 'bool', value: true }, changed: true, producer: { blockId: 'occupancy_source', endpoint: 'occupied' }, producingExecutionId: null, consumers: [{ blockId: 'lighting_policy', endpoint: 'occupied' }] };
+    const inputs = (body.inputs ?? []).map((input) => ({ ...input, dpt: { major: 1, subtype: 1 } }));
+    return { block_id: 'occupancy_source', logic_revision: 3, duration_us: 18, status: 'succeeded', trigger: { type: 'input', endpoint: body.trigger.endpoint, dpt: { major: 1, subtype: 1 }, value: body.trigger.value, previous: body.trigger.previous ?? null, changed: true, rising: true, falling: false }, inputs, state_before: body.state ?? {}, state_after: body.state ?? {}, transition: { state: body.state ?? {}, effects: [], signalEffects: [effect], timers: [] }, pending_timers: [], effects: [], signalEffects: [effect], eligibleConsumers: effect.consumers, timer_effects: [], time_context: timeContext, error: null };
+  }
   if (body.trigger?.type === 'schedule') {
     const schedule = body.trigger.schedule ?? 'morning_on';
     if (body.trigger.occurrence_at_ms === undefined || body.trigger.occurrence_at_ms === null) {
@@ -129,14 +187,14 @@ function simulation(body) {
         { utc_ms: 1_756_672_800_000, local: '2026-08-31 05:30:00', utc_offset: 10800, weekday: 'Monday' }
       ] };
     }
-    return { logic_revision: 12, duration_us: 24, status: 'succeeded', trigger: { type: 'schedule', name: schedule, kind: 'astronomical', scheduled_for_utc_ms: body.trigger.occurrence_at_ms, detected_at_utc_ms: body.trigger.occurrence_at_ms, handled_at_utc_ms: body.trigger.occurrence_at_ms, late_by_ms: 0, queue_delay_ms: 0, coalesced_count: 0, structural_revision: '17827391827' }, inputs: [], state_before: body.state ?? state, state_after: { ...(body.state ?? state), phase: { kind: 'string', value: 'dimmed' } }, transition: { state: { ...(body.state ?? state), phase: { kind: 'string', value: 'dimmed' } }, effects: [{ endpoint: 'scheduled_light', destination: '1/2/4', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true } }], timers: [{ name: 'off', action: 'scheduled', after_ms: 5000, due_at_ms: body.trigger.occurrence_at_ms + 5000 }] }, pending_timers: [], effects: [], timer_effects: [], time_context: timeContext, error: null };
+    return { logic_revision: 12, duration_us: 24, status: 'succeeded', trigger: { type: 'schedule', name: schedule, kind: 'astronomical', scheduled_for_utc_ms: body.trigger.occurrence_at_ms, detected_at_utc_ms: body.trigger.occurrence_at_ms, handled_at_utc_ms: body.trigger.occurrence_at_ms, late_by_ms: 0, queue_delay_ms: 0, coalesced_count: 0, structural_revision: '17827391827' }, inputs: [], state_before: body.state ?? state, state_after: { ...(body.state ?? state), phase: { kind: 'string', value: 'dimmed' } }, transition: { state: { ...(body.state ?? state), phase: { kind: 'string', value: 'dimmed' } }, effects: [{ endpoint: 'scheduled_light', destination: '1/2/4', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true } }], signalEffects: [], timers: [{ name: 'off', action: 'scheduled', after_ms: 5000, due_at_ms: body.trigger.occurrence_at_ms + 5000 }] }, pending_timers: [], effects: [], signalEffects: [], eligibleConsumers: [], timer_effects: [], time_context: timeContext, error: null };
   }
   const timer = body.trigger?.type === 'timer';
   const selected = body.trigger?.name ?? 'off';
   const timerTrigger = { ...timerTrigger(), name: selected, fired_at_ms: body.trigger?.fired_at_ms ?? 5800, late_by_ms: 0 };
   const inputs = (body.inputs ?? []).map((input) => ({ ...input, dpt: { major: 1, subtype: 1 } }));
   const nextTimers = timer ? [] : [{ name: 'dim', scheduled_at_ms: 1000, due_at_ms: 5500, logic_revision: 12 }, { name: 'off', scheduled_at_ms: 1000, due_at_ms: 6000, logic_revision: 12 }];
-  return { logic_revision: 12, duration_us: 24, status: 'succeeded', trigger: timer ? timerTrigger : { type: 'input', endpoint: 'wall_switch', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true }, previous: { kind: 'bool', value: false }, changed: true, rising: true, falling: false }, inputs, state_before: body.state ?? state, state_after: { ...(body.state ?? state), phase: { kind: 'string', value: timer ? 'idle' : 'waiting_to_turn_off' } }, transition: { state: { phase: { kind: 'string', value: timer ? 'idle' : 'waiting_to_turn_off' } }, effects: timer ? [{ endpoint: 'scheduled_light', destination: '1/2/4', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: false } }] : [{ endpoint: 'scheduled_light', destination: '1/2/4', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true } }], timers: timer ? [{ name: selected, action: 'cancelled', previous_due_at_ms: 5800 }] : [{ name: 'dim', action: 'scheduled', after_ms: 4500, due_at_ms: 5500 }, { name: 'off', action: 'scheduled', after_ms: 5000, due_at_ms: 6000 }] }, pending_timers: nextTimers, effects: [], timer_effects: [], time_context: timeContext, error: null };
+  return { logic_revision: 12, duration_us: 24, status: 'succeeded', trigger: timer ? timerTrigger : { type: 'input', endpoint: 'wall_switch', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true }, previous: { kind: 'bool', value: false }, changed: true, rising: true, falling: false }, inputs, state_before: body.state ?? state, state_after: { ...(body.state ?? state), phase: { kind: 'string', value: timer ? 'idle' : 'waiting_to_turn_off' } }, transition: { state: { phase: { kind: 'string', value: timer ? 'idle' : 'waiting_to_turn_off' } }, effects: timer ? [{ endpoint: 'scheduled_light', destination: '1/2/4', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: false } }] : [{ endpoint: 'scheduled_light', destination: '1/2/4', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true } }], signalEffects: [], timers: timer ? [{ name: selected, action: 'cancelled', previous_due_at_ms: 5800 }] : [{ name: 'dim', action: 'scheduled', after_ms: 4500, due_at_ms: 5500 }, { name: 'off', action: 'scheduled', after_ms: 5000, due_at_ms: 6000 }] }, pending_timers: nextTimers, effects: [], signalEffects: [], eligibleConsumers: [], timer_effects: [], time_context: timeContext, error: null };
 }
 async function readJson(request) {
   let raw = '';
@@ -184,7 +242,7 @@ const server = createServer(async (request, response) => {
   if (request.url?.startsWith('/api/snapshot')) return sendJson(response, snapshot());
   if (request.url?.startsWith('/api/automation')) {
     if (request.method === 'PUT') { for await (const _chunk of request) {} return sendJson(response, { revision: 13, logic_activated: true, active_logic_revision: 13, restart_required: false, cancelled_timers: ['dim', 'off'] }); }
-    const document = { blocks: blocks().map((item) => ({ id: item.id, enabled: item.active_enabled, revision: 1, inputs: item.inputs.map((input) => ({ name: input.name, dpt: '1.001' })), outputs: item.outputs.map((output) => ({ name: output.name, dpt: '1.001' })), knx_bindings: item.knx_bindings, source: item.source, schedules: scheduleDefinitions })) };
+    const document = { signals: snapshot().signals.map((item) => ({ name: item.name, dpt: item.dpt })), blocks: blocks().map((item) => ({ id: item.id, enabled: item.active_enabled ?? item.activeEnabled ?? true, revision: 1, inputs: item.inputs.map((input) => ({ name: input.name, dpt: '1.001' })), outputs: item.outputs.map((output) => ({ name: output.name, dpt: '1.001' })), knx_bindings: item.knx_bindings ?? item.knxBindings ?? [], signal_bindings: item.signal_bindings ?? item.signalBindings ?? [], source: item.source, schedules: item.schedules?.length ? scheduleDefinitions : [] })) };
     return sendJson(response, { document, revision: 12, active_logic_revision: 12, saved_logic_revision: 12, active_structural_revision: 1, saved_structural_revision: 1, restart_required: false, blocks: [{ id: 'scheduled_light_test', active_revision: '12', saved_revision: '12', active_logic_revision: 12, saved_logic_revision: 12, active_enabled: true, saved_enabled: true }] });
   }
   if (request.url?.startsWith('/api/schedules/preview')) {

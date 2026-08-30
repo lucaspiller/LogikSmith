@@ -61,7 +61,10 @@ impl LogicBlock {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Runtime {
     blocks: Vec<LogicBlock>,
+    signals: Vec<SignalState>,
+    signal_indexes: BTreeMap<SignalName, usize>,
     last_accepted_at: Option<MonotonicMs>,
+    next_execution_id: ExecutionId,
     /// The site wall-clock context is captured from for every execution.
     site: SiteTimeConfig,
     /// Per-block, per-schedule engine state, keyed deterministically by
@@ -74,4 +77,15 @@ pub struct Runtime {
     /// Last valid wall-clock sample used by the schedule poller. `None`
     /// means the next valid sample must establish a future-only baseline.
     last_schedule_wall_clock_utc_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SignalState {
+    config: SignalConfig,
+    value: Option<TypedValue>,
+    observed_at: Option<MonotonicMs>,
+    changed_at: Option<MonotonicMs>,
+    producer: Option<SignalEndpointId>,
+    producing_execution: Option<ExecutionId>,
+    consumers: Vec<SignalEndpointId>,
 }

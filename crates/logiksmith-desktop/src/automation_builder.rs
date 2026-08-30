@@ -4,6 +4,49 @@ pub fn build_automation(
     document: AutomationDocument,
 ) -> Result<AutomationRuntime, Vec<FieldError>> {
     let mut errors = Vec::new();
+    let mut signal_dpts = HashMap::new();
+    let mut signals = Vec::new();
+    if document.signals.len() > MAX_SIGNALS {
+        errors.push(FieldError {
+            path: "signals".to_owned(),
+            message: format!("must contain at most {MAX_SIGNALS} signals"),
+        });
+    }
+    for (signal_index, signal) in document.signals.iter().enumerate() {
+        let path = format!("signals[{signal_index}]");
+        let name = match endpoint_name(&format!("{path}.name"), &signal.name) {
+            Ok(name) => name,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        if name.to_string() != signal.name {
+            errors.push(FieldError {
+                path: format!("{path}.name"),
+                message: "must use canonical identifier form".to_owned(),
+            });
+            continue;
+        }
+        let dpt = match parse_dpt(&format!("{path}.dpt"), &signal.dpt) {
+            Ok(dpt) => dpt,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        if signal_dpts.insert(signal.name.clone(), dpt).is_some() {
+            errors.push(FieldError {
+                path: format!("{path}.name"),
+                message: "must be unique".to_owned(),
+            });
+            continue;
+        }
+        signals.push(SignalRuntime {
+            name: signal.name.clone(),
+            dpt,
+        });
+    }
     if document.blocks.is_empty() {
         errors.push(FieldError {
             path: "blocks".to_owned(),
@@ -19,8 +62,12 @@ pub fn build_automation(
     let mut blocks = Vec::new();
     let mut address_to_inputs: HashMap<GroupAddress, Vec<BlockInputBinding>> = HashMap::new();
     let mut output_to_address = HashMap::new();
+    let mut signal_to_inputs: HashMap<String, Vec<BlockSignalInputBinding>> = HashMap::new();
+    let mut output_to_signal = HashMap::new();
     let mut address_dpts = HashMap::new();
     let mut address_origins: HashMap<GroupAddress, (String, String)> = HashMap::new();
+    let mut signal_producers: HashMap<String, (String, String)> = HashMap::new();
+    let mut signal_binding_count = 0usize;
 
     for (block_index, block) in document.blocks.iter().enumerate() {
         let block_path = format!("blocks[{block_index}]");
@@ -77,12 +124,6 @@ pub fn build_automation(
                 endpoints.push(Endpoint::new(name, direction, dpt));
             }
         }
-        if block.inputs.is_empty() {
-            errors.push(FieldError {
-                path: format!("{block_path}.inputs"),
-                message: "must contain at least one input".to_owned(),
-            });
-        }
         if block.source.is_empty() {
             errors.push(FieldError {
                 path: format!("{block_path}.source"),
@@ -96,6 +137,7 @@ pub fn build_automation(
         }
 
         let mut endpoint_to_address = HashMap::new();
+        let mut endpoint_to_signal = HashMap::new();
         let mut local_addresses = HashSet::new();
         for (index, binding) in block.knx_bindings.iter().enumerate() {
             let path = format!("{block_path}.knx_bindings[{index}]");
@@ -178,8 +220,76 @@ pub fn build_automation(
                 None => unreachable!("endpoint DPT implies direction"),
             }
         }
+        for (index, binding) in block.signal_bindings.iter().enumerate() {
+            signal_binding_count = signal_binding_count.saturating_add(1);
+            let path = format!("{block_path}.signal_bindings[{index}]");
+            let name = match endpoint_name(&format!("{path}.endpoint"), &binding.endpoint) {
+                Ok(name) => name,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            };
+            let Some(&dpt) = endpoint_dpts.get(&name) else {
+                errors.push(FieldError {
+                    path: format!("{path}.endpoint"),
+                    message: "must reference an existing endpoint in this block".to_owned(),
+                });
+                continue;
+            };
+            let Some(&signal_dpt) = signal_dpts.get(&binding.signal) else {
+                errors.push(FieldError {
+                    path: format!("{path}.signal"),
+                    message: "must reference an existing signal".to_owned(),
+                });
+                continue;
+            };
+            if dpt != signal_dpt {
+                errors.push(FieldError {
+                    path: format!("{path}.signal"),
+                    message: format!("DPT conflicts with endpoint {name}"),
+                });
+                continue;
+            }
+            if endpoint_to_address.contains_key(&name) || endpoint_to_signal.contains_key(&name) {
+                errors.push(FieldError {
+                    path: format!("{path}.endpoint"),
+                    message: "must have exactly one binding across KNX and signals".to_owned(),
+                });
+                continue;
+            }
+            endpoint_to_signal.insert(name.clone(), binding.signal.clone());
+            if endpoint_directions.get(&name) == Some(&EndpointDirection::Input) {
+                signal_to_inputs
+                    .entry(binding.signal.clone())
+                    .or_default()
+                    .push(BlockSignalInputBinding {
+                        block_id: block.id.clone(),
+                        endpoint: name,
+                        dpt,
+                        signal: binding.signal.clone(),
+                    });
+            } else if endpoint_directions.get(&name) == Some(&EndpointDirection::Output) {
+                if let Some((previous_block, previous_endpoint)) =
+                    signal_producers.insert(
+                        binding.signal.clone(),
+                        (block.id.clone(), name.to_string()),
+                    )
+                {
+                    errors.push(FieldError {
+                        path: format!("{path}.signal"),
+                        message: format!(
+                            "must have at most one producer; already produced by {previous_block}.{previous_endpoint}"
+                        ),
+                    });
+                }
+                output_to_signal.insert((block.id.clone(), name), binding.signal.clone());
+            }
+        }
         for endpoint in &endpoints {
-            if !endpoint_to_address.contains_key(&endpoint.name) {
+            if !endpoint_to_address.contains_key(&endpoint.name)
+                && !endpoint_to_signal.contains_key(&endpoint.name)
+            {
                 let list = match endpoint.direction {
                     EndpointDirection::Input => "inputs",
                     EndpointDirection::Output => "outputs",
@@ -200,7 +310,7 @@ pub fn build_automation(
                         |index| format!("{block_path}.{list}[{index}].name"),
                     ),
                     message: format!(
-                        "endpoint {} must have exactly one KNX binding",
+                        "endpoint {} must have exactly one binding across KNX and signals",
                         endpoint.name
                     ),
                 });
@@ -220,8 +330,15 @@ pub fn build_automation(
             enabled: block.enabled,
             engine_config,
             endpoint_to_address,
+            endpoint_to_signal,
             endpoint_dpts,
             schedules,
+        });
+    }
+    if signal_binding_count > MAX_SIGNAL_BINDINGS {
+        errors.push(FieldError {
+            path: "blocks.signal_bindings".to_owned(),
+            message: format!("must contain at most {MAX_SIGNAL_BINDINGS} bindings"),
         });
     }
     if !errors.is_empty() {
@@ -230,25 +347,157 @@ pub fn build_automation(
     let core_blocks = blocks
         .iter()
         .map(|block| {
-            CoreBlockConfig::with_schedules(
+            let mut config = CoreBlockConfig::with_schedules(
                 block.id.parse::<BlockId>().expect("validated block ID"),
                 block.enabled,
                 block.engine_config.endpoints.clone(),
                 block.engine_config.logic.source.clone(),
                 block.schedules.clone(),
+            );
+            config.signal_bindings = document
+                .blocks
+                .iter()
+                .find(|candidate| candidate.id == block.id)
+                .map(|candidate| {
+                    candidate
+                        .signal_bindings
+                        .iter()
+                        .map(|binding| {
+                            CoreSignalBinding::new(
+                                binding.endpoint.parse().expect("validated endpoint"),
+                                SignalName::new(binding.signal.clone())
+                                    .expect("validated signal"),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            config
+        })
+        .collect();
+    let core_signals = signals
+        .iter()
+        .map(|signal| {
+            CoreSignalConfig::new(
+                SignalName::new(signal.name.clone()).expect("validated signal"),
+                signal.dpt,
             )
         })
         .collect();
+    let core_config = CoreRuntimeConfig::with_signals(core_blocks, core_signals);
+    if let Err(error) = core_config.validate() {
+        return Err(vec![core_validation_error(&error, &document)]);
+    }
     Ok(AutomationRuntime {
         structural_revision: structural_revision(&document),
         document_revision: 0,
         document,
-        core_config: CoreRuntimeConfig::new(core_blocks),
+        signals,
+        core_config,
         blocks,
         address_to_inputs,
         output_to_address,
+        signal_to_inputs,
+        output_to_signal,
         address_dpts,
     })
+}
+
+fn core_validation_error(
+    error: &logiksmith_core::RuntimeConfigError,
+    document: &AutomationDocument,
+) -> FieldError {
+    let block_path = |id: &logiksmith_core::BlockId| {
+        document
+            .blocks
+            .iter()
+            .position(|block| block.id == id.as_str())
+            .map(|index| format!("blocks[{index}]"))
+            .unwrap_or_else(|| "blocks".to_owned())
+    };
+    let signal_path = |name: &logiksmith_core::SignalName| {
+        document
+            .signals
+            .iter()
+            .position(|signal| signal.name == name.as_str())
+            .map(|index| format!("signals[{index}]"))
+            .unwrap_or_else(|| "signals".to_owned())
+    };
+    match error {
+        logiksmith_core::RuntimeConfigError::TooManySignals { .. }
+        | logiksmith_core::RuntimeConfigError::DuplicateSignal(_)
+        | logiksmith_core::RuntimeConfigError::UnsupportedSignalDpt { .. } => FieldError {
+            path: signal_path(match error {
+                logiksmith_core::RuntimeConfigError::DuplicateSignal(name) => name,
+                logiksmith_core::RuntimeConfigError::UnsupportedSignalDpt { signal, .. } => signal,
+                _ => return FieldError { path: "signals".to_owned(), message: error.to_string() },
+            }),
+            message: error.to_string(),
+        },
+        logiksmith_core::RuntimeConfigError::TooManySignalBindings { .. } => FieldError {
+            path: "blocks.signal_bindings".to_owned(),
+            message: error.to_string(),
+        },
+        logiksmith_core::RuntimeConfigError::UnknownSignal {
+            block_id,
+            endpoint,
+            ..
+        }
+        | logiksmith_core::RuntimeConfigError::SignalDptMismatch {
+            block_id,
+            endpoint,
+            ..
+        } => FieldError {
+            path: document
+                .blocks
+                .iter()
+                .position(|block| block.id == block_id.as_str())
+                .and_then(|block_index| {
+                    document.blocks[block_index]
+                        .signal_bindings
+                        .iter()
+                        .position(|binding| binding.endpoint == endpoint.as_str())
+                        .map(|binding_index| {
+                            format!("blocks[{block_index}].signal_bindings[{binding_index}]")
+                        })
+                })
+                .unwrap_or_else(|| format!("{}.signal_bindings", block_path(block_id))),
+            message: error.to_string(),
+        },
+        logiksmith_core::RuntimeConfigError::DuplicateSignalProducer { duplicate, .. } => {
+            FieldError {
+                path: document
+                    .blocks
+                    .iter()
+                    .position(|block| block.id == duplicate.block_id.as_str())
+                    .and_then(|block_index| {
+                        document.blocks[block_index]
+                            .signal_bindings
+                            .iter()
+                            .position(|binding| binding.endpoint == duplicate.endpoint.as_str())
+                            .map(|binding_index| {
+                                format!(
+                                    "blocks[{block_index}].signal_bindings[{binding_index}].signal"
+                                )
+                            })
+                    })
+                    .unwrap_or_else(|| "blocks.signal_bindings".to_owned()),
+                message: error.to_string(),
+            }
+        }
+        logiksmith_core::RuntimeConfigError::SignalCycle { .. } => FieldError {
+            path: "blocks.signal_bindings".to_owned(),
+            message: error.to_string(),
+        },
+        logiksmith_core::RuntimeConfigError::InvalidBlock { block_id, .. } => FieldError {
+            path: format!("{}.source", block_path(block_id)),
+            message: error.to_string(),
+        },
+        _ => FieldError {
+            path: "blocks".to_owned(),
+            message: error.to_string(),
+        },
+    }
 }
 
 pub fn automation_revision(source: &[u8]) -> u64 {

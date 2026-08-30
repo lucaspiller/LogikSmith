@@ -60,6 +60,7 @@ pub struct Snapshot {
     /// Ordered block-local diagnostics. The older global projections remain
     /// during the dashboard migration, but this is the authoritative M8 view.
     pub blocks: Vec<BlockSnapshot>,
+    pub signals: Vec<SignalSnapshot>,
 }
 /// Read-only site wall-clock and astronomy facts for the dashboard card.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -191,6 +192,8 @@ pub struct AutomationSnapshot {
     pub inputs: Vec<EndpointSnapshot>,
     pub outputs: Vec<EndpointSnapshot>,
     pub knx_bindings: Vec<BindingSnapshot>,
+    #[serde(rename = "signalBindings")]
+    pub signal_bindings: Vec<SignalBindingSnapshot>,
     pub logic: LogicSourceSnapshot,
 }
 
@@ -211,6 +214,8 @@ pub struct BlockSnapshot {
     pub inputs: Vec<EndpointSnapshot>,
     pub outputs: Vec<EndpointSnapshot>,
     pub knx_bindings: Vec<BindingSnapshot>,
+    #[serde(rename = "signalBindings")]
+    pub signal_bindings: Vec<SignalBindingSnapshot>,
     pub values: ValuesSnapshot,
     pub state: BTreeMap<String, StateValueRecord>,
     pub pending_timers: Vec<PendingTimerRecord>,
@@ -234,11 +239,62 @@ pub struct LogicSourceSnapshot {
 pub struct EndpointSnapshot {
     pub name: String,
     pub dpt: DptMessage,
+    #[serde(rename = "bindingKind")]
+    pub binding_kind: String,
+    pub signal: Option<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BindingSnapshot {
     pub endpoint: String,
     pub group_address: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalBindingSnapshot {
+    pub endpoint: String,
+    pub signal: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalSnapshot {
+    pub name: String,
+    pub dpt: DptMessage,
+    pub value: Option<ValueMessage>,
+    pub status: String,
+    pub producer: Option<SignalProducerSnapshot>,
+    pub consumers: Vec<SignalConsumerSnapshot>,
+    pub observed_at_ms: Option<u64>,
+    pub changed_at_ms: Option<u64>,
+    pub producing_execution_id: Option<u64>,
+    pub recent_changes: Vec<SignalChangeSnapshot>,
+    #[serde(serialize_with = "crate::wire_revision::serialize_option")]
+    pub structural_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalProducerSnapshot {
+    pub block_id: String,
+    pub endpoint: String,
+    pub execution_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalConsumerSnapshot {
+    pub block_id: String,
+    pub endpoint: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalChangeSnapshot {
+    pub value: Option<ValueMessage>,
+    pub observed_at_ms: Option<u64>,
+    pub changed_at_ms: Option<u64>,
+    pub execution_id: Option<u64>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ValuesSnapshot {
@@ -310,6 +366,16 @@ pub struct ExecutionRecord {
     pub state_after: BTreeMap<String, StateValueRecord>,
     pub transition: Option<LogicalTransitionRecord>,
     pub effects: Vec<LogicalEffectRecord>,
+    #[serde(rename = "signalEffects")]
+    pub signal_effects: Vec<LogicalSignalEffectRecord>,
+    #[serde(rename = "causalProducerExecutionId")]
+    pub causal_producer_execution_id: Option<u64>,
+    #[serde(rename = "causalProducerBlockId")]
+    pub causal_producer_block_id: Option<String>,
+    #[serde(rename = "causalSignal")]
+    pub causal_signal: Option<String>,
+    #[serde(rename = "causalLinks")]
+    pub causal_links: Vec<CausalLinkSnapshot>,
     pub timer_effects: Vec<LogicalTimerEffectRecord>,
     pub error: Option<LogicErrorRecord>,
 }
@@ -435,9 +501,34 @@ pub struct LogicalEffectRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogicalSignalEffectRecord {
+    pub endpoint: String,
+    pub signal: String,
+    pub dpt: DptMessage,
+    pub value: ValueMessage,
+    pub changed: bool,
+    pub producer: Option<SignalProducerSnapshot>,
+    pub producing_execution_id: Option<u64>,
+    pub consumers: Vec<SignalConsumerSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CausalLinkSnapshot {
+    pub producer_execution_id: u64,
+    pub consumer_execution_id: u64,
+    pub signal: Option<String>,
+    pub producer_block_id: Option<String>,
+    pub consumer_block_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LogicalTransitionRecord {
     pub state: BTreeMap<String, StateValueRecord>,
     pub effects: Vec<LogicalEffectRecord>,
+    #[serde(rename = "signalEffects")]
+    pub signal_effects: Vec<LogicalSignalEffectRecord>,
     pub timers: Vec<LogicalTimerEffectRecord>,
 }
 
@@ -470,6 +561,10 @@ pub struct SimulationResponse {
     pub transition: Option<LogicalTransitionRecord>,
     pub pending_timers: Vec<PendingTimerRecord>,
     pub effects: Vec<LogicalEffectRecord>,
+    #[serde(rename = "signalEffects")]
+    pub signal_effects: Vec<LogicalSignalEffectRecord>,
+    #[serde(rename = "eligibleConsumers")]
+    pub eligible_consumers: Vec<SignalConsumerSnapshot>,
     pub timer_effects: Vec<LogicalTimerEffectRecord>,
     pub error: Option<LogicErrorRecord>,
 }
@@ -573,6 +668,7 @@ struct Inner {
     journal: VecDeque<DiagnosticUpdate>,
     pending_writes: BTreeMap<u64, WriteState>,
     blocks: BTreeMap<String, BlockDiagnosticState>,
+    signals: Vec<SignalSnapshot>,
     block_order: Vec<String>,
     block_automation: BTreeMap<String, AutomationSnapshot>,
     block_endpoint_values: BTreeMap<(String, EndpointName), EndpointValueState>,
@@ -593,7 +689,7 @@ struct ScheduleConfigSnapshot {
 struct EndpointValueState {
     direction: EndpointDirection,
     dpt: Dpt,
-    address: GroupAddress,
+    address: Option<GroupAddress>,
     observed: Option<ValueMessage>,
     requested: Option<ValueMessage>,
 }

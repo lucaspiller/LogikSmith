@@ -5,3 +5,5 @@ use crate::*;
 
 include!("runtime_model.rs");
 include!("runtime_impl.rs");
+include!("runtime_signals.rs");
+include!("runtime_simulation.rs");

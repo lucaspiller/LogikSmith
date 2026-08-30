@@ -5,6 +5,8 @@ export type Dpt = (typeof DPTS)[number];
 
 export interface AutomationEndpoint { name: string; dpt: Dpt; }
 export interface KnxBinding { endpoint: string; group_address: string; }
+export interface SignalBinding { endpoint: string; signal: string; }
+export interface AutomationSignal { name: string; dpt: Dpt; }
 export interface AutomationLogic { source: string; }
 export type ScheduleKind = 'fixed' | 'interval' | 'astronomical';
 export type ScheduleWeekday = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun';
@@ -29,11 +31,13 @@ export interface AutomationBlock {
   inputs: AutomationEndpoint[];
   outputs: AutomationEndpoint[];
   knx_bindings: KnxBinding[];
+  signal_bindings?: SignalBinding[];
   source: string;
   schedules: AutomationSchedule[];
 }
 export interface AutomationDocument {
   blocks?: AutomationBlock[];
+  signals?: AutomationSignal[];
   /** Transitional fields are required only by the TypeScript compatibility shape; canonical saves serialize blocks alone. */
   inputs: AutomationEndpoint[];
   outputs: AutomationEndpoint[];
@@ -72,9 +76,9 @@ export class AutomationApiError extends Error {
   readonly status: number; readonly fieldErrors: AutomationFieldError[]; readonly latest: AutomationEnvelope | null;
   constructor(status: number, message: string, fieldErrors: AutomationFieldError[] = [], latest: AutomationEnvelope | null = null) { super(message); this.name = 'AutomationApiError'; this.status = status; this.fieldErrors = fieldErrors; this.latest = latest; }
 }
-export const emptyAutomation = (): AutomationDocument => ({ blocks: [], inputs: [], outputs: [], knx_bindings: [], logic: { source: '' } });
+export const emptyAutomation = (): AutomationDocument => ({ blocks: [], signals: [], inputs: [], outputs: [], knx_bindings: [], logic: { source: '' } });
 function canonicalBlocks(document: AutomationDocument): AutomationBlock[] {
-  if (document.inputs && document.outputs && document.knx_bindings && document.logic) return [{ id: 'default', revision: '1', enabled: true, inputs: document.inputs, outputs: document.outputs, knx_bindings: document.knx_bindings, source: document.logic.source, schedules: [] }];
+  if (document.inputs && document.outputs && document.knx_bindings && document.logic) return [{ id: 'default', revision: '1', enabled: true, inputs: document.inputs, outputs: document.outputs, knx_bindings: document.knx_bindings, signal_bindings: [], source: document.logic.source, schedules: [] }];
   if (Array.isArray(document.blocks) && document.blocks.length) return document.blocks;
   return document.blocks ?? [];
 }
@@ -100,6 +104,14 @@ function binding(value: unknown, path: string): KnxBinding {
   const endpointName = field(source, 'endpoint', 'name');
   const address = field(source, 'group_address', 'groupAddress', 'address');
   return { endpoint: nonEmptyString(endpointName, `${path}.endpoint`), group_address: nonEmptyString(address, `${path}.group_address`) };
+}
+function signalBinding(value: unknown, path: string): SignalBinding {
+  const source = record(value, path);
+  return { endpoint: nonEmptyString(field(source, 'endpoint', 'name'), `${path}.endpoint`), signal: nonEmptyString(field(source, 'signal'), `${path}.signal`) };
+}
+function signal(value: unknown, path: string): AutomationSignal {
+  const source = record(value, path);
+  return { name: nonEmptyString(required(source, 'name', `${path}.name`), `${path}.name`), dpt: dpt(required(source, 'dpt', `${path}.dpt`), `${path}.dpt`) };
 }
 function sourceText(value: unknown, path: string): string {
   if (typeof value !== 'string' || value.length === 0) throw new AutomationDecodeError(path, 'expected a non-empty string');
@@ -141,7 +153,10 @@ function block(value: unknown, path: string): AutomationBlock {
   const source = record(value, path);
   const inputs = list(required(source, 'inputs', `${path}.inputs`), `${path}.inputs`).map((item, index) => endpoint(item, `${path}.inputs[${index}]`));
   const outputs = list(required(source, 'outputs', `${path}.outputs`), `${path}.outputs`).map((item, index) => endpoint(item, `${path}.outputs[${index}]`));
-  const bindings = list(required(source, 'knx_bindings', `${path}.knx_bindings`), `${path}.knx_bindings`).map((item, index) => binding(item, `${path}.knx_bindings[${index}]`));
+  const bindingsRaw = field(source, 'knx_bindings', 'knxBindings');
+  const bindings = bindingsRaw === undefined || bindingsRaw === null ? [] : list(bindingsRaw, `${path}.knx_bindings`).map((item, index) => binding(item, `${path}.knx_bindings[${index}]`));
+  const signalBindingsRaw = field(source, 'signal_bindings', 'signalBindings');
+  const signalBindings = signalBindingsRaw === undefined || signalBindingsRaw === null ? [] : list(signalBindingsRaw, `${path}.signal_bindings`).map((item, index) => signalBinding(item, `${path}.signal_bindings[${index}]`));
   const logic = field(source, 'source', 'logic');
   const sourceTextValue = isRecord(logic) ? required(logic, 'source', `${path}.source`) : logic;
   if (typeof source.enabled !== 'boolean') throw new AutomationDecodeError(`${path}.enabled`, 'expected a boolean');
@@ -151,7 +166,7 @@ function block(value: unknown, path: string): AutomationBlock {
   const schedules = schedulesRaw === undefined || schedulesRaw === null ? [] : list(schedulesRaw, `${path}.schedules`).map((item, index) => decodeSchedule(item, `${path}.schedules[${index}]`));
   if (schedules.length > 32) throw new AutomationDecodeError(`${path}.schedules`, 'must contain at most 32 schedules');
   const names = new Set<string>(); schedules.forEach((item, index) => { if (names.has(item.name)) throw new AutomationDecodeError(`${path}.schedules[${index}].name`, `duplicate schedule name ${item.name}`); names.add(item.name); });
-  return { id: blockId(required(source, 'id', `${path}.id`), `${path}.id`), revision: revisionValue, enabled: source.enabled, inputs, outputs, knx_bindings: bindings, source: sourceText(sourceTextValue, `${path}.source`), schedules };
+  return { id: blockId(required(source, 'id', `${path}.id`), `${path}.id`), revision: revisionValue, enabled: source.enabled, inputs, outputs, knx_bindings: bindings, signal_bindings: signalBindings, source: sourceText(sourceTextValue, `${path}.source`), schedules };
 }
 
 /** Decode canonical blocks. The legacy branch exists only to keep Milestone 7 fixtures readable during migration. */
@@ -163,10 +178,12 @@ export function decodeAutomationDocument(input: unknown, path = 'document'): Aut
     if (values.length > MAX_BLOCKS) throw new AutomationDecodeError(`${path}.blocks`, `must contain at most ${MAX_BLOCKS} blocks`);
     const blocks = values.map((value, index) => block(value, `${path}.blocks[${index}]`)); const seen = new Set<string>();
     blocks.forEach((item, index) => { if (seen.has(item.id)) throw new AutomationDecodeError(`${path}.blocks[${index}].id`, `duplicate block id ${item.id}`); seen.add(item.id); });
-    return { blocks } as AutomationDocument;
+    const signalsRaw = field(source, 'signals');
+    const signals = signalsRaw === undefined || signalsRaw === null ? [] : list(signalsRaw, `${path}.signals`).map((value, index) => signal(value, `${path}.signals[${index}]`));
+    return { blocks, signals } as AutomationDocument;
   }
   const legacyLogic = record(required(source, 'logic', `${path}.logic`), `${path}.logic`); const inputs = list(required(source, 'inputs', `${path}.inputs`), `${path}.inputs`).map((value, index) => endpoint(value, `${path}.inputs[${index}]`)); const outputs = list(required(source, 'outputs', `${path}.outputs`), `${path}.outputs`).map((value, index) => endpoint(value, `${path}.outputs[${index}]`)); const bindings = list(required(source, 'knx_bindings', `${path}.knx_bindings`), `${path}.knx_bindings`).map((value, index) => binding(value, `${path}.knx_bindings[${index}]`)); const sourceValue = sourceText(required(legacyLogic, 'source', `${path}.logic.source`), `${path}.logic.source`);
-  return { inputs, outputs, knx_bindings: bindings, logic: { source: sourceValue } };
+  return { inputs, outputs, knx_bindings: bindings, logic: { source: sourceValue }, signals: [] };
 }
 function logicRevision(value: unknown, path: string): RevisionToken {
   const token = parseRevisionToken(value);
@@ -191,7 +208,7 @@ export async function saveAutomation(document: AutomationDocument, replacedRevis
   // The automation document remains the desktop's persisted authority. Its
   // config revision uses the document serializer's native representation;
   // browser-facing active/saved status and simulation tokens stay opaque.
-  const persisted = document.blocks?.length ? { blocks: document.blocks } : document;
+  const persisted = document.blocks?.length ? { ...(document.signals?.length ? { signals: document.signals } : {}), blocks: document.blocks } : document;
   const response = await fetchImpl('/api/automation', { method: 'PUT', headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify({ document: persisted }) });
   if (response.ok) {
     const source = record(await response.json(), 'save'); const cancellationRaw = field(source, 'cancelled_timers', 'cancelledTimers');
@@ -255,21 +272,49 @@ function validateSchedule(schedule: AutomationSchedule, blockIndex: number, sche
   }
 }
 function durationSeconds(value: string): number { return [...value.matchAll(/(\d+)([hms])/g)].reduce((total, match) => total + Number(match[1]) * ({ h: 3600, m: 60, s: 1 } as Record<string, number>)[match[2]], 0); }
-function validateBlock(blockValue: AutomationBlock, index: number, errors: AutomationFieldError[]): void {
-  const base = `blocks[${index}]`; if (!namePattern.test(blockValue.id)) addError(errors, `${base}.id`, 'must start with a lowercase ASCII letter and contain only lowercase letters, digits, or _'); const names = new Map<string, string>();
-  for (const [direction, endpoints] of [['inputs', blockValue.inputs], ['outputs', blockValue.outputs]] as const) endpoints.forEach((item, endpointIndex) => { const path = `${base}.${direction}[${endpointIndex}]`; if (!namePattern.test(item.name)) addError(errors, `${path}.name`, 'must start with a lowercase ASCII letter and contain only lowercase letters, digits, or _'); const prior = names.get(item.name); if (prior) addError(errors, `${path}.name`, `duplicates ${prior}`); else names.set(item.name, path); if (!DPTS.includes(item.dpt)) addError(errors, `${path}.dpt`, 'must be 1.001 or 5.001'); });
-  const bindingNames = new Map<string, string>(); const addresses = new Map<string, string>(); blockValue.knx_bindings.forEach((item, bindingIndex) => { const path = `${base}.knx_bindings[${bindingIndex}]`; const prior = bindingNames.get(item.endpoint); if (prior) addError(errors, `${path}.endpoint`, `duplicate binding; already declared at ${prior}`); else bindingNames.set(item.endpoint, path); if (!names.has(item.endpoint)) addError(errors, `${path}.endpoint`, 'must reference an existing endpoint'); const match = groupAddressPattern.exec(item.group_address); if (!match || Number(match[1]) > 31 || Number(match[2]) > 7 || Number(match[3]) > 255 || item.group_address === '0/0/0') addError(errors, `${path}.group_address`, 'must be a canonical non-broadcast group address'); const priorAddress = addresses.get(item.group_address); if (priorAddress) addError(errors, `${path}.group_address`, `duplicates ${priorAddress} within this block`); else addresses.set(item.group_address, path); });
-  for (const [name, path] of names) if (!bindingNames.has(name)) addError(errors, `${path}.name`, 'must have exactly one KNX binding'); if (!isRevisionToken(blockValue.revision)) addError(errors, `${base}.revision`, 'must be a non-negative decimal revision token'); blockValue.schedules.forEach((scheduleValue, scheduleIndex) => validateSchedule(scheduleValue, index, scheduleIndex, errors)); if (blockValue.schedules.length > 32) addError(errors, `${base}.schedules`, 'must contain at most 32 schedules'); if (typeof blockValue.source !== 'string' || blockValue.source.trim().length === 0) addError(errors, `${base}.source`, 'must contain a Lua source program'); else if (new TextEncoder().encode(blockValue.source).byteLength > MAX_SOURCE_BYTES) addError(errors, `${base}.source`, `must be at most ${MAX_SOURCE_BYTES} bytes`);
+function validateBlock(blockValue: AutomationBlock, index: number, errors: AutomationFieldError[], declaredSignals: Set<string>): void {
+  const base = `blocks[${index}]`;
+  if (!namePattern.test(blockValue.id)) addError(errors, `${base}.id`, 'must start with a lowercase ASCII letter and contain only lowercase letters, digits, and _');
+  const names = new Map<string, string>();
+  for (const [direction, endpoints] of [['inputs', blockValue.inputs], ['outputs', blockValue.outputs]] as const) endpoints.forEach((item, endpointIndex) => {
+    const path = `${base}.${direction}[${endpointIndex}]`;
+    if (!namePattern.test(item.name)) addError(errors, `${path}.name`, 'must start with a lowercase ASCII letter and contain only lowercase letters, digits, or _');
+    const prior = names.get(item.name); if (prior) addError(errors, `${path}.name`, `duplicates ${prior}`); else names.set(item.name, path);
+    if (!DPTS.includes(item.dpt)) addError(errors, `${path}.dpt`, 'must be 1.001 or 5.001');
+  });
+  const bindingNames = new Map<string, string>(); const addresses = new Map<string, string>();
+  blockValue.knx_bindings.forEach((item, bindingIndex) => {
+    const path = `${base}.knx_bindings[${bindingIndex}]`; const prior = bindingNames.get(item.endpoint);
+    if (prior) addError(errors, `${path}.endpoint`, `duplicate binding; already declared at ${prior}`); else bindingNames.set(item.endpoint, path);
+    if (!names.has(item.endpoint)) addError(errors, `${path}.endpoint`, 'must reference an existing endpoint');
+    const match = groupAddressPattern.exec(item.group_address); if (!match || Number(match[1]) > 31 || Number(match[2]) > 7 || Number(match[3]) > 255 || item.group_address === '0/0/0') addError(errors, `${path}.group_address`, 'must be a canonical non-broadcast group address');
+    const priorAddress = addresses.get(item.group_address); if (priorAddress) addError(errors, `${path}.group_address`, `duplicates ${priorAddress} within this block`); else addresses.set(item.group_address, path);
+  });
+  (blockValue.signal_bindings ?? []).forEach((item, bindingIndex) => {
+    const path = `${base}.signal_bindings[${bindingIndex}]`; const prior = bindingNames.get(item.endpoint);
+    if (prior) addError(errors, `${path}.endpoint`, `duplicate binding; already declared at ${prior}`); else bindingNames.set(item.endpoint, path);
+    if (!names.has(item.endpoint)) addError(errors, `${path}.endpoint`, 'must reference an existing endpoint');
+    if (!namePattern.test(item.signal)) addError(errors, `${path}.signal`, 'must be a valid signal name');
+    if (declaredSignals.size && !declaredSignals.has(item.signal)) addError(errors, `${path}.signal`, 'must reference an existing signal');
+  });
+  for (const [name, path] of names) if (!bindingNames.has(name)) addError(errors, `${path}.name`, 'must have exactly one KNX or signal binding');
+  if (!isRevisionToken(blockValue.revision)) addError(errors, `${base}.revision`, 'must be a non-negative decimal revision token');
+  blockValue.schedules.forEach((scheduleValue, scheduleIndex) => validateSchedule(scheduleValue, index, scheduleIndex, errors)); if (blockValue.schedules.length > 32) addError(errors, `${base}.schedules`, 'must contain at most 32 schedules');
+  if (typeof blockValue.source !== 'string' || blockValue.source.trim().length === 0) addError(errors, `${base}.source`, 'must contain a Lua source program'); else if (new TextEncoder().encode(blockValue.source).byteLength > MAX_SOURCE_BYTES) addError(errors, `${base}.source`, `must be at most ${MAX_SOURCE_BYTES} bytes`);
 }
-export function validateAutomation(document: AutomationDocument): AutomationFieldError[] { const errors: AutomationFieldError[] = []; const legacy = Boolean(document.logic && document.inputs && document.outputs && document.knx_bindings); const blocks = canonicalBlocks(document); if (!blocks.length) { addError(errors, 'blocks', 'must contain at least one block'); return errors; } if (blocks.length > MAX_BLOCKS) addError(errors, 'blocks', `must contain at most ${MAX_BLOCKS} blocks`); const ids = new Map<string, number>(); blocks.forEach((item, index) => { const prior = ids.get(item.id); if (prior !== undefined) addError(errors, `${legacy ? '' : `blocks[${index}].`}id`, `duplicates ${legacy ? '' : `blocks[${prior}].`}id`); else ids.set(item.id, index); const before = errors.length; validateBlock(item, index, errors); if (legacy) errors.splice(before, errors.length - before, ...errors.slice(before).map((error) => ({ ...error, path: error.path.replace(`blocks[${index}].`, '') === 'source' ? 'logic.source' : error.path.replace(`blocks[${index}].`, '') }))); }); return errors; }
+export function validateAutomation(document: AutomationDocument): AutomationFieldError[] {
+  const errors: AutomationFieldError[] = []; const legacy = Boolean(document.logic && document.inputs && document.outputs && document.knx_bindings); const blocks = canonicalBlocks(document); if (!blocks.length) { addError(errors, 'blocks', 'must contain at least one block'); return errors; } if (blocks.length > MAX_BLOCKS) addError(errors, 'blocks', `must contain at most ${MAX_BLOCKS} blocks`);
+  const declaredSignals = new Set<string>(); (document.signals ?? []).forEach((item, index) => { if (!namePattern.test(item.name)) addError(errors, `signals[${index}].name`, 'must start with a lowercase ASCII letter and contain only lowercase letters, digits, or _'); if (!DPTS.includes(item.dpt)) addError(errors, `signals[${index}].dpt`, 'must be 1.001 or 5.001'); if (declaredSignals.has(item.name)) addError(errors, `signals[${index}].name`, `duplicates ${item.name}`); declaredSignals.add(item.name); });
+  const ids = new Map<string, number>(); blocks.forEach((item, index) => { const prior = ids.get(item.id); if (prior !== undefined) addError(errors, `${legacy ? '' : `blocks[${index}].`}id`, `duplicates ${legacy ? '' : `blocks[${prior}].`}id`); else ids.set(item.id, index); const before = errors.length; validateBlock(item, index, errors, declaredSignals); if (legacy) errors.splice(before, errors.length - before, ...errors.slice(before).map((error) => ({ ...error, path: error.path.replace(`blocks[${index}].`, '') === 'source' ? 'logic.source' : error.path.replace(`blocks[${index}].`, '') }))); }); return errors;
+}
 export function blockWithSource(document: AutomationDocument, id: string, source: string): AutomationDocument { return { blocks: canonicalBlocks(document).map((item) => item.id === id ? { ...item, source } : item) } as AutomationDocument; }
 export function blockById(document: AutomationDocument, id: string): AutomationBlock | null { return canonicalBlocks(document).find((item) => item.id === id) ?? null; }
 export function renameEndpoint(document: AutomationDocument, blockIdOrFrom: string, fromOrTo: string, maybeTo?: string): AutomationDocument {
   const legacy = maybeTo === undefined; const blockId = legacy ? 'default' : blockIdOrFrom; const from = legacy ? blockIdOrFrom : fromOrTo; const to = legacy ? fromOrTo : maybeTo;
-  const next = { blocks: canonicalBlocks(document).map((blockValue) => blockValue.id === blockId ? { ...blockValue, inputs: blockValue.inputs.map((item) => item.name === from ? { ...item, name: to } : item), outputs: blockValue.outputs.map((item) => item.name === from ? { ...item, name: to } : item), knx_bindings: blockValue.knx_bindings.map((item) => item.endpoint === from ? { ...item, endpoint: to } : item) } : blockValue) };
-  return legacy ? { inputs: next.blocks[0]?.inputs ?? [], outputs: next.blocks[0]?.outputs ?? [], knx_bindings: next.blocks[0]?.knx_bindings ?? [], logic: { source: next.blocks[0]?.source ?? '' }, blocks: next.blocks } : next as AutomationDocument;
+  const next = { signals: document.signals, blocks: canonicalBlocks(document).map((blockValue) => blockValue.id === blockId ? { ...blockValue, inputs: blockValue.inputs.map((item) => item.name === from ? { ...item, name: to } : item), outputs: blockValue.outputs.map((item) => item.name === from ? { ...item, name: to } : item), knx_bindings: blockValue.knx_bindings.map((item) => item.endpoint === from ? { ...item, endpoint: to } : item), signal_bindings: (blockValue.signal_bindings ?? []).map((item) => item.endpoint === from ? { ...item, endpoint: to } : item) } : blockValue) };
+  return legacy ? { inputs: next.blocks[0]?.inputs ?? [], outputs: next.blocks[0]?.outputs ?? [], knx_bindings: next.blocks[0]?.knx_bindings ?? [], logic: { source: next.blocks[0]?.source ?? '' }, blocks: next.blocks, signals: document.signals } : next as AutomationDocument;
 }
-export function removeEndpoint(document: AutomationDocument, blockIdOrName: string, maybeName?: string): AutomationDocument { const legacy = maybeName === undefined; const blockId = legacy ? 'default' : blockIdOrName; const name = legacy ? blockIdOrName : maybeName; const blocks = canonicalBlocks(document).map((blockValue) => blockValue.id === blockId ? { ...blockValue, inputs: blockValue.inputs.filter((item) => item.name !== name), outputs: blockValue.outputs.filter((item) => item.name !== name) } : blockValue); return legacy ? { ...document, inputs: blocks[0]?.inputs ?? [], outputs: blocks[0]?.outputs ?? [], blocks } : { blocks } as AutomationDocument; }
+export function removeEndpoint(document: AutomationDocument, blockIdOrName: string, maybeName?: string): AutomationDocument { const legacy = maybeName === undefined; const blockId = legacy ? 'default' : blockIdOrName; const name = legacy ? blockIdOrName : maybeName; const blocks = canonicalBlocks(document).map((blockValue) => blockValue.id === blockId ? { ...blockValue, inputs: blockValue.inputs.filter((item) => item.name !== name), outputs: blockValue.outputs.filter((item) => item.name !== name), knx_bindings: blockValue.knx_bindings.filter((item) => item.endpoint !== name), signal_bindings: (blockValue.signal_bindings ?? []).filter((item) => item.endpoint !== name) } : blockValue); return legacy ? { ...document, inputs: blocks[0]?.inputs ?? [], outputs: blocks[0]?.outputs ?? [], blocks } : { ...document, blocks } as AutomationDocument; }
 export function removeBinding(document: AutomationDocument, blockIdOrIndex: string | number, indexMaybe?: number): AutomationDocument { const legacy = indexMaybe === undefined; const blockId = legacy ? 'default' : String(blockIdOrIndex); const index = legacy ? Number(blockIdOrIndex) : indexMaybe; const blocks = canonicalBlocks(document).map((blockValue) => blockValue.id === blockId ? { ...blockValue, knx_bindings: blockValue.knx_bindings.filter((_, current) => current !== index) } : blockValue); return legacy ? { ...document, blocks } : { blocks } as AutomationDocument; }
 export function compatibleEndpoints(document: AutomationDocument, blockIdOrDirection: string, directionOrDpt: 'input' | 'output' | Dpt, dptMaybe?: Dpt): AutomationEndpoint[] { const legacy = dptMaybe === undefined; const blockId = legacy ? 'default' : blockIdOrDirection; const direction = (legacy ? blockIdOrDirection : directionOrDpt) as 'input' | 'output'; const dptValue = (legacy ? directionOrDpt : dptMaybe) as Dpt; const blockValue = blockById(document, blockId); return (direction === 'input' ? blockValue?.inputs : blockValue?.outputs)?.filter((item) => item.dpt === dptValue) ?? []; }
 import { isRevisionToken, parseRevisionToken, type RevisionToken } from './revision';

@@ -52,3 +52,9 @@ mod runtime_tests {
     use super::*;
     include!("runtime_tests.rs");
 }
+
+#[cfg(test)]
+mod signal_tests {
+    use super::*;
+    include!("signal_tests.rs");
+}

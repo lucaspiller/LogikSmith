@@ -1,4 +1,4 @@
-use crate::diagnostics::{ConnectionState, DiagnosticStore, TelegramRecord};
+use crate::diagnostics::{ConnectionState, DiagnosticStore, ScheduleHandling, TelegramRecord};
 use crate::protocol::ProtocolError;
 use crate::web::WebError;
 use crate::*;
@@ -283,16 +283,19 @@ async fn run_session(
                                 let input = InputEvent::new(binding.endpoint.clone(), input_value);
                                 let block_id = binding.block_id.parse::<BlockId>().map_err(|error| ProtocolError::Field("block_id", error.to_string()))?;
                                 let started = Instant::now();
-                                let result = runtime.process_input_sampled(&block_id, input, sample.clone());
+                                let result = runtime.process_input_cascade_sampled(&block_id, input, sample.clone());
                                 let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
                                 match result {
-                                    Ok(Some(execution)) => {
-                                        store.record_block_execution(&execution, now, duration_us, &config.automation, None);
-                                        if let Ok(transition) = &execution.execution.outcome {
-                                            dispatch_effects(store, stdin, &config.automation, &execution.block_id, transition.outputs.clone(), &mut next_request_id, &mut pending).await?;
-                                        }
-                                    }
-                                    Ok(None) => store.set_runtime_projection_from_runtime(runtime, now),
+                                    Ok(executions) => record_and_dispatch_cascade(
+                                        runtime,
+                                        store,
+                                        &config.automation,
+                                        executions,
+                                        now,
+                                        duration_us,
+                                        Some((&mut *stdin, &mut next_request_id, &mut pending)),
+                                        None,
+                                    ).await?,
                                     Err(error) => tracing::warn!(target: "logiksmith", block = %binding.block_id, error = %error, "ignoring invalid logical input event"),
                                 }
                             }

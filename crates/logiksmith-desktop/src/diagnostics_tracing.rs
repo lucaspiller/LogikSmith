@@ -1,3 +1,10 @@
+static ACTIVE_STORE: OnceLock<Arc<Mutex<Option<DiagnosticStore>>>> = OnceLock::new();
+
+pub fn activate_tracing_store(store: DiagnosticStore) {
+    let slot = ACTIVE_STORE.get_or_init(|| Arc::new(Mutex::new(None)));
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(store);
+}
+
 pub fn tracing_layer() -> DiagnosticLayer {
     DiagnosticLayer {
         slot: ACTIVE_STORE

@@ -29,6 +29,7 @@
                     group_address: output_address.to_owned(),
                 },
             ],
+            signal_bindings: Vec::new(),
             source: "function handle(event, input) return nil end".to_owned(),
             schedules: Vec::new(),
         }
@@ -37,6 +38,7 @@
     #[test]
     fn nested_document_supports_sixty_four_blocks_and_rejects_sixty_five() {
         let document = AutomationDocument {
+            signals: Vec::new(),
             blocks: (0..64)
                 .map(|index| {
                     block(
@@ -50,6 +52,7 @@
         let runtime = build_automation(document.clone()).unwrap();
         assert_eq!(runtime.blocks.len(), 64);
         let too_many = AutomationDocument {
+            signals: Vec::new(),
             blocks: (0..65)
                 .map(|index| {
                     block(
@@ -66,6 +69,7 @@
     #[test]
     fn structural_revision_ignores_source_enabled_and_persisted_block_revision() {
         let mut first = AutomationDocument {
+            signals: Vec::new(),
             blocks: vec![block("one", "6/1/1", "6/2/1")],
         };
         let mut second = first.clone();
@@ -102,8 +106,67 @@
     }
 
     #[test]
+    fn schedule_only_block_does_not_need_an_input() {
+        let mut schedule_only = block("schedule_only", "2/1/1", "2/2/1");
+        schedule_only.inputs.clear();
+        schedule_only
+            .knx_bindings
+            .retain(|binding| binding.endpoint != "input");
+        schedule_only.schedules = vec![AutomationSchedule {
+            name: "turn_on".to_owned(),
+            enabled: true,
+            kind: "fixed".to_owned(),
+            at: Some("18:00".to_owned()),
+            every: None,
+            offset: None,
+            anchor: None,
+            earliest: None,
+            latest: None,
+            weekdays: None,
+            extra: Default::default(),
+        }];
+
+        assert!(build_automation(AutomationDocument {
+            signals: Vec::new(),
+            blocks: vec![schedule_only],
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn schedule_only_toml_may_omit_inputs() {
+        let document: AutomationDocument = toml::from_str(
+            r#"
+[[blocks]]
+id = "schedule_only"
+enabled = true
+source = "function handle() return nil end"
+
+[[blocks.schedules]]
+name = "turn_on"
+enabled = true
+kind = "fixed"
+at = "18:00"
+
+[[blocks.outputs]]
+name = "light"
+dpt = "1.001"
+
+[[blocks.knx_bindings]]
+endpoint = "light"
+group_address = "2/2/1"
+"#,
+        )
+        .expect("schedule-only TOML should load without an inputs field");
+
+        assert!(document.blocks[0].inputs.is_empty());
+        assert!(build_automation(document).is_ok());
+    }
+
+    #[test]
     fn shared_same_dpt_address_fans_out_in_declaration_order() {
         let runtime = build_automation(AutomationDocument {
+            signals: Vec::new(),
             blocks: vec![
                 block("first", "3/1/1", "3/2/1"),
                 block("second", "3/1/1", "3/2/2"),
@@ -129,6 +192,7 @@
         let mut conflicting = block("second", "4/1/1", "4/2/1");
         conflicting.inputs[0].dpt = "5.001".to_owned();
         let errors = build_automation(AutomationDocument {
+            signals: Vec::new(),
             blocks: vec![block("first", "4/1/1", "4/2/2"), conflicting],
         })
         .unwrap_err();
@@ -141,6 +205,7 @@
         let mut duplicate = block("first", "5/1/1", "5/2/1");
         duplicate.knx_bindings[1].group_address = "5/1/1".to_owned();
         let errors = build_automation(AutomationDocument {
+            signals: Vec::new(),
             blocks: vec![duplicate],
         })
         .unwrap_err();
@@ -149,6 +214,82 @@
                 .iter()
                 .any(|error| error.path == "blocks[0].knx_bindings[1].group_address")
         );
+    }
+
+    #[test]
+    fn signals_round_trip_and_share_endpoint_binding_validation() {
+        let mut producer = block("producer", "7/1/1", "7/2/1");
+        producer.knx_bindings.retain(|binding| binding.endpoint != "light");
+        producer.signal_bindings = vec![SignalBinding {
+            endpoint: "light".to_owned(),
+            signal: "house_occupied".to_owned(),
+        }];
+        let document = AutomationDocument {
+            signals: vec![AutomationSignal {
+                name: "house_occupied".to_owned(),
+                dpt: "1.001".to_owned(),
+            }],
+            blocks: vec![producer],
+        };
+        let runtime = build_automation(document.clone()).expect("valid signal binding");
+        assert_eq!(runtime.signals[0].name, "house_occupied");
+        assert_eq!(runtime.output_to_signal.len(), 1);
+        assert_eq!(runtime.signal_to_inputs.len(), 0);
+
+        let path = std::env::temp_dir().join(format!(
+            "logiksmith-signals-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, serialize_automation(&document, 0).unwrap()).unwrap();
+        assert_eq!(load_automation(&path).unwrap().0, document);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn signals_reject_unknown_or_conflicting_bindings_and_duplicate_producers() {
+        let mut first = block("first", "8/1/1", "8/2/1");
+        first.knx_bindings.retain(|binding| binding.endpoint != "light");
+        first.signal_bindings = vec![SignalBinding {
+            endpoint: "light".to_owned(),
+            signal: "allowed".to_owned(),
+        }];
+        let mut second = block("second", "8/1/2", "8/2/2");
+        second.knx_bindings.retain(|binding| binding.endpoint != "light");
+        second.signal_bindings = vec![SignalBinding {
+            endpoint: "light".to_owned(),
+            signal: "allowed".to_owned(),
+        }];
+        let errors = build_automation(AutomationDocument {
+            signals: vec![AutomationSignal {
+                name: "allowed".to_owned(),
+                dpt: "1.001".to_owned(),
+            }],
+            blocks: vec![first, second],
+        })
+        .unwrap_err();
+        assert!(errors.iter().any(|error| error.path == "blocks[1].signal_bindings[0].signal"));
+
+        let mut mismatched = block("mismatched", "9/1/1", "9/2/1");
+        mismatched.knx_bindings.retain(|binding| binding.endpoint != "light");
+        mismatched.signal_bindings = vec![SignalBinding {
+            endpoint: "light".to_owned(),
+            signal: "unknown".to_owned(),
+        }];
+        let errors = build_automation(AutomationDocument {
+            signals: vec![AutomationSignal {
+                name: "allowed".to_owned(),
+                dpt: "1.001".to_owned(),
+            }],
+            blocks: vec![mismatched],
+        })
+        .unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.path == "blocks[0].signal_bindings[0].signal"));
     }
 
     #[test]

@@ -6,6 +6,7 @@
 
     fn store() -> DiagnosticStore {
         let runtime = crate::build_automation(crate::AutomationDocument {
+            signals: Vec::new(),
             blocks: vec![crate::AutomationBlock {
                 id: "test".to_owned(),
                 revision: 1,
@@ -48,6 +49,7 @@
                         group_address: "2/3/53".to_owned(),
                     },
                 ],
+                signal_bindings: Vec::new(),
                 source: "function handle(event, input) return nil end".to_owned(),
                 schedules: Vec::new(),
             }],
@@ -71,6 +73,7 @@
                 .as_nanos()
         ));
         let document = AutomationDocument {
+            signals: Vec::new(),
             blocks: vec![crate::AutomationBlock {
                 id: "test".to_owned(),
                 revision: 1,
@@ -93,6 +96,7 @@
                         group_address: "1/1/2".to_owned(),
                     },
                 ],
+                signal_bindings: Vec::new(),
                 source: "function handle() end".to_owned(),
                 schedules: Vec::new(),
             }],
@@ -109,6 +113,7 @@
     #[test]
     fn block_revisions_increment_only_for_changed_blocks() {
         let current = AutomationDocument {
+            signals: Vec::new(),
             blocks: vec![
                 crate::AutomationBlock {
                     id: "first".to_owned(),
@@ -117,6 +122,7 @@
                     inputs: vec![],
                     outputs: vec![],
                     knx_bindings: vec![],
+                    signal_bindings: vec![],
                     source: "return 1".to_owned(),
                     schedules: Vec::new(),
                 },
@@ -127,6 +133,7 @@
                     inputs: vec![],
                     outputs: vec![],
                     knx_bindings: vec![],
+                    signal_bindings: vec![],
                     source: "return 2".to_owned(),
                     schedules: Vec::new(),
                 },
@@ -281,6 +288,7 @@
         schedules: Vec<crate::AutomationSchedule>,
     ) -> crate::AutomationRuntime {
         crate::build_automation(crate::AutomationDocument {
+            signals: Vec::new(),
             blocks: vec![crate::AutomationBlock {
                 id: "test".to_owned(),
                 revision: 1,
@@ -313,6 +321,7 @@
                         group_address: "2/3/52".to_owned(),
                     },
                 ],
+                signal_bindings: Vec::new(),
                 source: source.to_owned(),
                 schedules,
             }],

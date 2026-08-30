@@ -127,6 +127,7 @@ pub fn simulation_response(
     logic_revision: u64,
     automation: &AutomationRuntime,
 ) -> SimulationResponse {
+    let signal_effects = signal_effect_records(&execution.signal_effects);
     let (status, effects, transition, error) = match &execution.outcome {
         Ok(effects) => (
             LogicExecutionStatus::Succeeded,
@@ -135,7 +136,11 @@ pub fn simulation_response(
                 .iter()
                 .filter_map(|effect| effect_record(effect, automation))
                 .collect(),
-            Some(transition_record(effects, automation)),
+            Some({
+                let mut transition = transition_record(effects, automation);
+                transition.signal_effects = signal_effects.clone();
+                transition
+            }),
             None,
         ),
         Err(error) => (
@@ -166,6 +171,12 @@ pub fn simulation_response(
             .map(|timer| pending_timer_record(timer, logic_revision))
             .collect(),
         effects,
+        signal_effects,
+        eligible_consumers: execution
+            .eligible_consumers
+            .iter()
+            .map(signal_consumer_record)
+            .collect(),
         timer_effects: transition
             .as_ref()
             .map(|transition| transition.timers.clone())
@@ -181,6 +192,7 @@ pub fn simulation_response_for_block(
     automation: &AutomationRuntime,
 ) -> SimulationResponse {
     let execution = &tagged.execution;
+    let signal_effects = signal_effect_records(&execution.signal_effects);
     let (status, effects, transition, error) = match &execution.outcome {
         Ok(effects) => (
             LogicExecutionStatus::Succeeded,
@@ -189,11 +201,12 @@ pub fn simulation_response_for_block(
                 .iter()
                 .filter_map(|effect| effect_record_for_block(effect, automation, &tagged.block_id))
                 .collect(),
-            Some(transition_record_for_block(
-                effects,
-                automation,
-                &tagged.block_id,
-            )),
+            Some({
+                let mut transition =
+                    transition_record_for_block(effects, automation, &tagged.block_id);
+                transition.signal_effects = signal_effects.clone();
+                transition
+            }),
             None,
         ),
         Err(error) => (
@@ -220,6 +233,12 @@ pub fn simulation_response_for_block(
             .map(|timer| pending_timer_record(timer, logic_revision))
             .collect(),
         effects,
+        signal_effects,
+        eligible_consumers: execution
+            .eligible_consumers
+            .iter()
+            .map(signal_consumer_record)
+            .collect(),
         timer_effects: transition
             .as_ref()
             .map(|transition| transition.timers.clone())
@@ -314,6 +333,7 @@ fn transition_record(
         return LogicalTransitionRecord {
             state: state_record(&transition.state),
             effects: Vec::new(),
+            signal_effects: Vec::new(),
             timers: transition_timer_records(transition),
         };
     };
@@ -332,6 +352,7 @@ fn transition_record_for_block(
             .iter()
             .filter_map(|effect| effect_record_for_block(effect, automation, block_id))
             .collect(),
+        signal_effects: Vec::new(),
         timers: transition_timer_records(transition),
     }
 }
@@ -675,6 +696,7 @@ fn automation_snapshot(runtime: &AutomationRuntime) -> AutomationSnapshot {
             inputs: Vec::new(),
             outputs: Vec::new(),
             knx_bindings: Vec::new(),
+            signal_bindings: Vec::new(),
             logic: LogicSourceSnapshot {
                 source: String::new(),
             },
@@ -701,23 +723,35 @@ fn block_automation_snapshot_with_source(
     block: &crate::BlockRuntime,
     source: &str,
 ) -> AutomationSnapshot {
-    let endpoint = |name: &str, dpt: Dpt| EndpointSnapshot {
-        name: name.to_owned(),
-        dpt: DptMessage::from_core(dpt),
+    let endpoint = |name: &EndpointName, dpt: Dpt| {
+        let signal = block.endpoint_to_signal.get(name).cloned();
+        EndpointSnapshot {
+            name: name.to_string(),
+            dpt: DptMessage::from_core(dpt),
+            binding_kind: if block.endpoint_to_address.contains_key(name) {
+                "knx"
+            } else if signal.is_some() {
+                "signal"
+            } else {
+                "unbound"
+            }
+            .to_owned(),
+            signal,
+        }
     };
     let inputs = block
         .engine_config
         .endpoints
         .iter()
         .filter(|item| item.direction == EndpointDirection::Input)
-        .map(|item| endpoint(item.name.as_str(), item.dpt))
+        .map(|item| endpoint(&item.name, item.dpt))
         .collect();
     let outputs = block
         .engine_config
         .endpoints
         .iter()
         .filter(|item| item.direction == EndpointDirection::Output)
-        .map(|item| endpoint(item.name.as_str(), item.dpt))
+        .map(|item| endpoint(&item.name, item.dpt))
         .collect();
     let mut knx_bindings: Vec<_> = block
         .endpoint_to_address
@@ -728,22 +762,24 @@ fn block_automation_snapshot_with_source(
         })
         .collect();
     knx_bindings.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
+    let mut signal_bindings: Vec<_> = block
+        .endpoint_to_signal
+        .iter()
+        .map(|(endpoint, signal)| SignalBindingSnapshot {
+            endpoint: endpoint.to_string(),
+            signal: signal.clone(),
+        })
+        .collect();
+    signal_bindings.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     AutomationSnapshot {
         inputs,
         outputs,
         knx_bindings,
+        signal_bindings,
         logic: LogicSourceSnapshot {
             source: source.to_owned(),
         },
     }
-}
-
-fn first_block_revision(document: &crate::AutomationDocument) -> u64 {
-    document
-        .blocks
-        .first()
-        .map(|block| block.revision.max(1))
-        .unwrap_or(1)
 }
 
 /// Refreshes only active document-derived projections. Structural saved
@@ -901,6 +937,9 @@ fn snapshot_locked(inner: &Inner, _now: logiksmith_core::MonotonicMs) -> Snapsho
                 knx_bindings: automation
                     .map(|automation| automation.knx_bindings.clone())
                     .unwrap_or_default(),
+                signal_bindings: automation
+                    .map(|automation| automation.signal_bindings.clone())
+                    .unwrap_or_default(),
                 values: ValuesSnapshot {
                     endpoints: inner
                         .block_endpoint_values
@@ -953,11 +992,6 @@ fn snapshot_locked(inner: &Inner, _now: logiksmith_core::MonotonicMs) -> Snapsho
         telegrams: inner.telegrams.iter().cloned().collect(),
         logs: inner.logs.iter().cloned().collect(),
         blocks,
+        signals: inner.signals.clone(),
     }
-}
-
-static ACTIVE_STORE: OnceLock<Arc<Mutex<Option<DiagnosticStore>>>> = OnceLock::new();
-pub fn activate_tracing_store(store: DiagnosticStore) {
-    let slot = ACTIVE_STORE.get_or_init(|| Arc::new(Mutex::new(None)));
-    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(store);
 }

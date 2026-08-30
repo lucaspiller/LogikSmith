@@ -233,10 +233,13 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone)]
 pub struct AutomationRuntime {
     pub document: AutomationDocument,
+    pub signals: Vec<SignalRuntime>,
     pub core_config: CoreRuntimeConfig,
     pub blocks: Vec<BlockRuntime>,
     pub address_to_inputs: HashMap<GroupAddress, Vec<BlockInputBinding>>,
     pub output_to_address: HashMap<(String, EndpointName), GroupAddress>,
+    pub signal_to_inputs: HashMap<String, Vec<BlockSignalInputBinding>>,
+    pub output_to_signal: HashMap<(String, EndpointName), String>,
     pub address_dpts: HashMap<GroupAddress, Dpt>,
     pub structural_revision: u64,
     pub document_revision: u64,
@@ -249,6 +252,7 @@ pub struct BlockRuntime {
     pub enabled: bool,
     pub engine_config: EngineConfig,
     pub endpoint_to_address: HashMap<EndpointName, GroupAddress>,
+    pub endpoint_to_signal: HashMap<EndpointName, String>,
     pub endpoint_dpts: HashMap<EndpointName, Dpt>,
     /// Validated schedule definitions owned by this block. The desktop keeps
     /// them beside the KNX maps for diagnostics and simulation routing; the
@@ -264,6 +268,20 @@ pub struct BlockInputBinding {
     pub address: GroupAddress,
 }
 
+#[derive(Debug, Clone)]
+pub struct SignalRuntime {
+    pub name: String,
+    pub dpt: Dpt,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockSignalInputBinding {
+    pub block_id: String,
+    pub endpoint: EndpointName,
+    pub dpt: Dpt,
+    pub signal: String,
+}
+
 impl AutomationRuntime {
     pub fn block(&self, id: &str) -> Option<&BlockRuntime> {
         self.blocks.iter().find(|block| block.id == id)
@@ -277,7 +295,16 @@ impl AutomationRuntime {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AutomationDocument {
+    #[serde(default)]
+    pub signals: Vec<AutomationSignal>,
     pub blocks: Vec<AutomationBlock>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationSignal {
+    pub name: String,
+    pub dpt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -287,9 +314,14 @@ pub struct AutomationBlock {
     #[serde(default = "default_block_revision")]
     pub revision: u64,
     pub enabled: bool,
+    #[serde(default)]
     pub inputs: Vec<AutomationEndpoint>,
+    #[serde(default)]
     pub outputs: Vec<AutomationEndpoint>,
+    #[serde(default)]
     pub knx_bindings: Vec<KnxBinding>,
+    #[serde(default)]
+    pub signal_bindings: Vec<SignalBinding>,
     pub source: String,
     #[serde(default)]
     pub schedules: Vec<AutomationSchedule>,
@@ -346,6 +378,13 @@ pub struct AutomationEndpoint {
 pub struct KnxBinding {
     pub endpoint: String,
     pub group_address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SignalBinding {
+    pub endpoint: String,
+    pub signal: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

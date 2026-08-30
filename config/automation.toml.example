@@ -1,5 +1,15 @@
 # Copy this file to config/automation.toml and replace every KNX placeholder.
 # Use only harmless visible actuators for manual tests.
+# Internal signals are declared once at the document root and bind existing
+# input/output endpoints with [[blocks.signal_bindings]]. For example:
+#
+# [[signals]]
+# name = "house_occupied"
+# dpt = "1.001"
+#
+# [[blocks.signal_bindings]]
+# endpoint = "occupied"
+# signal = "house_occupied"
 
 [[blocks]]
 id = "staircase"
@@ -94,3 +104,38 @@ group_address = "REPLACE_WITH_SECOND_INPUT_GROUP_ADDRESS"
 [[blocks.knx_bindings]]
 endpoint = "test_light"
 group_address = "REPLACE_WITH_SECOND_SAFE_OUTPUT_GROUP_ADDRESS"
+
+[[blocks]]
+id = "outdoor_lighting"
+revision = 1
+enabled = true
+source = '''
+function handle(event, input, meta, state)
+    if event.type == "schedule" and event.schedule == "outdoor_lights_on" then
+        return { outputs = { outdoor_lights = true } }
+    elseif event.type == "schedule" and event.schedule == "outdoor_lights_off" then
+        return { outputs = { outdoor_lights = false } }
+    end
+end
+'''
+
+[[blocks.schedules]]
+name = "outdoor_lights_on"
+enabled = true
+kind = "astronomical"
+anchor = "sunset"
+offset = "-15m"
+
+[[blocks.schedules]]
+name = "outdoor_lights_off"
+enabled = true
+kind = "fixed"
+at = "22:15"
+
+[[blocks.outputs]]
+name = "outdoor_lights"
+dpt = "1.001"
+
+[[blocks.knx_bindings]]
+endpoint = "outdoor_lights"
+group_address = "REPLACE_WITH_OUTDOOR_LIGHTS_GROUP_ADDRESS"

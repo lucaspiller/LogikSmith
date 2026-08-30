@@ -11,9 +11,49 @@ impl Runtime {
             .into_iter()
             .map(LogicBlock::try_new)
             .collect::<Result<Vec<_>, _>>()?;
+        let mut signal_indexes = BTreeMap::new();
+        let mut signals = config
+            .signals
+            .into_iter()
+            .enumerate()
+            .map(|(index, signal)| {
+                signal_indexes.insert(signal.name.clone(), index);
+                SignalState {
+                    config: signal,
+                    value: None,
+                    observed_at: None,
+                    changed_at: None,
+                    producer: None,
+                    producing_execution: None,
+                    consumers: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        for block in &blocks {
+            for binding in &block.config.signal_bindings {
+                let endpoint = block
+                    .config
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.name == binding.endpoint)
+                    .expect("validated signal endpoint");
+                let Some(signal_index) = signal_indexes.get(&binding.signal).copied() else {
+                    continue;
+                };
+                let identity = SignalEndpointId::new(block.config.id.clone(), endpoint.name.clone());
+                if endpoint.direction == EndpointDirection::Output {
+                    signals[signal_index].producer = Some(identity);
+                } else {
+                    signals[signal_index].consumers.push(identity);
+                }
+            }
+        }
         Ok(Self {
             blocks,
+            signals,
+            signal_indexes,
             last_accepted_at: None,
+            next_execution_id: 1,
             site,
             schedule_cursors: BTreeMap::new(),
             schedule_structural_revision: None,
@@ -30,11 +70,12 @@ impl Runtime {
     }
 
     pub fn config(&self) -> RuntimeConfig {
-        RuntimeConfig::with_site(
+        RuntimeConfig::with_signals_and_site(
             self.blocks
                 .iter()
                 .map(|block| block.config.clone())
                 .collect(),
+            self.signals.iter().map(|signal| signal.config.clone()).collect(),
             self.site.clone(),
         )
     }
@@ -58,6 +99,7 @@ impl Runtime {
                 .iter()
                 .map(|block| block.snapshot_at(now))
                 .collect(),
+            signals: self.signal_snapshots_at(now),
             last_accepted_at: self.last_accepted_at,
         }
     }
@@ -126,6 +168,8 @@ impl Runtime {
                 block_id: block_id.clone(),
                 error,
             })?;
+        let mut execution = execution;
+        self.assign_execution_id(&mut execution, None);
         self.last_accepted_at = Some(now);
         Ok(Some(BlockExecution {
             block_id: block_id.clone(),
@@ -171,6 +215,8 @@ impl Runtime {
                 block_id: block_id.clone(),
                 error,
             })?;
+        let mut execution = execution;
+        self.assign_execution_id(&mut execution, None);
         self.last_accepted_at = Some(sample.monotonic_ms);
         Ok(Some(BlockExecution {
             block_id: block_id.clone(),
@@ -229,6 +275,10 @@ impl Runtime {
                 block_id: block_id.clone(),
                 error,
             })?;
+        let mut execution = execution;
+        if let Some(execution) = execution.as_mut() {
+            self.assign_execution_id(execution, None);
+        }
         self.last_accepted_at = Some(now);
         Ok(execution.map(|execution| BlockExecution {
             block_id,
@@ -286,6 +336,10 @@ impl Runtime {
                 block_id: block_id.clone(),
                 error,
             })?;
+        let mut execution = execution;
+        if let Some(execution) = execution.as_mut() {
+            self.assign_execution_id(execution, None);
+        }
         self.last_accepted_at = Some(sample.monotonic_ms);
         Ok(execution.map(|execution| BlockExecution {
             block_id,
@@ -634,77 +688,12 @@ impl Runtime {
                 block_id: block_id.clone(),
                 error,
             })?;
+        let mut execution = execution;
+        self.assign_execution_id(&mut execution, None);
         Ok(Some(BlockExecution {
             block_id,
             execution,
         }))
-    }
-
-    /// Validates a simulation request (known schedule, genuine occurrence,
-    /// current logic and structural revisions) and evaluates it without
-    /// mutating the runtime. The time context is frozen at the occurrence.
-    pub fn simulate_schedule(
-        &self,
-        request: ScheduleSimulationRequest,
-    ) -> Result<BlockExecution, ScheduleSimulationError> {
-        let block = self
-            .blocks
-            .iter()
-            .find(|block| block.id() == &request.block_id)
-            .ok_or(ScheduleSimulationError::UnknownSchedule)?;
-        let block_schedule = block
-            .config
-            .schedules
-            .iter()
-            .find(|block_schedule| block_schedule.name == request.schedule)
-            .ok_or(ScheduleSimulationError::UnknownSchedule)?;
-        let is_occurrence = schedule::next_occurrence_after(
-            &block_schedule.rule,
-            &self.site,
-            request.occurrence_at_utc_ms.saturating_sub(1),
-        ) == Some(request.occurrence_at_utc_ms);
-        if !is_occurrence {
-            return Err(ScheduleSimulationError::NotOccurrence);
-        }
-        let Some(cursor) = self
-            .schedule_cursors
-            .get(&(request.block_id.clone(), request.schedule.clone()))
-        else {
-            return Err(ScheduleSimulationError::StaleStructuralRevision);
-        };
-        // A simulation selection must come from the current preview window,
-        // not from an arbitrary historical occurrence. The preview API is
-        // stateless, so the cursor's next future occurrence is the lower
-        // bound that the core can validate without adding a server token.
-        let Some(next_previewable) = cursor.next_occurrence_utc_ms else {
-            return Err(ScheduleSimulationError::NotOccurrence);
-        };
-        if request.occurrence_at_utc_ms < next_previewable {
-            return Err(ScheduleSimulationError::NotOccurrence);
-        }
-        if cursor.structural_revision != request.expected_structural_revision
-            || block.active_logic_revision() != request.expected_logic_revision
-        {
-            return Err(ScheduleSimulationError::StaleStructuralRevision);
-        }
-        let trigger = ScheduleTrigger {
-            block_id: request.block_id.clone(),
-            name: request.schedule.clone(),
-            kind: block_schedule.rule.kind(),
-            scheduled_for_utc_ms: request.occurrence_at_utc_ms,
-            detected_at_utc_ms: request.occurrence_at_utc_ms,
-            coalesced_count: 0,
-            structural_revision: request.expected_structural_revision,
-        };
-        let execution = block.engine.simulate_schedule_trigger(
-            trigger,
-            &self.site,
-            Some(request.occurrence_at_utc_ms),
-        );
-        Ok(BlockExecution {
-            block_id: request.block_id,
-            execution,
-        })
     }
 
     /// A per-schedule status view for every configured schedule in block and
@@ -748,70 +737,6 @@ impl Runtime {
             }
         }
         statuses
-    }
-
-    pub fn simulate_input(
-        &self,
-        block_id: &BlockId,
-        scenario: SimulationScenario,
-    ) -> Result<BlockExecution, RuntimeSimulationError> {
-        let block = self
-            .block(block_id)
-            .ok_or_else(|| RuntimeSimulationError::UnknownBlock(block_id.clone()))?;
-        let execution = block.engine.simulate_input(scenario).map_err(|error| {
-            RuntimeSimulationError::Block {
-                block_id: block_id.clone(),
-                error,
-            }
-        })?;
-        Ok(BlockExecution {
-            block_id: block_id.clone(),
-            execution,
-        })
-    }
-
-    pub fn simulate_input_with_state(
-        &self,
-        block_id: &BlockId,
-        scenario: SimulationScenario,
-        state: TransientState,
-        pending_timers: Vec<PendingTimer>,
-        now: MonotonicMs,
-    ) -> Result<BlockExecution, RuntimeSimulationError> {
-        let block = self
-            .block(block_id)
-            .ok_or_else(|| RuntimeSimulationError::UnknownBlock(block_id.clone()))?;
-        let execution = block
-            .engine
-            .simulate_input_with_state(scenario, state, pending_timers, now)
-            .map_err(|error| RuntimeSimulationError::Block {
-                block_id: block_id.clone(),
-                error,
-            })?;
-        Ok(BlockExecution {
-            block_id: block_id.clone(),
-            execution,
-        })
-    }
-
-    pub fn simulate_timer(
-        &self,
-        block_id: &BlockId,
-        scenario: TimerSimulationScenario,
-    ) -> Result<BlockExecution, RuntimeSimulationError> {
-        let block = self
-            .block(block_id)
-            .ok_or_else(|| RuntimeSimulationError::UnknownBlock(block_id.clone()))?;
-        let execution = block.engine.simulate_timer(scenario).map_err(|error| {
-            RuntimeSimulationError::Block {
-                block_id: block_id.clone(),
-                error,
-            }
-        })?;
-        Ok(BlockExecution {
-            block_id: block_id.clone(),
-            execution,
-        })
     }
 
     /// Validates every source in the batch before changing any active block.

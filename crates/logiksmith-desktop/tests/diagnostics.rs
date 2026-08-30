@@ -1,13 +1,14 @@
 use logiksmith_core::{BlockId, InputEvent, MonotonicMs, Runtime, TypedValue};
 use logiksmith_desktop::{
-    AutomationBlock, AutomationDocument, AutomationEndpoint, BoolValueMessage, DptMessage,
-    KnxBinding, ValueMessage, build_automation,
+    AutomationBlock, AutomationDocument, AutomationEndpoint, AutomationSignal, BoolValueMessage,
+    DptMessage, KnxBinding, SignalBinding, ValueMessage, build_automation,
     diagnostics::{DiagnosticStore, LogicalTriggerRecord},
 };
 use std::path::PathBuf;
 
 fn make_runtime(source: &str) -> logiksmith_desktop::AutomationRuntime {
     build_automation(AutomationDocument {
+        signals: Vec::new(),
         blocks: vec![AutomationBlock {
             id: "test".to_owned(),
             revision: 1,
@@ -40,6 +41,7 @@ fn make_runtime(source: &str) -> logiksmith_desktop::AutomationRuntime {
                     group_address: "2/3/52".to_owned(),
                 },
             ],
+            signal_bindings: Vec::new(),
             source: source.to_owned(),
             schedules: Vec::new(),
         }],
@@ -53,6 +55,158 @@ fn bool_event(name: &str, value: bool) -> InputEvent {
 
 fn store(runtime: &logiksmith_desktop::AutomationRuntime) -> DiagnosticStore {
     DiagnosticStore::new(runtime, PathBuf::from("automation.toml"), 1)
+}
+
+#[test]
+fn signal_snapshot_and_endpoint_binding_shape_are_serialized() {
+    let runtime = build_automation(AutomationDocument {
+        signals: vec![AutomationSignal {
+            name: "house_occupied".to_owned(),
+            dpt: "1.001".to_owned(),
+        }],
+        blocks: vec![
+            AutomationBlock {
+                id: "source".to_owned(),
+                revision: 1,
+                enabled: true,
+                inputs: vec![AutomationEndpoint {
+                    name: "switch".to_owned(),
+                    dpt: "1.001".to_owned(),
+                }],
+                outputs: vec![AutomationEndpoint {
+                    name: "occupied".to_owned(),
+                    dpt: "1.001".to_owned(),
+                }],
+                knx_bindings: vec![KnxBinding {
+                    endpoint: "switch".to_owned(),
+                    group_address: "1/1/1".to_owned(),
+                }],
+                signal_bindings: vec![SignalBinding {
+                    endpoint: "occupied".to_owned(),
+                    signal: "house_occupied".to_owned(),
+                }],
+                source: "function handle(event, input, meta) return nil end".to_owned(),
+                schedules: Vec::new(),
+            },
+            AutomationBlock {
+                id: "consumer".to_owned(),
+                revision: 1,
+                enabled: true,
+                inputs: vec![AutomationEndpoint {
+                    name: "occupied".to_owned(),
+                    dpt: "1.001".to_owned(),
+                }],
+                outputs: vec![AutomationEndpoint {
+                    name: "light".to_owned(),
+                    dpt: "1.001".to_owned(),
+                }],
+                knx_bindings: vec![KnxBinding {
+                    endpoint: "light".to_owned(),
+                    group_address: "1/1/2".to_owned(),
+                }],
+                signal_bindings: vec![SignalBinding {
+                    endpoint: "occupied".to_owned(),
+                    signal: "house_occupied".to_owned(),
+                }],
+                source: "function handle(event, input, meta) return nil end".to_owned(),
+                schedules: Vec::new(),
+            },
+        ],
+    })
+    .expect("valid signal automation");
+    let json = serde_json::to_value(store(&runtime).snapshot()).unwrap();
+    assert_eq!(json["signals"][0]["name"], "house_occupied");
+    assert_eq!(json["signals"][0]["status"], "unknown");
+    assert!(json["signals"][0]["structuralRevision"].is_string());
+    assert_eq!(json["signals"][0]["producer"]["blockId"], "source");
+    assert_eq!(json["signals"][0]["consumers"][0]["endpoint"], "occupied");
+    assert_eq!(json["blocks"][0]["outputs"][0]["bindingKind"], "signal");
+    assert_eq!(json["blocks"][0]["outputs"][0]["signal"], "house_occupied");
+    assert_eq!(json["blocks"][1]["inputs"][0]["bindingKind"], "signal");
+}
+
+#[test]
+fn cascade_execution_diagnostics_keep_signal_provenance() {
+    let automation = build_automation(AutomationDocument {
+        signals: vec![AutomationSignal {
+            name: "occupied".to_owned(),
+            dpt: "1.001".to_owned(),
+        }],
+        blocks: vec![
+            AutomationBlock {
+                id: "source".to_owned(),
+                revision: 1,
+                enabled: true,
+                inputs: vec![AutomationEndpoint {
+                    name: "trigger".to_owned(),
+                    dpt: "1.001".to_owned(),
+                }],
+                outputs: vec![AutomationEndpoint {
+                    name: "out".to_owned(),
+                    dpt: "1.001".to_owned(),
+                }],
+                knx_bindings: vec![KnxBinding {
+                    endpoint: "trigger".to_owned(),
+                    group_address: "1/2/1".to_owned(),
+                }],
+                signal_bindings: vec![SignalBinding {
+                    endpoint: "out".to_owned(),
+                    signal: "occupied".to_owned(),
+                }],
+                source:
+                    "function handle(event, input) return { outputs = { out = input.trigger } } end"
+                        .to_owned(),
+                schedules: Vec::new(),
+            },
+            AutomationBlock {
+                id: "consumer".to_owned(),
+                revision: 1,
+                enabled: true,
+                inputs: vec![AutomationEndpoint {
+                    name: "occupied".to_owned(),
+                    dpt: "1.001".to_owned(),
+                }],
+                outputs: Vec::new(),
+                knx_bindings: Vec::new(),
+                signal_bindings: vec![SignalBinding {
+                    endpoint: "occupied".to_owned(),
+                    signal: "occupied".to_owned(),
+                }],
+                source: "function handle(event, input) return nil end".to_owned(),
+                schedules: Vec::new(),
+            },
+        ],
+    })
+    .expect("valid cascade automation");
+    let mut engine = Runtime::new(automation.core_config.clone());
+    let executions = engine
+        .process_input_cascade(
+            &BlockId::parse("source").unwrap(),
+            bool_event("trigger", true),
+            MonotonicMs(10),
+        )
+        .unwrap();
+    assert_eq!(executions.len(), 2);
+    let store = store(&automation);
+    for execution in &executions {
+        store.record_block_execution(execution, MonotonicMs(10), 1, &automation, None);
+    }
+    store.set_runtime_projection_from_runtime(&engine, MonotonicMs(10));
+
+    let snapshot = store.snapshot_at(MonotonicMs(10));
+    assert_eq!(
+        snapshot.signals[0].value,
+        Some(ValueMessage::Bool(BoolValueMessage {
+            kind: "bool".to_owned(),
+            value: true,
+        }))
+    );
+    assert_eq!(snapshot.signals[0].recent_changes[0].execution_id, Some(1));
+    let consumer = &snapshot.blocks[1].executions[0];
+    assert_eq!(consumer.execution_id, 2);
+    assert_eq!(consumer.causal_producer_execution_id, Some(1));
+    assert_eq!(consumer.causal_signal.as_deref(), Some("occupied"));
+    assert_eq!(consumer.causal_links[0].signal.as_deref(), Some("occupied"));
 }
 
 #[test]

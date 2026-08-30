@@ -252,6 +252,10 @@ pub struct SourceActivation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Execution {
+    /// Runtime-assigned identity. Simulations intentionally leave this empty.
+    pub id: Option<ExecutionId>,
+    /// The execution that produced the signal which triggered this execution.
+    pub causal_producer: Option<ExecutionId>,
     pub logic_revision: LogicRevision,
     pub trigger: Trigger,
     pub inputs: Vec<InputSnapshot>,
@@ -259,6 +263,12 @@ pub struct Execution {
     pub state_after: TransientState,
     pub pending_timers: Vec<PendingTimer>,
     pub outcome: Result<Transition, LogicError>,
+    /// Signal values proposed by this execution. Live runtimes populate this
+    /// after committing the transition; simulations populate it without
+    /// changing any live signal state.
+    pub signal_effects: Vec<SignalEffect>,
+    /// Consumers whose endpoint values would change for these effects.
+    pub eligible_consumers: Vec<SignalEndpointId>,
     /// The frozen wall-clock context this execution captured (unavailable
     /// sentinels when no wall-clock instant was supplied).
     pub time_context: TimeContext,
@@ -281,6 +291,8 @@ impl Execution {
         utc_unix_ms: Option<i64>,
     ) -> Self {
         Self {
+            id: None,
+            causal_producer: None,
             logic_revision,
             trigger,
             inputs,
@@ -288,8 +300,28 @@ impl Execution {
             state_after,
             pending_timers,
             outcome,
+            signal_effects: Vec::new(),
+            eligible_consumers: Vec::new(),
             time_context: TimeContext::capture(site, utc_unix_ms),
         }
+    }
+
+    pub(crate) fn set_runtime_metadata(
+        &mut self,
+        id: ExecutionId,
+        causal_producer: Option<ExecutionId>,
+    ) {
+        self.id = Some(id);
+        self.causal_producer = causal_producer;
+    }
+
+    pub(crate) fn set_signal_metadata(
+        &mut self,
+        effects: Vec<SignalEffect>,
+        eligible_consumers: Vec<SignalEndpointId>,
+    ) {
+        self.signal_effects = effects;
+        self.eligible_consumers = eligible_consumers;
     }
 }
 

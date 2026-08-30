@@ -58,11 +58,23 @@ pub(crate) mod wire_revision {
             })
             .transpose()
     }
+
+    pub fn serialize_option<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => serializer.serialize_some(&Value(*value)),
+            None => serializer.serialize_none(),
+        }
+    }
 }
 
 pub const MAX_SCHEDULES_PER_BLOCK: usize = 32;
 pub const PROTOCOL_VERSION: u64 = 1;
 pub const MAX_BLOCKS: usize = 64;
+pub const MAX_SIGNALS: usize = 256;
+pub const MAX_SIGNAL_BINDINGS: usize = 256;
 
 #[cfg(test)]
 mod milestone7_simulation_tests {

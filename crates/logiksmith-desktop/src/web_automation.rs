@@ -226,12 +226,29 @@ fn merge_block_revisions(
     current: &AutomationDocument,
     candidate: &mut AutomationDocument,
 ) -> Result<(), ()> {
+    let changed_signals = current
+        .signals
+        .iter()
+        .chain(candidate.signals.iter())
+        .filter_map(|signal| {
+            let before = current.signals.iter().find(|item| item.name == signal.name);
+            let after = candidate.signals.iter().find(|item| item.name == signal.name);
+            (before.map(|item| &item.dpt) != after.map(|item| &item.dpt)).then_some(signal.name.clone())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     for block in &mut candidate.blocks {
         if let Some(previous) = current.blocks.iter().find(|item| item.id == block.id) {
+            let signal_binding_changed = block.signal_bindings != previous.signal_bindings;
+            let bound_signal_changed = block
+                .signal_bindings
+                .iter()
+                .any(|binding| changed_signals.contains(&binding.signal));
             let changed = block.enabled != previous.enabled
                 || block.inputs != previous.inputs
                 || block.outputs != previous.outputs
                 || block.knx_bindings != previous.knx_bindings
+                || signal_binding_changed
+                || bound_signal_changed
                 || block.schedules != previous.schedules
                 || block.source != previous.source;
             if changed {

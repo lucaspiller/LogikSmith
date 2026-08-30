@@ -2,8 +2,9 @@ use crate::*;
 use logiksmith_core::{
     BlockConfig as CoreBlockConfig, BlockId, BlockSchedule as CoreBlockSchedule, Coordinates, Dpt,
     Endpoint, EndpointDirection, EndpointName, EngineConfig, LocalTime,
-    RuntimeConfig as CoreRuntimeConfig, ScheduleName, ScheduleRule, SiteTimeConfig, SolarAnchor,
-    TimeZoneId, Weekday, WeekdaySet,
+    RuntimeConfig as CoreRuntimeConfig, ScheduleName, ScheduleRule,
+    SignalBinding as CoreSignalBinding, SignalConfig as CoreSignalConfig, SignalName,
+    SiteTimeConfig, SolarAnchor, TimeZoneId, Weekday, WeekdaySet,
 };
 use serde::Deserialize;
 use std::{

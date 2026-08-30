@@ -1,3 +1,21 @@
+fn unique_execution_id(inner: &Inner, requested: Option<u64>) -> u64 {
+    let mut candidate = requested
+        .unwrap_or(inner.next_execution_id)
+        .max(inner.next_execution_id);
+    while inner
+        .executions
+        .iter()
+        .any(|record| record.execution_id == candidate)
+        || inner
+            .blocks
+            .values()
+            .any(|block| block.executions.iter().any(|record| record.execution_id == candidate))
+    {
+        candidate = candidate.saturating_add(1);
+    }
+    candidate
+}
+
 impl DiagnosticStore {
     pub fn new(runtime: &AutomationRuntime, automation_path: PathBuf, revision: u64) -> Self {
         let (events, _) = broadcast::channel(JOURNAL_CAPACITY);
@@ -49,9 +67,10 @@ impl DiagnosticStore {
             );
             block_automation.insert(block.id.clone(), block_automation_snapshot(runtime, block));
             for endpoint in block.engine_config.endpoints.iter() {
-                let Some(address) = block.endpoint_to_address.get(&endpoint.name).copied() else {
+                let address = block.endpoint_to_address.get(&endpoint.name).copied();
+                if address.is_none() && !block.endpoint_to_signal.contains_key(&endpoint.name) {
                     continue;
-                };
+                }
                 // The legacy global value projection is retained for the
                 // desktop shell while block snapshots carry the authoritative
                 // identity. Repeated local names intentionally overwrite this
@@ -71,6 +90,7 @@ impl DiagnosticStore {
             }
         }
         let automation = automation_snapshot(runtime);
+        let signals = signal_snapshots(runtime);
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 revision: 0,
@@ -123,6 +143,7 @@ impl DiagnosticStore {
                 site_time: site_time_snapshot(&runtime.core_config.site),
                 schedule_status: BTreeMap::new(),
                 block_schedules,
+                signals,
                 last_clock_sample: None,
             })),
             events,
@@ -405,7 +426,7 @@ impl DiagnosticStore {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for block in snapshot.blocks {
+        for block in &snapshot.blocks {
             let id = block.id.to_string();
             let revision = inner
                 .blocks
@@ -433,7 +454,7 @@ impl DiagnosticStore {
                 .iter()
                 .map(|timer| pending_timer_record(timer, revision))
                 .collect();
-            for input in block.inputs {
+            for input in &block.inputs {
                 if let Some(value) = input.value {
                     if let Some(state) = inner
                         .block_endpoint_values
@@ -444,6 +465,19 @@ impl DiagnosticStore {
                 }
             }
         }
+        let previous_signals = inner.signals.clone();
+        let structural_revision = inner.active_structural_revision;
+        inner.signals = snapshot
+            .signals
+            .iter()
+            .map(|signal| {
+                signal_snapshot_record(
+                    signal,
+                    previous_signals.iter().find(|item| item.name == signal.name.as_str()),
+                    structural_revision,
+                )
+            })
+            .collect();
         let first_revision = inner
             .block_order
             .first()
@@ -487,6 +521,7 @@ impl DiagnosticStore {
                     .map(|block| block.active_logic_revision)
             })
             .unwrap_or(1);
+        let signal_effects = signal_effect_records(&semantic.signal_effects);
         let (status, effects, transition, error) = match &semantic.outcome {
             Ok(effects) => (
                 LogicExecutionStatus::Succeeded,
@@ -497,11 +532,12 @@ impl DiagnosticStore {
                         effect_record_for_block(effect, automation, &execution.block_id)
                     })
                     .collect(),
-                Some(transition_record_for_block(
-                    effects,
-                    automation,
-                    &execution.block_id,
-                )),
+                Some({
+                    let mut transition =
+                        transition_record_for_block(effects, automation, &execution.block_id);
+                    transition.signal_effects = signal_effects.clone();
+                    transition
+                }),
                 None,
             ),
             Err(error) => (
@@ -511,9 +547,31 @@ impl DiagnosticStore {
                 Some(logic_error_record(error)),
             ),
         };
-        let execution_id = inner.next_execution_id;
-        inner.next_execution_id = inner.next_execution_id.saturating_add(1);
+        let execution_id = unique_execution_id(&inner, semantic.id);
+        inner.next_execution_id = inner.next_execution_id.max(execution_id.saturating_add(1));
         let first_block_id = inner.block_order.first().cloned();
+        let causal_producer_execution_id = semantic.causal_producer;
+        let causal_producer_block_id = causal_producer_execution_id.and_then(|id| {
+            inner
+                .blocks
+                .iter()
+                .find(|(_, block)| block.executions.iter().any(|record| record.execution_id == id))
+                .map(|(block_id, _)| block_id.clone())
+        });
+        let causal_signal = causal_producer_execution_id.and_then(|id| {
+            signal_for_causal_execution(&inner, id, &block_id, &semantic.trigger)
+        });
+        let causal_links = causal_producer_execution_id
+            .map(|producer_execution_id| {
+                vec![CausalLinkSnapshot {
+                    producer_execution_id,
+                    consumer_execution_id: execution_id,
+                    signal: causal_signal.clone(),
+                    producer_block_id: causal_producer_block_id.clone(),
+                    consumer_block_id: Some(block_id.clone()),
+                }]
+            })
+            .unwrap_or_default();
         let record = ExecutionRecord {
             block_id: execution.block_id.to_string(),
             execution_id,
@@ -532,6 +590,11 @@ impl DiagnosticStore {
                 .unwrap_or_default(),
             transition,
             effects,
+            signal_effects,
+            causal_producer_execution_id,
+            causal_producer_block_id,
+            causal_signal,
+            causal_links,
             error: error.clone(),
         };
         let (block_revision, block_state, block_pending, block_executions) = {
@@ -681,9 +744,10 @@ impl DiagnosticStore {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let execution_id = inner.next_execution_id;
-        inner.next_execution_id = inner.next_execution_id.saturating_add(1);
+        let execution_id = unique_execution_id(&inner, execution.id);
+        inner.next_execution_id = inner.next_execution_id.max(execution_id.saturating_add(1));
         let document_revision = inner.active_logic_revision;
+        let signal_effects = signal_effect_records(&execution.signal_effects);
         let (status, effects, transition, error) = match &execution.outcome {
             Ok(effects) => (
                 LogicExecutionStatus::Succeeded,
@@ -692,7 +756,11 @@ impl DiagnosticStore {
                     .iter()
                     .filter_map(|effect| effect_record(effect, automation))
                     .collect(),
-                Some(transition_record(effects, automation)),
+                Some({
+                    let mut transition = transition_record(effects, automation);
+                    transition.signal_effects = signal_effects.clone();
+                    transition
+                }),
                 None,
             ),
             Err(error) => (
@@ -702,12 +770,32 @@ impl DiagnosticStore {
                 Some(logic_error_record(error)),
             ),
         };
-        inner.executions.push_back(ExecutionRecord {
-            block_id: automation
+        let block_id = automation
                 .blocks
                 .first()
                 .map(|block| block.id.clone())
-                .unwrap_or_default(),
+                .unwrap_or_default();
+        let causal_producer_execution_id = execution.causal_producer;
+        let causal_producer_block_id = causal_producer_execution_id.and_then(|id| {
+            inner
+                .executions
+                .iter()
+                .find(|record| record.execution_id == id)
+                .map(|record| record.block_id.clone())
+        });
+        let causal_links = causal_producer_execution_id
+            .map(|producer_execution_id| {
+                vec![CausalLinkSnapshot {
+                    producer_execution_id,
+                    consumer_execution_id: execution_id,
+                    signal: None,
+                    producer_block_id: causal_producer_block_id.clone(),
+                    consumer_block_id: Some(block_id.clone()),
+                }]
+            })
+            .unwrap_or_default();
+        inner.executions.push_back(ExecutionRecord {
+            block_id,
             execution_id,
             time_ms: now.0,
             duration_us,
@@ -724,6 +812,11 @@ impl DiagnosticStore {
                 .unwrap_or_default(),
             transition,
             effects,
+            signal_effects,
+            causal_producer_execution_id,
+            causal_producer_block_id,
+            causal_signal: None,
+            causal_links,
             error,
         });
         inner.state = state_record(&execution.state_after);
@@ -748,7 +841,7 @@ impl DiagnosticStore {
             telegram.endpoint = inner
                 .endpoint_values
                 .iter()
-                .find(|(_, state)| state.address == address)
+                .find(|(_, state)| state.address == Some(address))
                 .map(|(name, _)| name.to_string());
         }
         if let (Some(endpoint), Some(value)) =
@@ -762,7 +855,7 @@ impl DiagnosticStore {
             && let Ok(address) = telegram.destination.parse::<GroupAddress>()
         {
             for state in inner.block_endpoint_values.values_mut() {
-                if state.address == address && state.direction == EndpointDirection::Input {
+                if state.address == Some(address) && state.direction == EndpointDirection::Input {
                     state.observed = Some(value.clone());
                 }
             }
@@ -800,7 +893,7 @@ impl DiagnosticStore {
         }
         if let Some(state) = inner.endpoint_values.get_mut(&endpoint) {
             state.requested = Some(value.clone());
-            if state.address == destination && state.direction == EndpointDirection::Output {
+            if state.address == Some(destination) && state.direction == EndpointDirection::Output {
                 inner.last_write = WriteSnapshot {
                     status: WriteStatus::Pending,
                     request_id: Some(request_id),

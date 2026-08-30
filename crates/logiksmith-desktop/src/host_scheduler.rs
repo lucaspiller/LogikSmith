@@ -50,9 +50,9 @@ async fn drain_due_timers(
     {
         let started = Instant::now();
         let sample = clock_sample(store);
-        let execution = match runtime.process_next_due_timer_sampled(sample) {
-            Ok(Some(execution)) => execution,
-            Ok(None) => break,
+        let executions = match runtime.process_next_due_timer_cascade_sampled(sample) {
+            Ok(executions) if executions.is_empty() => break,
+            Ok(executions) => executions,
             Err(error) => {
                 tracing::warn!(target: "logiksmith", error = %error, "discarding invalid timer execution");
                 store.set_runtime_projection_from_runtime(runtime, now);
@@ -60,14 +60,48 @@ async fn drain_due_timers(
             }
         };
         let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        store.record_block_execution(&execution, now, duration_us, &config.automation, None);
+        record_and_dispatch_cascade(
+            runtime,
+            store,
+            &config.automation,
+            executions,
+            now,
+            duration_us,
+            bridge.as_mut().map(|(stdin, next_request_id, pending)| {
+                (&mut **stdin, &mut **next_request_id, &mut **pending)
+            }),
+            None,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn record_and_dispatch_cascade(
+    runtime: &CoreRuntime,
+    store: &DiagnosticStore,
+    automation: &AutomationRuntime,
+    executions: Vec<logiksmith_core::BlockExecution>,
+    now: logiksmith_core::MonotonicMs,
+    duration_us: u64,
+    mut bridge: Option<(&mut ChildStdin, &mut u64, &mut HashSet<u64>)>,
+    schedule_handling: Option<ScheduleHandling>,
+) -> Result<(), HostError> {
+    for execution in executions {
+        store.record_block_execution(
+            &execution,
+            now,
+            duration_us,
+            automation,
+            schedule_handling,
+        );
         if let Some((stdin, next_request_id, pending)) = bridge.as_mut()
             && let Ok(transition) = &execution.execution.outcome
         {
             dispatch_effects(
                 store,
                 stdin,
-                &config.automation,
+                automation,
                 &execution.block_id,
                 transition.outputs.clone(),
                 next_request_id,
@@ -76,6 +110,7 @@ async fn drain_due_timers(
             .await?;
         }
     }
+    store.set_runtime_projection_from_runtime(runtime, now);
     Ok(())
 }
 
@@ -171,13 +206,13 @@ async fn poll_and_process_schedules(
         // A second SystemTime read could cross a wall-clock correction and
         // make queue delay disagree with the scheduler's detection instant.
         let handled_at_utc_ms = utc_unix_ms.unwrap_or(0);
-        let execution = match runtime.process_schedule_sampled(trigger, sample) {
-            Ok(Some(execution)) => execution,
-            Ok(None) => {
+        let executions = match runtime.process_schedule_cascade_sampled(trigger, sample) {
+            Ok(executions) if executions.is_empty() => {
                 // Stale structural revision, disabled block, or unknown
                 // schedule; the core decided not to deliver.
                 continue;
             }
+            Ok(executions) => executions,
             Err(error) => {
                 tracing::warn!(target: "logiksmith", block = %block_id, error = %error, "discarding invalid schedule execution");
                 continue;
@@ -188,27 +223,19 @@ async fn poll_and_process_schedules(
             handled_at_utc_ms,
             coalesced_count,
         };
-        store.record_block_execution(
-            &execution,
+        record_and_dispatch_cascade(
+            runtime,
+            store,
+            &config.automation,
+            executions,
             store.now(),
             duration_us,
-            &config.automation,
+            bridge.as_mut().map(|(stdin, next_request_id, pending)| {
+                (&mut **stdin, &mut **next_request_id, &mut **pending)
+            }),
             Some(handling),
-        );
-        if let Some((stdin, next_request_id, pending)) = bridge.as_mut()
-            && let Ok(transition) = &execution.execution.outcome
-        {
-            dispatch_effects(
-                store,
-                stdin,
-                &config.automation,
-                &execution.block_id,
-                transition.outputs.clone(),
-                next_request_id,
-                pending,
-            )
-            .await?;
-        }
+        )
+        .await?;
     }
     refresh_schedule_statuses(runtime, store, utc_unix_ms);
     Ok(())

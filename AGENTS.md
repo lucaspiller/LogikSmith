@@ -16,5 +16,6 @@ LogikSmith is a lightweight KNX automation engine with a portable Rust core. It 
 - Before a manual KNX run, confirm the output is a harmless visible actuator, the input and output addresses differ, and the gateway uses plain KNXnet/IP tunnelling.
 - A successful manual POC run shows `KNX connected`, then an input `true`, an immediate output `true`, and an output `false` after the configured delay. Test retriggering and shutdown deliberately.
 - Keep every tracked source file under 1000 lines by using focussed modules for cohesive responsibilities.
+- Serialize every revision exposed through JSON, including optional nested revisions, as a non-negative decimal string. Add a JSON-shape assertion whenever a new revision field is introduced; the browser intentionally rejects numeric revisions to avoid JavaScript precision loss.
 
 Start with the active PRD, then consult `docs/architecture.md`, `docs/decisions.md`, `docs/deferred.md`, and `docs/issues/` as those records are added.

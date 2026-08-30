@@ -4,10 +4,12 @@ export type ConnectionState = 'starting' | 'connecting' | 'connected' | 'disconn
 export type TimerState = 'idle' | 'pending';
 export type StreamStatus = 'connecting' | 'connected' | 'stale' | 'error';
 export type WriteStatus = 'idle' | 'pending' | 'succeeded' | 'failed';
+export type DisplayEndpointBindingKind = 'knx' | 'signal' | 'unbound';
 
-export interface DisplayEndpoint { name?: string; address: string; dpt: string; direction?: 'input' | 'output'; observed?: boolean | number | null; requested?: boolean | number | null; }
-export interface DisplayBinding { endpoint: string; groupAddress: string; }
-export interface DisplayAutomation { inputs: DisplayEndpoint[]; outputs: DisplayEndpoint[]; bindings: DisplayBinding[]; source: string; }
+export interface DisplayEndpoint { name?: string; address: string; dpt: string; direction?: 'input' | 'output'; bindingKind?: DisplayEndpointBindingKind; signal?: string | null; observed?: boolean | number | null; requested?: boolean | number | null; }
+export interface DisplayBinding { endpoint: string; groupAddress: string; kind?: DisplayEndpointBindingKind; signal?: string; }
+export interface DisplaySignalBinding { endpoint: string; signal: string; dpt?: string; }
+export interface DisplayAutomation { inputs: DisplayEndpoint[]; outputs: DisplayEndpoint[]; bindings: DisplayBinding[]; signalBindings?: DisplaySignalBinding[]; source: string; }
 export interface DisplayLogicError { category: string; message: string; line: number | null; }
 export interface DisplayLastResult { status: 'none' | 'succeeded' | 'failed'; executionId: number | null; timeMs: number | null; error: DisplayLogicError | null; }
 
@@ -45,9 +47,28 @@ export type DisplayExecutionTrigger = DisplayInputExecutionTrigger | DisplayTime
 
 export interface DisplayExecutionInput { endpoint: string; dpt: string; value: boolean | number | null; valid: boolean; ageMs: number | null; }
 export interface DisplayExecutionEffect { endpoint: string; destination: string; dpt: string; value: boolean | number; }
+export interface DisplaySignalEffect { endpoint: string; signal: string; dpt: string; value: boolean | number; changed?: boolean; producer?: DisplaySignalProducer | null; producingExecutionId?: number | null; consumers?: DisplaySignalConsumer[]; }
+export interface DisplayCausalLink { producerExecutionId: number; consumerExecutionId: number; signal: string | null; producerBlockId?: string | null; consumerBlockId?: string | null; }
 export type DisplayTimerEffectAction = 'scheduled' | 'replaced' | 'cancelled' | 'cancel_noop';
 export interface DisplayTimerEffect { name: string; action: DisplayTimerEffectAction; afterMs: number | null; dueAtMs: number | null; previousDueAtMs: number | null; }
-export interface DisplayTransition { state: DisplayState; effects: DisplayExecutionEffect[]; timers: DisplayTimerEffect[]; }
+export interface DisplayTransition { state: DisplayState; effects: DisplayExecutionEffect[]; signalEffects: DisplaySignalEffect[]; timers: DisplayTimerEffect[]; }
+
+export interface DisplaySignalProducer { blockId: string; endpoint: string; executionId: number | null; }
+export interface DisplaySignalConsumer { blockId: string; endpoint: string; }
+export interface DisplaySignalChange { value: boolean | number | null; observedAtMs: number | null; changedAtMs: number | null; executionId: number | null; }
+export interface DisplaySignal {
+  name: string;
+  dpt: string;
+  value: boolean | number | null;
+  status: string;
+  observedAtMs: number | null;
+  changedAtMs: number | null;
+  producer: DisplaySignalProducer | null;
+  producingExecutionId: number | null;
+  consumers: DisplaySignalConsumer[];
+  recentChanges: DisplaySignalChange[];
+  structuralRevision: RevisionToken | null;
+}
 
 /** A captured civil calendar value. Unavailable values expose null fields. */
 export interface DisplayDateTimeValue {
@@ -146,6 +167,11 @@ export interface DisplayExecution {
   stateBefore: DisplayState;
   stateAfter: DisplayState;
   effects: DisplayExecutionEffect[];
+  signalEffects: DisplaySignalEffect[];
+  causalProducerExecutionId: number | null;
+  causalProducerBlockId: string | null;
+  causalSignal: string | null;
+  causalLinks: DisplayCausalLink[];
   timerEffects: DisplayTimerEffect[];
   /** Captured time context; null only for legacy records without one. */
   timeContext: DisplayTimeContext | null;
@@ -161,6 +187,7 @@ export interface DisplayBlock {
   inputs: DisplayEndpoint[];
   outputs: DisplayEndpoint[];
   bindings: DisplayBinding[];
+  signalBindings: DisplaySignalBinding[];
   state: DisplayState;
   pendingTimers: DisplayPendingTimer[];
   schedules: DisplayBlockSchedule[];
@@ -194,6 +221,8 @@ export interface DisplaySimulation {
   stateBefore: DisplayState;
   stateAfter: DisplayState;
   effects: DisplayExecutionEffect[];
+  signalEffects: DisplaySignalEffect[];
+  eligibleConsumers: DisplaySignalConsumer[];
   timerEffects: DisplayTimerEffect[];
   pendingTimers: DisplayPendingTimer[];
   timeContext: DisplayTimeContext | null;
@@ -229,6 +258,7 @@ export interface DisplaySnapshot {
   executions: DisplayExecution[];
   /** Site-time card; null only for legacy snapshots without one. */
   siteTime: DisplaySiteTime | null;
+  signals: DisplaySignal[];
   write: DisplayWrite;
   timer: DisplayTimer;
   telegrams: DisplayTelegram[];

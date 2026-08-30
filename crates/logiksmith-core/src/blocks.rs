@@ -10,6 +10,9 @@ pub struct BlockConfig {
     pub endpoints: Vec<Endpoint>,
     pub logic: LogicProgram,
     pub schedules: Vec<BlockSchedule>,
+    /// Bindings to globally declared internal signals. Input endpoints
+    /// consume a signal; output endpoints publish one.
+    pub signal_bindings: Vec<SignalBinding>,
 }
 
 impl BlockConfig {
@@ -25,6 +28,7 @@ impl BlockConfig {
             endpoints,
             logic: LogicProgram::new(source),
             schedules: Vec::new(),
+            signal_bindings: Vec::new(),
         }
     }
 
@@ -40,6 +44,7 @@ impl BlockConfig {
             endpoints,
             logic,
             schedules: Vec::new(),
+            signal_bindings: Vec::new(),
         }
     }
 
@@ -57,17 +62,11 @@ impl BlockConfig {
             endpoints,
             logic: LogicProgram::new(source),
             schedules,
+            signal_bindings: Vec::new(),
         }
     }
 
     pub fn validate(&self) -> Result<(), BlockConfigError> {
-        if !self
-            .endpoints
-            .iter()
-            .any(|endpoint| endpoint.direction == EndpointDirection::Input)
-        {
-            return Err(BlockConfigError::NoInputs);
-        }
         if self.schedules.len() > MAX_SCHEDULES_PER_BLOCK {
             return Err(BlockConfigError::TooManySchedules {
                 actual: self.schedules.len(),
@@ -91,6 +90,27 @@ impl BlockConfig {
                     error,
                 })?;
         }
+        for (index, binding) in self.signal_bindings.iter().enumerate() {
+            if self
+                .signal_bindings
+                .iter()
+                .take(index)
+                .any(|other| other.endpoint == binding.endpoint)
+            {
+                return Err(BlockConfigError::DuplicateSignalBinding {
+                    endpoint: binding.endpoint.clone(),
+                });
+            }
+            let Some(_endpoint) = self
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.name == binding.endpoint)
+            else {
+                return Err(BlockConfigError::UnknownSignalBindingEndpoint {
+                    endpoint: binding.endpoint.clone(),
+                });
+            };
+        }
         EngineConfig::with_program(self.endpoints.clone(), self.logic.clone())
             .validate()
             .map_err(BlockConfigError::Engine)
@@ -109,7 +129,6 @@ impl BlockConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlockConfigError {
-    NoInputs,
     TooManySchedules {
         actual: usize,
         maximum: usize,
@@ -119,13 +138,18 @@ pub enum BlockConfigError {
         name: ScheduleName,
         error: ScheduleError,
     },
+    DuplicateSignalBinding {
+        endpoint: EndpointName,
+    },
+    UnknownSignalBindingEndpoint {
+        endpoint: EndpointName,
+    },
     Engine(ConfigError),
 }
 
 impl fmt::Display for BlockConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoInputs => formatter.write_str("logic block must define at least one input"),
             Self::TooManySchedules { actual, maximum } => write!(
                 formatter,
                 "block defines {actual} schedules; maximum is {maximum}"
@@ -134,10 +158,51 @@ impl fmt::Display for BlockConfigError {
             Self::InvalidSchedule { name, error } => {
                 write!(formatter, "schedule {name}: {error}")
             }
+            Self::DuplicateSignalBinding { endpoint } => {
+                write!(
+                    formatter,
+                    "endpoint {endpoint} has more than one signal binding"
+                )
+            }
+            Self::UnknownSignalBindingEndpoint { endpoint } => {
+                write!(
+                    formatter,
+                    "signal binding references unknown endpoint {endpoint}"
+                )
+            }
             Self::Engine(error) => error.fmt(formatter),
         }
     }
 }
+
+/// A declared internal signal and its exact DPT.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignalConfig {
+    pub name: SignalName,
+    pub dpt: Dpt,
+}
+
+impl SignalConfig {
+    pub fn new(name: SignalName, dpt: Dpt) -> Self {
+        Self { name, dpt }
+    }
+}
+
+/// Binds one block endpoint to a global signal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignalBinding {
+    pub endpoint: EndpointName,
+    pub signal: SignalName,
+}
+
+impl SignalBinding {
+    pub fn new(endpoint: EndpointName, signal: SignalName) -> Self {
+        Self { endpoint, signal }
+    }
+}
+
+pub const MAX_SIGNALS: usize = 256;
+pub const MAX_SIGNAL_BINDINGS: usize = 256;
 
 impl Error for BlockConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
@@ -153,6 +218,7 @@ impl Error for BlockConfigError {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeConfig {
     pub blocks: Vec<BlockConfig>,
+    pub signals: Vec<SignalConfig>,
     /// The site wall-clock context is captured from. Defaults to UTC with no
     /// coordinates; hosts assign it (e.g. `config.site = ...`) after
     /// construction.
@@ -163,6 +229,7 @@ impl RuntimeConfig {
     pub fn new(blocks: Vec<BlockConfig>) -> Self {
         Self {
             blocks,
+            signals: Vec::new(),
             site: SiteTimeConfig {
                 timezone: TimeZoneId::utc(),
                 coordinates: None,
@@ -171,7 +238,34 @@ impl RuntimeConfig {
     }
 
     pub fn with_site(blocks: Vec<BlockConfig>, site: SiteTimeConfig) -> Self {
-        Self { blocks, site }
+        Self {
+            blocks,
+            signals: Vec::new(),
+            site,
+        }
+    }
+
+    pub fn with_signals(blocks: Vec<BlockConfig>, signals: Vec<SignalConfig>) -> Self {
+        Self {
+            blocks,
+            signals,
+            site: SiteTimeConfig {
+                timezone: TimeZoneId::utc(),
+                coordinates: None,
+            },
+        }
+    }
+
+    pub fn with_signals_and_site(
+        blocks: Vec<BlockConfig>,
+        signals: Vec<SignalConfig>,
+        site: SiteTimeConfig,
+    ) -> Self {
+        Self {
+            blocks,
+            signals,
+            site,
+        }
     }
 
     pub fn try_new(blocks: Vec<BlockConfig>) -> Result<Self, RuntimeConfigError> {
@@ -190,6 +284,35 @@ impl RuntimeConfig {
                 maximum: MAX_BLOCKS,
             });
         }
+        if self.signals.len() > MAX_SIGNALS {
+            return Err(RuntimeConfigError::TooManySignals {
+                actual: self.signals.len(),
+                maximum: MAX_SIGNALS,
+            });
+        }
+        let mut signal_names = std::collections::BTreeSet::new();
+        for signal in &self.signals {
+            if !signal_names.insert(signal.name.clone()) {
+                return Err(RuntimeConfigError::DuplicateSignal(signal.name.clone()));
+            }
+            if !signal.dpt.is_supported() {
+                return Err(RuntimeConfigError::UnsupportedSignalDpt {
+                    signal: signal.name.clone(),
+                    dpt: signal.dpt,
+                });
+            }
+        }
+        let binding_count: usize = self
+            .blocks
+            .iter()
+            .map(|block| block.signal_bindings.len())
+            .sum();
+        if binding_count > MAX_SIGNAL_BINDINGS {
+            return Err(RuntimeConfigError::TooManySignalBindings {
+                actual: binding_count,
+                maximum: MAX_SIGNAL_BINDINGS,
+            });
+        }
         for (index, block) in self.blocks.iter().enumerate() {
             if self
                 .blocks
@@ -206,8 +329,121 @@ impl RuntimeConfig {
                     error,
                 })?;
         }
+        let mut producers: std::collections::BTreeMap<SignalName, SignalEndpointId> =
+            std::collections::BTreeMap::new();
+        let mut edges: std::collections::BTreeMap<BlockId, Vec<BlockId>> =
+            std::collections::BTreeMap::new();
+        for block in &self.blocks {
+            for binding in &block.signal_bindings {
+                let signal = self
+                    .signals
+                    .iter()
+                    .find(|signal| signal.name == binding.signal)
+                    .ok_or_else(|| RuntimeConfigError::UnknownSignal {
+                        block_id: block.id.clone(),
+                        endpoint: binding.endpoint.clone(),
+                        signal: binding.signal.clone(),
+                    })?;
+                let endpoint = block
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.name == binding.endpoint)
+                    .expect("BlockConfig validates signal endpoint references");
+                if endpoint.dpt != signal.dpt {
+                    return Err(RuntimeConfigError::SignalDptMismatch {
+                        block_id: block.id.clone(),
+                        endpoint: endpoint.name.clone(),
+                        signal: signal.name.clone(),
+                        expected: endpoint.dpt,
+                        actual: signal.dpt,
+                    });
+                }
+                let identity = SignalEndpointId::new(block.id.clone(), endpoint.name.clone());
+                if endpoint.direction == EndpointDirection::Output {
+                    if let Some(previous) = producers.insert(signal.name.clone(), identity.clone())
+                    {
+                        return Err(RuntimeConfigError::DuplicateSignalProducer {
+                            signal: signal.name.clone(),
+                            previous,
+                            duplicate: identity,
+                        });
+                    }
+                }
+            }
+        }
+        // A producer may be declared later than its consumer, so resolve all
+        // input edges in a second pass after collecting producers.
+        edges.clear();
+        for block in &self.blocks {
+            for binding in &block.signal_bindings {
+                let endpoint = block
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.name == binding.endpoint)
+                    .unwrap();
+                if endpoint.direction == EndpointDirection::Input
+                    && let Some(producer) = producers.get(&binding.signal)
+                {
+                    edges
+                        .entry(producer.block_id.clone())
+                        .or_default()
+                        .push(block.id.clone());
+                }
+            }
+        }
+        detect_signal_cycle(&self.blocks, &edges)?;
         Ok(())
     }
+}
+
+fn detect_signal_cycle(
+    blocks: &[BlockConfig],
+    edges: &std::collections::BTreeMap<BlockId, Vec<BlockId>>,
+) -> Result<(), RuntimeConfigError> {
+    fn visit(
+        id: &BlockId,
+        edges: &std::collections::BTreeMap<BlockId, Vec<BlockId>>,
+        visiting: &mut std::collections::BTreeSet<BlockId>,
+        visited: &mut std::collections::BTreeSet<BlockId>,
+        path: &mut Vec<BlockId>,
+    ) -> Result<(), Vec<BlockId>> {
+        if visiting.contains(id) {
+            let start = path.iter().position(|item| item == id).unwrap_or(0);
+            let mut cycle = path[start..].to_vec();
+            cycle.push(id.clone());
+            return Err(cycle);
+        }
+        if !visited.insert(id.clone()) {
+            return Ok(());
+        }
+        visiting.insert(id.clone());
+        path.push(id.clone());
+        if let Some(children) = edges.get(id) {
+            for child in children {
+                // A node can be reached from two branches; `visited` is only
+                // committed after its DFS completes so back edges remain
+                // detectable.
+                if let Err(cycle) = visit(child, edges, visiting, visited, path) {
+                    return Err(cycle);
+                }
+            }
+        }
+        path.pop();
+        visiting.remove(id);
+        Ok(())
+    }
+
+    let mut visiting = std::collections::BTreeSet::new();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut path = Vec::new();
+    for block in blocks {
+        if !visited.contains(&block.id)
+            && let Err(path) = visit(&block.id, edges, &mut visiting, &mut visited, &mut path)
+        {
+            return Err(RuntimeConfigError::SignalCycle { path });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,6 +454,39 @@ pub enum RuntimeConfigError {
         maximum: usize,
     },
     DuplicateId(BlockId),
+    TooManySignals {
+        actual: usize,
+        maximum: usize,
+    },
+    DuplicateSignal(SignalName),
+    UnsupportedSignalDpt {
+        signal: SignalName,
+        dpt: Dpt,
+    },
+    TooManySignalBindings {
+        actual: usize,
+        maximum: usize,
+    },
+    UnknownSignal {
+        block_id: BlockId,
+        endpoint: EndpointName,
+        signal: SignalName,
+    },
+    SignalDptMismatch {
+        block_id: BlockId,
+        endpoint: EndpointName,
+        signal: SignalName,
+        expected: Dpt,
+        actual: Dpt,
+    },
+    DuplicateSignalProducer {
+        signal: SignalName,
+        previous: SignalEndpointId,
+        duplicate: SignalEndpointId,
+    },
+    SignalCycle {
+        path: Vec<BlockId>,
+    },
     InvalidBlock {
         block_id: BlockId,
         error: BlockConfigError,
@@ -235,6 +504,52 @@ impl fmt::Display for RuntimeConfigError {
                 )
             }
             Self::DuplicateId(id) => write!(formatter, "duplicate logic block ID {id}"),
+            Self::TooManySignals { actual, maximum } => write!(
+                formatter,
+                "runtime contains {actual} signals; maximum is {maximum}"
+            ),
+            Self::DuplicateSignal(name) => write!(formatter, "duplicate signal {name}"),
+            Self::UnsupportedSignalDpt { signal, dpt } => {
+                write!(formatter, "signal {signal} uses unsupported DPT {dpt}")
+            }
+            Self::TooManySignalBindings { actual, maximum } => write!(
+                formatter,
+                "runtime contains {actual} signal bindings; maximum is {maximum}"
+            ),
+            Self::UnknownSignal {
+                block_id,
+                endpoint,
+                signal,
+            } => write!(
+                formatter,
+                "block {block_id} endpoint {endpoint} references unknown signal {signal}"
+            ),
+            Self::SignalDptMismatch {
+                block_id,
+                endpoint,
+                signal,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "block {block_id} endpoint {endpoint} DPT {expected} does not match signal {signal} DPT {actual}"
+            ),
+            Self::DuplicateSignalProducer {
+                signal,
+                previous,
+                duplicate,
+            } => write!(
+                formatter,
+                "signal {signal} has producers {previous} and {duplicate}"
+            ),
+            Self::SignalCycle { path } => write!(
+                formatter,
+                "signal dependency cycle: {}",
+                path.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            ),
             Self::InvalidBlock { block_id, error } => {
                 write!(formatter, "block {block_id}: {error}")
             }
@@ -267,7 +582,79 @@ pub struct BlockSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeSnapshot {
     pub blocks: Vec<BlockSnapshot>,
+    pub signals: Vec<SignalSnapshot>,
     pub last_accepted_at: Option<MonotonicMs>,
+}
+
+/// Monotonic identity assigned by a live runtime to every executed block.
+pub type ExecutionId = u64;
+
+/// Current status of a declared signal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalStatus {
+    Unknown,
+    Valid,
+    ProducerDisabled,
+}
+
+impl SignalStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Valid => "valid",
+            Self::ProducerDisabled => "producer_disabled",
+        }
+    }
+}
+
+impl fmt::Display for SignalStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One endpoint identity in a signal's producer/consumer graph.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SignalEndpointId {
+    pub block_id: BlockId,
+    pub endpoint: EndpointName,
+}
+
+impl SignalEndpointId {
+    pub fn new(block_id: BlockId, endpoint: EndpointName) -> Self {
+        Self { block_id, endpoint }
+    }
+}
+
+impl fmt::Display for SignalEndpointId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}.{}", self.block_id, self.endpoint)
+    }
+}
+
+/// A committed or proposed value produced for one signal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignalEffect {
+    pub signal: SignalName,
+    pub value: TypedValue,
+    pub changed: bool,
+    pub producer: SignalEndpointId,
+    pub producing_execution: Option<ExecutionId>,
+    pub consumers: Vec<SignalEndpointId>,
+}
+
+/// A public view of one signal's in-memory state and graph identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignalSnapshot {
+    pub name: SignalName,
+    pub dpt: Dpt,
+    pub value: Option<TypedValue>,
+    pub status: SignalStatus,
+    pub observed_at: Option<MonotonicMs>,
+    pub changed_at: Option<MonotonicMs>,
+    pub producer: Option<SignalEndpointId>,
+    pub producing_execution: Option<ExecutionId>,
+    pub consumers: Vec<SignalEndpointId>,
 }
 
 /// An execution tagged with its owning block.

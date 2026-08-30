@@ -79,6 +79,46 @@ impl fmt::Display for EndpointNameError {
 
 impl Error for EndpointNameError {}
 
+/// A validated identity for a globally declared internal signal.
+///
+/// Signals intentionally have their own type even though they use the same
+/// lexical grammar as endpoint names. This prevents accidentally passing a
+/// signal name where a block-local endpoint is expected.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SignalName(String);
+
+pub type SignalNameError = EndpointNameError;
+
+impl SignalName {
+    pub fn new(value: impl Into<String>) -> Result<Self, SignalNameError> {
+        let value = value.into();
+        validate_endpoint_name(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn parse(value: &str) -> Result<Self, SignalNameError> {
+        value.parse()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for SignalName {
+    type Err = SignalNameError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for SignalName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// A stable identity for one configured logic block.
 ///
 /// Block identifiers deliberately use a smaller grammar than endpoint names:
