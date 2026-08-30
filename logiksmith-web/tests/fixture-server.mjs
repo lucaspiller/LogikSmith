@@ -96,6 +96,10 @@ function scheduleExecution() {
 function timerExecution() {
   return { execution_id: 7, time_ms: 5312, duration_us: 42, logic_revision: 12, status: 'succeeded', trigger: timerTrigger(), inputs: [{ endpoint: 'wall_switch', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true }, valid: true, age_ms: 5312 }], state_before: state, state_after: { ...state, phase: { kind: 'string', value: 'dimmed' } }, transition: { state: { phase: { kind: 'string', value: 'dimmed' } }, effects: [], timers: [{ name: 'off', action: 'replaced', previous_due_at_ms: 5800, after_ms: 5000, due_at_ms: 10312 }] }, effects: [], timer_effects: [], time_context: timeContext, error: null };
 }
+function httpExecution() {
+  const temperature = { kind: 'temperature', value: 21.75 };
+  return { execution_id: 9, time_ms: 1_756_500_124_000, duration_us: 38, logic_revision: 12, status: 'succeeded', trigger: { type: 'input', endpoint: 'today_temperature_max', dpt: { major: 9, subtype: 1 }, value: temperature, previous: null, changed: true, rising: false, falling: false }, origin: { kind: 'http', poll: 'berlin_today_forecast', value: 'today_temperature_max' }, inputs: [{ endpoint: 'today_temperature_max', dpt: { major: 9, subtype: 1 }, value: temperature, valid: true, age_ms: 200 }], state_before: state, state_after: state, transition: { state, effects: [], timers: [] }, effects: [], timer_effects: [], time_context: timeContext, error: null };
+}
 function blocks() {
   return [{
     id: 'scheduled_light_test',
@@ -106,13 +110,19 @@ function blocks() {
     active_logic_revision: 12,
     saved_logic_revision: 12,
     source: 'function handle(event, input, meta, state, ctx)\n  if event.type == "schedule" and event.schedule == "morning_on" then\n    return { outputs = { scheduled_light = true }, timers = { off = { after = seconds(5) } } }\n  end\n  return nil\nend',
-    inputs: [{ name: 'wall_switch', dpt: { major: 1, subtype: 1 }, address: '1/2/3', observed: { kind: 'bool', value: true } }],
+    inputs: [
+      { name: 'wall_switch', dpt: { major: 1, subtype: 1 }, address: '1/2/3', observed: { kind: 'bool', value: true } },
+      { name: 'today_temperature_max', dpt: { major: 9, subtype: 1 }, bindingKind: 'http', source: 'today_temperature_max', observed: { kind: 'temperature', value: 21.75 } },
+      { name: 'external_override', dpt: { major: 1, subtype: 1 }, bindingKind: 'webhook', source: 'external_override', observed: { kind: 'bool', value: true } }
+    ],
     outputs: [{ name: 'scheduled_light', dpt: { major: 1, subtype: 1 }, address: '1/2/4', observed: { kind: 'bool', value: false }, requested: null }],
     knx_bindings: [{ endpoint: 'wall_switch', group_address: '1/2/3' }, { endpoint: 'scheduled_light', group_address: '1/2/4' }],
+    http_bindings: [{ endpoint: 'today_temperature_max', source: 'today_temperature_max', poll: 'berlin_today_forecast', value: 'today_temperature_max' }],
+    webhook_bindings: [{ endpoint: 'external_override', source: 'external_override' }],
     state,
     pending_timers: pendingTimers,
     schedules,
-    executions: [scheduleExecution(), timerExecution()],
+    executions: [scheduleExecution(), timerExecution(), httpExecution()],
     last_result: { status: 'succeeded', execution_id: 8, time_ms: 1_756_500_123, error: null }
   }, {
     id: 'occupancy_source',
@@ -169,8 +179,51 @@ function blocks() {
     lastResult: { status: 'none', executionId: null, timeMs: null, error: null }
   }];
 }
+function externalInputs() {
+  return {
+    http_polls: [{
+      kind: 'http',
+      name: 'berlin_today_forecast',
+      url: 'https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41&token=secret',
+      interval_ms: 21_600_000,
+      status: 'healthy',
+      last_attempt_at_ms: 1_756_500_000_000,
+      next_attempt_at_ms: 1_756_521_600_000,
+      last_success_at_ms: 1_756_500_000_100,
+      stale_at_ms: 1_756_543_200_000,
+      consecutive_failures: 0,
+      last_error: null,
+      values: [{
+        name: 'today_temperature_max',
+        dpt: { major: 9, subtype: 1 },
+        json_pointer: '/daily/temperature_2m_max/0',
+        value: { kind: 'temperature', value: 21.75 },
+        valid: true,
+        age_ms: 200,
+        consumers: [{ block_id: 'scheduled_light_test', endpoint: 'today_temperature_max' }]
+      }]
+    }],
+    webhook_inputs: [{
+      kind: 'webhook',
+      name: 'external_override',
+      route: '/api/webhooks/external_override',
+      dpt: { major: 1, subtype: 1 },
+      json_pointer: '/enabled',
+      status: 'healthy',
+      authentication_required: true,
+      authentication_configured: true,
+      last_accepted_at_ms: 1_756_500_000_200,
+      accepted_count: 3,
+      rejected_count: 1,
+      value: { kind: 'bool', value: true },
+      valid: true,
+      age_ms: 300,
+      consumers: [{ block_id: 'scheduled_light_test', endpoint: 'external_override' }]
+    }]
+  };
+}
 function snapshot() {
-  return { revision: 4, captured_at_ms: 1_000, connection: { state: 'connected' }, site_time: siteTime, active_structural_revision: 1, saved_structural_revision: 1, active_logic_revision: 12, saved_logic_revision: 12, restart_required: false, signals: [{ name: 'house_occupied', dpt: '1.001', value: { kind: 'bool', value: true }, status: 'valid', observedAtMs: 1200, changedAtMs: 1200, producer: { blockId: 'occupancy_source', endpoint: 'occupied' }, producingExecutionId: 101, consumers: [{ blockId: 'lighting_policy', endpoint: 'occupied' }], recentChanges: [{ value: { kind: 'bool', value: true }, observedAtMs: 1200, changedAtMs: 1200, executionId: 101 }], structuralRevision: '1' }, { name: 'lighting_allowed', dpt: '1.001', value: { kind: 'bool', value: true }, status: 'valid', observedAtMs: 1210, changedAtMs: 1210, producer: { blockId: 'lighting_policy', endpoint: 'allowed' }, producingExecutionId: 102, consumers: [{ blockId: 'hall_light', endpoint: 'allowed' }], recentChanges: [{ value: { kind: 'bool', value: true }, observedAtMs: 1210, changedAtMs: 1210, executionId: 102 }], structuralRevision: '1' }, { name: 'night_mode', dpt: '1.001', value: null, status: 'unknown', observedAtMs: null, changedAtMs: null, producer: null, producingExecutionId: null, consumers: [], recentChanges: [], structuralRevision: '1' }, { name: 'fallback_mode', dpt: '1.001', value: { kind: 'bool', value: false }, status: 'producer_disabled', observedAtMs: 1200, changedAtMs: null, producer: { blockId: 'hall_light', endpoint: 'allowed' }, producingExecutionId: null, consumers: [], recentChanges: [], structuralRevision: '1' }], blocks: blocks(), telegrams: [], logs: [] };
+  return { revision: 4, captured_at_ms: 1_000, connection: { state: 'connected' }, site_time: siteTime, active_structural_revision: 1, saved_structural_revision: 1, active_logic_revision: 12, saved_logic_revision: 12, restart_required: false, signals: [{ name: 'house_occupied', dpt: '1.001', value: { kind: 'bool', value: true }, status: 'valid', observedAtMs: 1200, changedAtMs: 1200, producer: { blockId: 'occupancy_source', endpoint: 'occupied' }, producingExecutionId: 101, consumers: [{ blockId: 'lighting_policy', endpoint: 'occupied' }], recentChanges: [{ value: { kind: 'bool', value: true }, observedAtMs: 1200, changedAtMs: 1200, executionId: 101 }], structuralRevision: '1' }, { name: 'lighting_allowed', dpt: '1.001', value: { kind: 'bool', value: true }, status: 'valid', observedAtMs: 1210, changedAtMs: 1210, producer: { blockId: 'lighting_policy', endpoint: 'allowed' }, producingExecutionId: 102, consumers: [{ blockId: 'hall_light', endpoint: 'allowed' }], recentChanges: [{ value: { kind: 'bool', value: true }, observedAtMs: 1210, changedAtMs: 1210, executionId: 102 }], structuralRevision: '1' }, { name: 'night_mode', dpt: '1.001', value: null, status: 'unknown', observedAtMs: null, changedAtMs: null, producer: null, producingExecutionId: null, consumers: [], recentChanges: [], structuralRevision: '1' }, { name: 'fallback_mode', dpt: '1.001', value: { kind: 'bool', value: false }, status: 'producer_disabled', observedAtMs: 1200, changedAtMs: null, producer: { blockId: 'hall_light', endpoint: 'allowed' }, producingExecutionId: null, consumers: [], recentChanges: [], structuralRevision: '1' }], external_inputs: externalInputs(), blocks: blocks(), telegrams: [], logs: [] };
 }
 function simulation(body) {
   if (body.block_id === 'occupancy_source' && body.trigger?.type === 'input') {
@@ -237,12 +290,17 @@ function scheduleSimulationResponse(body) {
   };
   return { status: 200, value: scheduleSimulation(body) };
 }
+function documentDpt(value) {
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object' && Number.isInteger(value.major) && Number.isInteger(value.subtype)) return `${value.major}.${String(value.subtype).padStart(3, '0')}`;
+  return '1.001';
+}
 function sendJson(response, value, status = 200) { response.writeHead(status, { 'content-type': 'application/json' }); response.end(JSON.stringify(value)); }
 const server = createServer(async (request, response) => {
   if (request.url?.startsWith('/api/snapshot')) return sendJson(response, snapshot());
   if (request.url?.startsWith('/api/automation')) {
     if (request.method === 'PUT') { for await (const _chunk of request) {} return sendJson(response, { revision: 13, logic_activated: true, active_logic_revision: 13, restart_required: false, cancelled_timers: ['dim', 'off'] }); }
-    const document = { signals: snapshot().signals.map((item) => ({ name: item.name, dpt: item.dpt })), blocks: blocks().map((item) => ({ id: item.id, enabled: item.active_enabled ?? item.activeEnabled ?? true, revision: 1, inputs: item.inputs.map((input) => ({ name: input.name, dpt: '1.001' })), outputs: item.outputs.map((output) => ({ name: output.name, dpt: '1.001' })), knx_bindings: item.knx_bindings ?? item.knxBindings ?? [], signal_bindings: item.signal_bindings ?? item.signalBindings ?? [], source: item.source, schedules: item.schedules?.length ? scheduleDefinitions : [] })) };
+    const document = { signals: snapshot().signals.map((item) => ({ name: item.name, dpt: item.dpt })), http_polls: [{ name: 'berlin_today_forecast', url: 'https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41', every: '6h', timeout: '10s', stale_after: '12h', headers: [], values: [{ name: 'today_temperature_max', dpt: '9.001', json_pointer: '/daily/temperature_2m_max/0' }] }], webhook_inputs: [{ name: 'external_override', route: '/api/webhooks/external_override', dpt: '1.001', json_pointer: '/enabled', bearer_token: 'configured' }], blocks: blocks().map((item) => ({ id: item.id, enabled: item.active_enabled ?? item.activeEnabled ?? true, revision: 1, inputs: item.inputs.map((input) => ({ name: input.name, dpt: documentDpt(input.dpt) })), outputs: item.outputs.map((output) => ({ name: output.name, dpt: documentDpt(output.dpt) })), knx_bindings: item.knx_bindings ?? item.knxBindings ?? [], signal_bindings: item.signal_bindings ?? item.signalBindings ?? [], http_bindings: item.http_bindings ?? item.httpBindings ?? [], webhook_bindings: item.webhook_bindings ?? item.webhookBindings ?? [], source: item.source, schedules: item.schedules?.length ? scheduleDefinitions : [] })) };
     return sendJson(response, { document, revision: 12, active_logic_revision: 12, saved_logic_revision: 12, active_structural_revision: 1, saved_structural_revision: 1, restart_required: false, blocks: [{ id: 'scheduled_light_test', active_revision: '12', saved_revision: '12', active_logic_revision: 12, saved_logic_revision: 12, active_enabled: true, saved_enabled: true }] });
   }
   if (request.url?.startsWith('/api/schedules/preview')) {

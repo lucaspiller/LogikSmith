@@ -2,6 +2,7 @@ use crate::diagnostics::{ConnectionState, DiagnosticStore, ScheduleHandling, Tel
 use crate::protocol::ProtocolError;
 use crate::web::WebError;
 use crate::*;
+use crate::external::{self, ExternalInputMessage, ExternalInputUpdate};
 use logiksmith_core::{
     BlockId, ClockSample, InputEvent, InputObservation, OutputEffect, Runtime as CoreRuntime,
     RuntimeSimulationError, ScheduleName, ScheduleSimulationError,
@@ -73,13 +74,17 @@ pub async fn run_simulation_only(config: RuntimeConfig) -> Result<(), HostError>
         })?;
     let (activation_sender, activation_receiver) = mpsc::channel(8);
     let (simulation_sender, simulation_receiver) = mpsc::channel(8);
-    let web_server = web::start_web_server_with_runtime(
+    let (external_sender, external_receiver) = mpsc::channel(256);
+    let web_server = web::start_web_server_with_runtime_and_sources(
         store.clone(),
         config.web,
         activation_sender,
         simulation_sender,
+        &config.automation,
+        external_sender.clone(),
     )
     .await?;
+    let external_tasks = external::spawn_http_polls(&config.automation, external_sender, store.clone());
     tracing::info!(target: "logiksmith", "simulation-only mode ready; KNX bridge disabled");
     let result = run_simulation_session(
         &config,
@@ -87,8 +92,10 @@ pub async fn run_simulation_only(config: RuntimeConfig) -> Result<(), HostError>
         &mut runtime,
         activation_receiver,
         simulation_receiver,
+        external_receiver,
     )
     .await;
+    external_tasks.shutdown().await;
     web_server.shutdown().await;
     result
 }
@@ -109,13 +116,17 @@ pub async fn run_with_bridge(
         })?;
     let (activation_sender, activation_receiver) = mpsc::channel(8);
     let (simulation_sender, simulation_receiver) = mpsc::channel(8);
-    let web_server = web::start_web_server_with_runtime(
+    let (external_sender, external_receiver) = mpsc::channel(256);
+    let web_server = web::start_web_server_with_runtime_and_sources(
         store.clone(),
         config.web,
         activation_sender,
         simulation_sender,
+        &config.automation,
+        external_sender.clone(),
     )
     .await?;
+    let external_tasks = external::spawn_http_polls(&config.automation, external_sender, store.clone());
     let mut child = match Command::new(&bridge_command.executable)
         .args(&bridge_command.args)
         .stdin(std::process::Stdio::piped())
@@ -125,6 +136,7 @@ pub async fn run_with_bridge(
     {
         Ok(child) => child,
         Err(source) => {
+            external_tasks.shutdown().await;
             web_server.shutdown().await;
             return Err(HostError::Start {
                 path: bridge_command.executable,
@@ -153,12 +165,14 @@ pub async fn run_with_bridge(
         &mut reader,
         activation_receiver,
         simulation_receiver,
+        external_receiver,
     )
     .await;
     if result.is_err() {
         let _ = send_message(&mut stdin, &shutdown_message()).await;
         terminate_child(&mut child).await;
     }
+    external_tasks.shutdown().await;
     web_server.shutdown().await;
     result
 }
@@ -170,12 +184,103 @@ async fn forward_bridge_stderr<R: AsyncRead + Unpin>(stderr: R) {
     }
 }
 
+/// Applies a desktop-owned external source delivery through the same serial
+/// runtime owner used by KNX events.  HTTP and webhook tasks never touch the
+/// core directly, and a single source fans out in block declaration order.
+async fn apply_external_input(
+    runtime: &mut CoreRuntime,
+    store: &DiagnosticStore,
+    config: &RuntimeConfig,
+    request: ExternalInputMessage,
+    mut bridge: Option<(&mut ChildStdin, &mut u64, &mut HashSet<u64>)>,
+) -> Result<(), HostError> {
+    let bindings = match &request.kind {
+        external::ExternalInputKind::HttpPoll { .. } => config
+            .automation
+            .http_to_inputs
+            .get(&request.source),
+        external::ExternalInputKind::Webhook { .. } => config
+            .automation
+            .webhook_to_inputs
+            .get(&request.source),
+    };
+    let Some(bindings) = bindings else {
+        if let Some(reply) = request.reply {
+            let _ = reply.send(Err(format!("unknown external source {:?}", request.source)));
+        }
+        return Ok(());
+    };
+    let origin = match &request.kind {
+        external::ExternalInputKind::HttpPoll { poll } => {
+            Some(diagnostics::ExecutionOrigin::Http {
+                poll: poll.clone(),
+                value: request.source.clone(),
+            })
+        }
+        external::ExternalInputKind::Webhook { source } => {
+            Some(diagnostics::ExecutionOrigin::Webhook {
+                source: source.clone(),
+            })
+        }
+    };
+    let mut first_error = None;
+    for binding in bindings {
+        let update = match request.update {
+            ExternalInputUpdate::Observe(value) => logiksmith_core::InputUpdate::Observe(value),
+            ExternalInputUpdate::Trigger(value) => logiksmith_core::InputUpdate::Trigger(value),
+            ExternalInputUpdate::Invalidate => logiksmith_core::InputUpdate::Invalidate,
+        };
+        let sample = clock_sample(store);
+        let started = Instant::now();
+        match runtime.process_input_update_sampled(
+            &binding.block_id,
+            binding.endpoint.clone(),
+            update,
+            sample,
+        ) {
+            Ok(executions) => {
+                let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                if !executions.is_empty() {
+                    record_and_dispatch_cascade_with_origin(
+                        runtime,
+                        store,
+                        &config.automation,
+                        executions,
+                        clock_sample(store).monotonic_ms,
+                        duration_us,
+                        bridge.as_mut().map(|(stdin, next_request_id, pending)| {
+                            (&mut **stdin, &mut **next_request_id, &mut **pending)
+                        }),
+                        None,
+                        origin.clone(),
+                    )
+                    .await?;
+                } else {
+                    store.set_runtime_projection_from_runtime(runtime, clock_sample(store).monotonic_ms);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(target: "logiksmith", source = %request.source, block = %binding.block_id, endpoint = %binding.endpoint, error = %error, "ignoring invalid external input");
+                first_error.get_or_insert_with(|| error.to_string());
+            }
+        }
+    }
+    if let Some(reply) = request.reply {
+        let _ = reply.send(match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        });
+    }
+    Ok(())
+}
+
 async fn run_simulation_session(
     config: &RuntimeConfig,
     store: &DiagnosticStore,
     runtime: &mut CoreRuntime,
     mut activations: mpsc::Receiver<ActivationRequest>,
     mut simulations: mpsc::Receiver<SimulationRequest>,
+    mut external: mpsc::Receiver<ExternalInputMessage>,
 ) -> Result<(), HostError> {
     let interrupt = signal::ctrl_c();
     tokio::pin!(interrupt);
@@ -189,6 +294,10 @@ async fn run_simulation_session(
             }
             Some(request) = simulations.recv() => {
                 apply_simulation(runtime, store, config, request);
+                reset_timer_sleep(&mut timer_sleep, runtime, store, config);
+            }
+            Some(request) = external.recv() => {
+                apply_external_input(runtime, store, config, request, None).await?;
                 reset_timer_sleep(&mut timer_sleep, runtime, store, config);
             }
             _ = &mut timer_sleep => {
@@ -213,6 +322,7 @@ async fn run_session(
     reader: &mut BufReader<ChildStdout>,
     mut activations: mpsc::Receiver<ActivationRequest>,
     mut simulations: mpsc::Receiver<SimulationRequest>,
+    mut external: mpsc::Receiver<ExternalInputMessage>,
 ) -> Result<(), HostError> {
     let hello = match read_message(reader).await? {
         Message::BridgeHello(hello) => hello,
@@ -285,7 +395,7 @@ async fn run_session(
                                 let result = runtime.process_input_cascade_sampled(&binding.block_id, input, sample.clone());
                                 let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
                                 match result {
-                                    Ok(executions) => record_and_dispatch_cascade(
+                                    Ok(executions) => record_and_dispatch_cascade_with_origin(
                                         runtime,
                                         store,
                                         &config.automation,
@@ -294,6 +404,9 @@ async fn run_session(
                                         duration_us,
                                         Some((&mut *stdin, &mut next_request_id, &mut pending)),
                                         None,
+                                        Some(diagnostics::ExecutionOrigin::Knx {
+                                            group_address: Some(destination.to_string()),
+                                        }),
                                     ).await?,
                                     Err(error) => tracing::warn!(target: "logiksmith", block = %binding.block_id, error = %error, "ignoring invalid logical input event"),
                                 }
@@ -325,6 +438,10 @@ async fn run_session(
             }
             Some(request) = simulations.recv() => {
                 apply_simulation(runtime, store, config, request);
+                reset_timer_sleep(&mut timer_sleep, runtime, store, config);
+            }
+            Some(request) = external.recv() => {
+                apply_external_input(runtime, store, config, request, Some((&mut *stdin, &mut next_request_id, &mut pending))).await?;
                 reset_timer_sleep(&mut timer_sleep, runtime, store, config);
             }
             _ = &mut timer_sleep => {

@@ -84,16 +84,42 @@ async fn record_and_dispatch_cascade(
     executions: Vec<logiksmith_core::BlockExecution>,
     now: logiksmith_core::MonotonicMs,
     duration_us: u64,
-    mut bridge: Option<(&mut ChildStdin, &mut u64, &mut HashSet<u64>)>,
+    bridge: Option<(&mut ChildStdin, &mut u64, &mut HashSet<u64>)>,
     schedule_handling: Option<ScheduleHandling>,
 ) -> Result<(), HostError> {
+    record_and_dispatch_cascade_with_origin(
+        runtime,
+        store,
+        automation,
+        executions,
+        now,
+        duration_us,
+        bridge,
+        schedule_handling,
+        None,
+    )
+    .await
+}
+
+async fn record_and_dispatch_cascade_with_origin(
+    runtime: &CoreRuntime,
+    store: &DiagnosticStore,
+    automation: &AutomationRuntime,
+    executions: Vec<logiksmith_core::BlockExecution>,
+    now: logiksmith_core::MonotonicMs,
+    duration_us: u64,
+    mut bridge: Option<(&mut ChildStdin, &mut u64, &mut HashSet<u64>)>,
+    schedule_handling: Option<ScheduleHandling>,
+    origin: Option<diagnostics::ExecutionOrigin>,
+) -> Result<(), HostError> {
     for execution in executions {
-        store.record_block_execution(
+        store.record_block_execution_with_origin(
             &execution,
             now,
             duration_us,
             automation,
             schedule_handling,
+            origin.clone(),
         );
         if let Some((stdin, next_request_id, pending)) = bridge.as_mut()
             && let Ok(transition) = &execution.execution.outcome

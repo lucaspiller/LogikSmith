@@ -240,6 +240,12 @@ pub struct AutomationRuntime {
     pub output_to_address: HashMap<(BlockId, EndpointName), GroupAddress>,
     pub signal_to_inputs: HashMap<SignalName, Vec<BlockSignalInputBinding>>,
     pub output_to_signal: HashMap<(BlockId, EndpointName), SignalName>,
+    /// Poll value source bindings, kept in block declaration order.
+    pub http_to_inputs: HashMap<String, Vec<BlockExternalInputBinding>>,
+    /// Webhook source bindings, kept in block declaration order.
+    pub webhook_to_inputs: HashMap<String, Vec<BlockExternalInputBinding>>,
+    pub http_polls: Vec<HttpPollRuntime>,
+    pub webhook_inputs: Vec<WebhookInputRuntime>,
     pub address_dpts: HashMap<GroupAddress, Dpt>,
     pub structural_revision: u64,
     pub document_revision: u64,
@@ -253,6 +259,7 @@ pub struct BlockRuntime {
     pub engine_config: EngineConfig,
     pub endpoint_to_address: HashMap<EndpointName, GroupAddress>,
     pub endpoint_to_signal: HashMap<EndpointName, SignalName>,
+    pub endpoint_to_external: HashMap<EndpointName, String>,
     pub endpoint_dpts: HashMap<EndpointName, Dpt>,
     /// Validated schedule definitions owned by this block. The desktop keeps
     /// them beside the KNX maps for diagnostics and simulation routing; the
@@ -282,6 +289,14 @@ pub struct BlockSignalInputBinding {
     pub signal: SignalName,
 }
 
+#[derive(Debug, Clone)]
+pub struct BlockExternalInputBinding {
+    pub block_id: BlockId,
+    pub endpoint: EndpointName,
+    pub dpt: Dpt,
+    pub source: String,
+}
+
 impl AutomationRuntime {
     pub fn block(&self, id: &BlockId) -> Option<&BlockRuntime> {
         self.blocks.iter().find(|block| block.id == *id)
@@ -297,6 +312,10 @@ impl AutomationRuntime {
 pub struct AutomationDocument {
     #[serde(default)]
     pub signals: Vec<AutomationSignal>,
+    #[serde(default)]
+    pub http_polls: Vec<HttpPoll>,
+    #[serde(default)]
+    pub webhook_inputs: Vec<WebhookInput>,
     pub blocks: Vec<AutomationBlock>,
 }
 
@@ -322,6 +341,10 @@ pub struct AutomationBlock {
     pub knx_bindings: Vec<KnxBinding>,
     #[serde(default)]
     pub signal_bindings: Vec<SignalBinding>,
+    #[serde(default)]
+    pub http_bindings: Vec<HttpBinding>,
+    #[serde(default)]
+    pub webhook_bindings: Vec<WebhookBinding>,
     pub source: String,
     #[serde(default)]
     pub schedules: Vec<AutomationSchedule>,
@@ -381,6 +404,87 @@ pub struct KnxBinding {
 pub struct SignalBinding {
     pub endpoint: String,
     pub signal: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpPoll {
+    pub name: String,
+    pub url: String,
+    pub every: String,
+    pub timeout: String,
+    pub stale_after: String,
+    #[serde(default)]
+    pub headers: Vec<HttpHeader>,
+    pub values: Vec<HttpPollValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpHeader {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpPollValue {
+    pub name: String,
+    pub dpt: String,
+    pub json_pointer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookInput {
+    pub name: String,
+    pub dpt: String,
+    pub json_pointer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpBinding {
+    pub endpoint: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookBinding {
+    pub endpoint: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpPollRuntime {
+    pub name: String,
+    pub url: String,
+    pub every: std::time::Duration,
+    pub timeout: std::time::Duration,
+    pub stale_after: std::time::Duration,
+    pub headers: Vec<(String, String)>,
+    pub values: Vec<HttpPollValueRuntime>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpPollValueRuntime {
+    pub name: String,
+    pub dpt: Dpt,
+    pub json_pointer: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebhookInputRuntime {
+    pub name: String,
+    pub dpt: Dpt,
+    pub json_pointer: String,
+    pub bearer_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

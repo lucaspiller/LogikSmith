@@ -115,7 +115,7 @@ fn parse_dpt(path: &str, value: &str) -> Result<Dpt, FieldError> {
     if !dpt.is_supported() {
         return Err(FieldError {
             path: path.to_owned(),
-            message: "must be 1.001 or 5.001".to_owned(),
+            message: "must be 1.001, 5.001, or 9.001".to_owned(),
         });
     }
     if dpt.to_string() != value {
@@ -135,6 +135,157 @@ pub(crate) fn endpoint_name(path: &str, value: &str) -> Result<EndpointName, Fie
 }
 
 const MAX_LOGIC_SOURCE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_EXTERNAL_SOURCES: usize = 64;
+pub(crate) const MAX_EXTERNAL_VALUES_AND_BINDINGS: usize = 256;
+pub(crate) const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
+const MAX_HTTP_URL_BYTES: usize = 2 * 1024;
+const MAX_JSON_POINTER_BYTES: usize = 256;
+const MAX_HTTP_HEADERS: usize = 16;
+const MIN_POLL_INTERVAL_SECONDS: u64 = 1;
+const MAX_POLL_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
+const MIN_REQUEST_TIMEOUT_MILLIS: u64 = 100;
+const MAX_REQUEST_TIMEOUT_MILLIS: u64 = 30 * 1000;
+const MAX_FRESHNESS_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+fn validate_json_pointer(path: &str, pointer: &str, errors: &mut Vec<FieldError>) -> bool {
+    if pointer.len() > MAX_JSON_POINTER_BYTES {
+        errors.push(FieldError {
+            path: path.to_owned(),
+            message: format!("must not exceed {MAX_JSON_POINTER_BYTES} bytes"),
+        });
+        return false;
+    }
+    if pointer.is_empty() {
+        return true;
+    }
+    if !pointer.starts_with('/') {
+        errors.push(FieldError {
+            path: path.to_owned(),
+            message: "must be empty or an RFC 6901 pointer beginning with '/'".to_owned(),
+        });
+        return false;
+    }
+    let mut valid = true;
+    for token in pointer.split('/').skip(1) {
+        let bytes = token.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'~' {
+                if index + 1 >= bytes.len() || !matches!(bytes[index + 1], b'0' | b'1') {
+                    valid = false;
+                    break;
+                }
+                index += 2;
+            } else {
+                index += 1;
+            }
+        }
+        if !valid {
+            break;
+        }
+    }
+    if !valid {
+        errors.push(FieldError {
+            path: path.to_owned(),
+            message: "must use valid RFC 6901 '~0' and '~1' escapes".to_owned(),
+        });
+    }
+    valid
+}
+
+fn parse_source_duration(path: &str, value: &str, errors: &mut Vec<FieldError>) -> Option<std::time::Duration> {
+    let Some(seconds) = parse_duration_field(path, value, false, errors) else {
+        return None;
+    };
+    u64::try_from(seconds).ok().map(std::time::Duration::from_secs)
+}
+
+fn parse_timeout_duration(
+    path: &str,
+    value: &str,
+    errors: &mut Vec<FieldError>,
+) -> Option<std::time::Duration> {
+    let parsed = match value.strip_suffix("ms") {
+        Some(millis) if !millis.is_empty() && millis.bytes().all(|byte| byte.is_ascii_digit()) =>
+            millis.parse::<u64>().ok().map(std::time::Duration::from_millis),
+        _ => parse_source_duration(path, value, errors),
+    };
+    let Some(duration) = parsed else { return None; };
+    if !(std::time::Duration::from_millis(MIN_REQUEST_TIMEOUT_MILLIS)..=std::time::Duration::from_millis(MAX_REQUEST_TIMEOUT_MILLIS)).contains(&duration) {
+        errors.push(FieldError {
+            path: path.to_owned(),
+            message: "must be between 100ms and 30s".to_owned(),
+        });
+        return None;
+    }
+    Some(duration)
+}
+
+fn source_name(path: &str, value: &str, errors: &mut Vec<FieldError>) -> Option<String> {
+    match endpoint_name(path, value) {
+        Ok(name) if name.as_str() == value => Some(value.to_owned()),
+        Ok(_) => {
+            errors.push(FieldError {
+                path: path.to_owned(),
+                message: "must use canonical identifier form".to_owned(),
+            });
+            None
+        }
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    }
+}
+
+fn validate_header(
+    path: &str,
+    header: &HttpHeader,
+    errors: &mut Vec<FieldError>,
+) -> Option<(String, String)> {
+    if header.name.is_empty() || header.name.len() > 128 || header.name.bytes().any(|byte| byte <= 32 || byte >= 127 || byte == b':') {
+        errors.push(FieldError {
+            path: format!("{path}.name"),
+            message: "must be a valid non-empty HTTP header name".to_owned(),
+        });
+        return None;
+    }
+    if header.value.is_some() == header.value_env.is_some() {
+        errors.push(FieldError {
+            path: path.to_owned(),
+            message: "must set exactly one of value or value_env".to_owned(),
+        });
+        return None;
+    }
+    let value = match (&header.value, &header.value_env) {
+        (Some(value), None) => value.clone(),
+        (None, Some(variable)) if !variable.is_empty() => match std::env::var(variable) {
+            Ok(value) => value,
+            Err(_) => {
+                errors.push(FieldError {
+                    path: format!("{path}.value_env"),
+                    message: format!("environment variable {variable:?} is not set"),
+                });
+                return None;
+            }
+        },
+        _ => {
+            errors.push(FieldError {
+                path: format!("{path}.value_env"),
+                message: "must not be empty".to_owned(),
+            });
+            return None;
+        }
+    };
+    if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+        errors.push(FieldError {
+            path: path.to_owned(),
+            message: "must not contain CR or LF".to_owned(),
+        });
+        return None;
+    }
+    Some((header.name.clone(), value))
+}
 
 // ---------------------------------------------------------------------------
 // Schedule document validation

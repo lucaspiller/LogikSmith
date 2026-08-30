@@ -1,4 +1,4 @@
-export const DPTS = ['1.001', '5.001'] as const;
+export const DPTS = ['1.001', '5.001', '9.001'] as const;
 export const MAX_SOURCE_BYTES = 64 * 1024;
 export const MAX_BLOCKS = 64;
 export type Dpt = (typeof DPTS)[number];
@@ -6,6 +6,12 @@ export type Dpt = (typeof DPTS)[number];
 export interface AutomationEndpoint { name: string; dpt: Dpt; }
 export interface KnxBinding { endpoint: string; group_address: string; }
 export interface SignalBinding { endpoint: string; signal: string; }
+export interface HttpHeader { name: string; value?: string; value_env?: string; }
+export interface HttpPollValue { name: string; dpt: Dpt; json_pointer: string; }
+export interface HttpPoll { name: string; url: string; every: string; timeout: string; stale_after: string; headers: HttpHeader[]; values: HttpPollValue[]; }
+export interface WebhookInput { name: string; dpt: Dpt; json_pointer: string; bearer_token_env?: string; }
+export interface HttpBinding { endpoint: string; source: string; }
+export interface WebhookBinding { endpoint: string; source: string; }
 export interface AutomationSignal { name: string; dpt: Dpt; }
 export interface AutomationLogic { source: string; }
 export type ScheduleKind = 'fixed' | 'interval' | 'astronomical';
@@ -30,6 +36,8 @@ export interface AutomationBlock {
   outputs: AutomationEndpoint[];
   knx_bindings: KnxBinding[];
   signal_bindings?: SignalBinding[];
+  http_bindings?: HttpBinding[];
+  webhook_bindings?: WebhookBinding[];
   source: string;
   schedules: AutomationSchedule[];
 }
@@ -41,6 +49,8 @@ export interface AutomationDocument {
   outputs: AutomationEndpoint[];
   knx_bindings: KnxBinding[];
   logic: AutomationLogic;
+  http_polls?: HttpPoll[];
+  webhook_inputs?: WebhookInput[];
 }
 export interface AutomationFieldError { path: string; message: string; }
 export interface AutomationEnvelope {
@@ -74,9 +84,9 @@ export class AutomationApiError extends Error {
   readonly status: number; readonly fieldErrors: AutomationFieldError[]; readonly latest: AutomationEnvelope | null;
   constructor(status: number, message: string, fieldErrors: AutomationFieldError[] = [], latest: AutomationEnvelope | null = null) { super(message); this.name = 'AutomationApiError'; this.status = status; this.fieldErrors = fieldErrors; this.latest = latest; }
 }
-export const emptyAutomation = (): AutomationDocument => ({ blocks: [], signals: [], inputs: [], outputs: [], knx_bindings: [], logic: { source: '' } });
+export const emptyAutomation = (): AutomationDocument => ({ blocks: [], signals: [], inputs: [], outputs: [], knx_bindings: [], logic: { source: '' }, http_polls: [], webhook_inputs: [] });
 function canonicalBlocks(document: AutomationDocument): AutomationBlock[] {
-  if (document.inputs && document.outputs && document.knx_bindings && document.logic) return [{ id: 'default', revision: '1', enabled: true, inputs: document.inputs, outputs: document.outputs, knx_bindings: document.knx_bindings, signal_bindings: [], source: document.logic.source, schedules: [] }];
+  if (document.inputs && document.outputs && document.knx_bindings && document.logic && (!document.blocks || document.blocks.length === 0 || (document.blocks.length === 1 && document.blocks[0]?.id === 'default'))) return [{ id: 'default', revision: '1', enabled: true, inputs: document.inputs, outputs: document.outputs, knx_bindings: document.knx_bindings, signal_bindings: [], http_bindings: [], webhook_bindings: [], source: document.logic.source, schedules: [] }];
   if (Array.isArray(document.blocks) && document.blocks.length) return document.blocks;
   return document.blocks ?? [];
 }
@@ -89,7 +99,7 @@ function nonNegativeInteger(value: unknown, path: string): number { if (typeof v
 function dpt(value: unknown, path: string): Dpt {
   let normalized = value;
   if (isRecord(value) && typeof value.major === 'number' && typeof value.subtype === 'number' && Number.isInteger(value.major) && Number.isInteger(value.subtype)) normalized = `${value.major}.${value.subtype.toString().padStart(3, '0')}`;
-  if (normalized !== '1.001' && normalized !== '5.001') throw new AutomationDecodeError(path, 'expected DPT 1.001 or 5.001');
+  if (normalized !== '1.001' && normalized !== '5.001' && normalized !== '9.001') throw new AutomationDecodeError(path, 'expected DPT 1.001, 5.001, or 9.001');
   return normalized;
 }
 function list(value: unknown, path: string): unknown[] { if (!Array.isArray(value)) throw new AutomationDecodeError(path, 'expected an array'); return value; }
@@ -106,6 +116,50 @@ function binding(value: unknown, path: string): KnxBinding {
 function signalBinding(value: unknown, path: string): SignalBinding {
   const source = record(value, path);
   return { endpoint: nonEmptyString(field(source, 'endpoint', 'name'), `${path}.endpoint`), signal: nonEmptyString(field(source, 'signal'), `${path}.signal`) };
+}
+function externalBinding(value: unknown, path: string): HttpBinding {
+  const source = record(value, path);
+  return { endpoint: nonEmptyString(field(source, 'endpoint', 'name'), `${path}.endpoint`), source: nonEmptyString(field(source, 'source'), `${path}.source`) };
+}
+function jsonPointer(value: unknown, path: string): string {
+  if (typeof value !== 'string') throw new AutomationDecodeError(path, 'expected an RFC 6901 JSON Pointer');
+  const pointer = value;
+  if (pointer.length > 256 || (pointer !== '' && !pointer.startsWith('/'))) throw new AutomationDecodeError(path, 'expected an RFC 6901 JSON Pointer of at most 256 characters');
+  return pointer;
+}
+function httpHeader(value: unknown, path: string): HttpHeader {
+  const source = record(value, path);
+  const name = nonEmptyString(required(source, 'name', `${path}.name`), `${path}.name`);
+  const headerValue = field(source, 'value');
+  const valueEnv = field(source, 'value_env', 'valueEnv');
+  if (headerValue !== undefined && headerValue !== null && typeof headerValue !== 'string') throw new AutomationDecodeError(`${path}.value`, 'expected a string');
+  if (valueEnv !== undefined && valueEnv !== null && typeof valueEnv !== 'string') throw new AutomationDecodeError(`${path}.value_env`, 'expected a string');
+  if ((headerValue === undefined || headerValue === null) === (valueEnv === undefined || valueEnv === null)) throw new AutomationDecodeError(path, 'exactly one of value or value_env is required');
+  return { name, ...(headerValue !== undefined && headerValue !== null ? { value: headerValue as string } : {}), ...(valueEnv !== undefined && valueEnv !== null ? { value_env: valueEnv as string } : {}) };
+}
+function httpPollValue(value: unknown, path: string): HttpPollValue {
+  const source = record(value, path);
+  return { name: nonEmptyString(required(source, 'name', `${path}.name`), `${path}.name`), dpt: dpt(required(source, 'dpt', `${path}.dpt`), `${path}.dpt`), json_pointer: jsonPointer(required(source, 'json_pointer', `${path}.json_pointer`), `${path}.json_pointer`) };
+}
+function httpPoll(value: unknown, path: string): HttpPoll {
+  const source = record(value, path);
+  const headersRaw = field(source, 'headers');
+  const valuesRaw = required(source, 'values', `${path}.values`);
+  return {
+    name: nonEmptyString(required(source, 'name', `${path}.name`), `${path}.name`),
+    url: nonEmptyString(required(source, 'url', `${path}.url`), `${path}.url`),
+    every: nonEmptyString(required(source, 'every', `${path}.every`), `${path}.every`),
+    timeout: nonEmptyString(required(source, 'timeout', `${path}.timeout`), `${path}.timeout`),
+    stale_after: nonEmptyString(required(source, 'stale_after', `${path}.stale_after`), `${path}.stale_after`),
+    headers: headersRaw === undefined || headersRaw === null ? [] : list(headersRaw, `${path}.headers`).map((item, index) => httpHeader(item, `${path}.headers[${index}]`)),
+    values: list(valuesRaw, `${path}.values`).map((item, index) => httpPollValue(item, `${path}.values[${index}]`))
+  };
+}
+function webhookInput(value: unknown, path: string): WebhookInput {
+  const source = record(value, path);
+  const token = field(source, 'bearer_token_env', 'bearerTokenEnv');
+  if (token !== undefined && token !== null && typeof token !== 'string') throw new AutomationDecodeError(`${path}.bearer_token_env`, 'expected a string');
+  return { name: nonEmptyString(required(source, 'name', `${path}.name`), `${path}.name`), dpt: dpt(required(source, 'dpt', `${path}.dpt`), `${path}.dpt`), json_pointer: jsonPointer(required(source, 'json_pointer', `${path}.json_pointer`), `${path}.json_pointer`), ...(token !== undefined && token !== null ? { bearer_token_env: token as string } : {}) };
 }
 function signal(value: unknown, path: string): AutomationSignal {
   const source = record(value, path);
@@ -155,6 +209,10 @@ function block(value: unknown, path: string): AutomationBlock {
   const bindings = bindingsRaw === undefined || bindingsRaw === null ? [] : list(bindingsRaw, `${path}.knx_bindings`).map((item, index) => binding(item, `${path}.knx_bindings[${index}]`));
   const signalBindingsRaw = field(source, 'signal_bindings', 'signalBindings');
   const signalBindings = signalBindingsRaw === undefined || signalBindingsRaw === null ? [] : list(signalBindingsRaw, `${path}.signal_bindings`).map((item, index) => signalBinding(item, `${path}.signal_bindings[${index}]`));
+  const httpBindingsRaw = field(source, 'http_bindings', 'httpBindings');
+  const httpBindings = httpBindingsRaw === undefined || httpBindingsRaw === null ? [] : list(httpBindingsRaw, `${path}.http_bindings`).map((item, index) => externalBinding(item, `${path}.http_bindings[${index}]`));
+  const webhookBindingsRaw = field(source, 'webhook_bindings', 'webhookBindings');
+  const webhookBindings = webhookBindingsRaw === undefined || webhookBindingsRaw === null ? [] : list(webhookBindingsRaw, `${path}.webhook_bindings`).map((item, index) => externalBinding(item, `${path}.webhook_bindings[${index}]`));
   const logic = field(source, 'source', 'logic');
   const sourceTextValue = isRecord(logic) ? required(logic, 'source', `${path}.source`) : logic;
   if (typeof source.enabled !== 'boolean') throw new AutomationDecodeError(`${path}.enabled`, 'expected a boolean');
@@ -164,7 +222,7 @@ function block(value: unknown, path: string): AutomationBlock {
   const schedules = schedulesRaw === undefined || schedulesRaw === null ? [] : list(schedulesRaw, `${path}.schedules`).map((item, index) => decodeSchedule(item, `${path}.schedules[${index}]`));
   if (schedules.length > 32) throw new AutomationDecodeError(`${path}.schedules`, 'must contain at most 32 schedules');
   const names = new Set<string>(); schedules.forEach((item, index) => { if (names.has(item.name)) throw new AutomationDecodeError(`${path}.schedules[${index}].name`, `duplicate schedule name ${item.name}`); names.add(item.name); });
-  return { id: blockId(required(source, 'id', `${path}.id`), `${path}.id`), revision: revisionValue, enabled: source.enabled, inputs, outputs, knx_bindings: bindings, signal_bindings: signalBindings, source: sourceText(sourceTextValue, `${path}.source`), schedules };
+  return { id: blockId(required(source, 'id', `${path}.id`), `${path}.id`), revision: revisionValue, enabled: source.enabled, inputs, outputs, knx_bindings: bindings, signal_bindings: signalBindings, http_bindings: httpBindings, webhook_bindings: webhookBindings, source: sourceText(sourceTextValue, `${path}.source`), schedules };
 }
 
 /** Decode canonical blocks. The legacy branch exists only to keep Milestone 7 fixtures readable during migration. */
@@ -178,10 +236,14 @@ export function decodeAutomationDocument(input: unknown, path = 'document'): Aut
     blocks.forEach((item, index) => { if (seen.has(item.id)) throw new AutomationDecodeError(`${path}.blocks[${index}].id`, `duplicate block id ${item.id}`); seen.add(item.id); });
     const signalsRaw = field(source, 'signals');
     const signals = signalsRaw === undefined || signalsRaw === null ? [] : list(signalsRaw, `${path}.signals`).map((value, index) => signal(value, `${path}.signals[${index}]`));
-    return { blocks, signals } as AutomationDocument;
+    const httpRaw = field(source, 'http_polls', 'httpPolls');
+    const webhookRaw = field(source, 'webhook_inputs', 'webhookInputs');
+    const http_polls = httpRaw === undefined || httpRaw === null ? [] : list(httpRaw, `${path}.http_polls`).map((value, index) => httpPoll(value, `${path}.http_polls[${index}]`));
+    const webhook_inputs = webhookRaw === undefined || webhookRaw === null ? [] : list(webhookRaw, `${path}.webhook_inputs`).map((value, index) => webhookInput(value, `${path}.webhook_inputs[${index}]`));
+    return { blocks, signals, http_polls, webhook_inputs } as AutomationDocument;
   }
   const legacyLogic = record(required(source, 'logic', `${path}.logic`), `${path}.logic`); const inputs = list(required(source, 'inputs', `${path}.inputs`), `${path}.inputs`).map((value, index) => endpoint(value, `${path}.inputs[${index}]`)); const outputs = list(required(source, 'outputs', `${path}.outputs`), `${path}.outputs`).map((value, index) => endpoint(value, `${path}.outputs[${index}]`)); const bindings = list(required(source, 'knx_bindings', `${path}.knx_bindings`), `${path}.knx_bindings`).map((value, index) => binding(value, `${path}.knx_bindings[${index}]`)); const sourceValue = sourceText(required(legacyLogic, 'source', `${path}.logic.source`), `${path}.logic.source`);
-  return { inputs, outputs, knx_bindings: bindings, logic: { source: sourceValue }, signals: [] };
+  return { inputs, outputs, knx_bindings: bindings, logic: { source: sourceValue }, signals: [], http_polls: [], webhook_inputs: [] };
 }
 function logicRevision(value: unknown, path: string): RevisionToken {
   const token = parseRevisionToken(value);
@@ -206,7 +268,7 @@ export async function saveAutomation(document: AutomationDocument, replacedRevis
   // The automation document remains the desktop's persisted authority. Its
   // config revision uses the document serializer's native representation;
   // browser-facing active/saved status and simulation tokens stay opaque.
-  const persisted = document.blocks?.length ? { ...(document.signals?.length ? { signals: document.signals } : {}), blocks: document.blocks } : document;
+  const persisted = document.blocks?.length ? { ...(document.signals?.length ? { signals: document.signals } : {}), ...(document.http_polls?.length ? { http_polls: document.http_polls } : {}), ...(document.webhook_inputs?.length ? { webhook_inputs: document.webhook_inputs } : {}), blocks: document.blocks } : document;
   const response = await fetchImpl('/api/automation', { method: 'PUT', headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify({ document: persisted }) });
   if (response.ok) {
     const source = record(await response.json(), 'save'); const cancellationRaw = field(source, 'cancelled_timers', 'cancelledTimers');
@@ -276,7 +338,7 @@ function validateBlock(blockValue: AutomationBlock, index: number, errors: Autom
     const path = `${base}.${direction}[${endpointIndex}]`;
     if (!namePattern.test(item.name)) addError(errors, `${path}.name`, 'must start with a lowercase ASCII letter and contain only lowercase letters, digits, or _');
     const prior = names.get(item.name); if (prior) addError(errors, `${path}.name`, `duplicates ${prior}`); else names.set(item.name, path);
-    if (!DPTS.includes(item.dpt)) addError(errors, `${path}.dpt`, 'must be 1.001 or 5.001');
+    if (!DPTS.includes(item.dpt)) addError(errors, `${path}.dpt`, 'must be 1.001, 5.001, or 9.001');
   });
   const bindingNames = new Map<string, string>(); const addresses = new Map<string, string>();
   blockValue.knx_bindings.forEach((item, bindingIndex) => {
@@ -293,7 +355,17 @@ function validateBlock(blockValue: AutomationBlock, index: number, errors: Autom
     if (!namePattern.test(item.signal)) addError(errors, `${path}.signal`, 'must be a valid signal name');
     if (declaredSignals.size && !declaredSignals.has(item.signal)) addError(errors, `${path}.signal`, 'must reference an existing signal');
   });
-  for (const [name, path] of names) if (!bindingNames.has(name)) addError(errors, `${path}.name`, 'must have exactly one KNX or signal binding');
+  const external = [
+    ...(blockValue.http_bindings ?? []).map((item, bindingIndex) => ({ item, path: `${base}.http_bindings[${bindingIndex}]` })),
+    ...(blockValue.webhook_bindings ?? []).map((item, bindingIndex) => ({ item, path: `${base}.webhook_bindings[${bindingIndex}]` }))
+  ];
+  external.forEach(({ item, path }) => {
+    const prior = bindingNames.get(item.endpoint);
+    if (prior) addError(errors, `${path}.endpoint`, `duplicate binding; already declared at ${prior}`); else bindingNames.set(item.endpoint, path);
+    if (!names.has(item.endpoint)) addError(errors, `${path}.endpoint`, 'must reference an existing endpoint');
+    if (!namePattern.test(item.source)) addError(errors, `${path}.source`, 'must be a valid external source name');
+  });
+  for (const [name, path] of names) if (!bindingNames.has(name)) addError(errors, `${path}.name`, 'must have exactly one KNX, signal, HTTP, or webhook binding');
   if (!isRevisionToken(blockValue.revision)) addError(errors, `${base}.revision`, 'must be a non-negative decimal revision token');
   blockValue.schedules.forEach((scheduleValue, scheduleIndex) => validateSchedule(scheduleValue, index, scheduleIndex, errors)); if (blockValue.schedules.length > 32) addError(errors, `${base}.schedules`, 'must contain at most 32 schedules');
   if (typeof blockValue.source !== 'string' || blockValue.source.trim().length === 0) addError(errors, `${base}.source`, 'must contain a Lua source program'); else if (new TextEncoder().encode(blockValue.source).byteLength > MAX_SOURCE_BYTES) addError(errors, `${base}.source`, `must be at most ${MAX_SOURCE_BYTES} bytes`);
@@ -303,14 +375,14 @@ export function validateAutomation(document: AutomationDocument): AutomationFiel
   const declaredSignals = new Set<string>(); (document.signals ?? []).forEach((item, index) => { if (!namePattern.test(item.name)) addError(errors, `signals[${index}].name`, 'must start with a lowercase ASCII letter and contain only lowercase letters, digits, or _'); if (!DPTS.includes(item.dpt)) addError(errors, `signals[${index}].dpt`, 'must be 1.001 or 5.001'); if (declaredSignals.has(item.name)) addError(errors, `signals[${index}].name`, `duplicates ${item.name}`); declaredSignals.add(item.name); });
   const ids = new Map<string, number>(); blocks.forEach((item, index) => { const prior = ids.get(item.id); if (prior !== undefined) addError(errors, `${legacy ? '' : `blocks[${index}].`}id`, `duplicates ${legacy ? '' : `blocks[${prior}].`}id`); else ids.set(item.id, index); const before = errors.length; validateBlock(item, index, errors, declaredSignals); if (legacy) errors.splice(before, errors.length - before, ...errors.slice(before).map((error) => ({ ...error, path: error.path.replace(`blocks[${index}].`, '') === 'source' ? 'logic.source' : error.path.replace(`blocks[${index}].`, '') }))); }); return errors;
 }
-export function blockWithSource(document: AutomationDocument, id: string, source: string): AutomationDocument { return { blocks: canonicalBlocks(document).map((item) => item.id === id ? { ...item, source } : item) } as AutomationDocument; }
+export function blockWithSource(document: AutomationDocument, id: string, source: string): AutomationDocument { return { ...document, blocks: canonicalBlocks(document).map((item) => item.id === id ? { ...item, source } : item) } as AutomationDocument; }
 export function blockById(document: AutomationDocument, id: string): AutomationBlock | null { return canonicalBlocks(document).find((item) => item.id === id) ?? null; }
 export function renameEndpoint(document: AutomationDocument, blockIdOrFrom: string, fromOrTo: string, maybeTo?: string): AutomationDocument {
   const legacy = maybeTo === undefined; const blockId = legacy ? 'default' : blockIdOrFrom; const from = legacy ? blockIdOrFrom : fromOrTo; const to = legacy ? fromOrTo : maybeTo;
-  const next = { signals: document.signals, blocks: canonicalBlocks(document).map((blockValue) => blockValue.id === blockId ? { ...blockValue, inputs: blockValue.inputs.map((item) => item.name === from ? { ...item, name: to } : item), outputs: blockValue.outputs.map((item) => item.name === from ? { ...item, name: to } : item), knx_bindings: blockValue.knx_bindings.map((item) => item.endpoint === from ? { ...item, endpoint: to } : item), signal_bindings: (blockValue.signal_bindings ?? []).map((item) => item.endpoint === from ? { ...item, endpoint: to } : item) } : blockValue) };
-  return legacy ? { inputs: next.blocks[0]?.inputs ?? [], outputs: next.blocks[0]?.outputs ?? [], knx_bindings: next.blocks[0]?.knx_bindings ?? [], logic: { source: next.blocks[0]?.source ?? '' }, blocks: next.blocks, signals: document.signals } : next as AutomationDocument;
+  const next = { ...document, signals: document.signals, blocks: canonicalBlocks(document).map((blockValue) => blockValue.id === blockId ? { ...blockValue, inputs: blockValue.inputs.map((item) => item.name === from ? { ...item, name: to } : item), outputs: blockValue.outputs.map((item) => item.name === from ? { ...item, name: to } : item), knx_bindings: blockValue.knx_bindings.map((item) => item.endpoint === from ? { ...item, endpoint: to } : item), signal_bindings: (blockValue.signal_bindings ?? []).map((item) => item.endpoint === from ? { ...item, endpoint: to } : item), http_bindings: (blockValue.http_bindings ?? []).map((item) => item.endpoint === from ? { ...item, endpoint: to } : item), webhook_bindings: (blockValue.webhook_bindings ?? []).map((item) => item.endpoint === from ? { ...item, endpoint: to } : item) } : blockValue) };
+  return legacy ? { ...next, inputs: next.blocks[0]?.inputs ?? [], outputs: next.blocks[0]?.outputs ?? [], knx_bindings: next.blocks[0]?.knx_bindings ?? [], logic: { source: next.blocks[0]?.source ?? '' } } : next as AutomationDocument;
 }
-export function removeEndpoint(document: AutomationDocument, blockIdOrName: string, maybeName?: string): AutomationDocument { const legacy = maybeName === undefined; const blockId = legacy ? 'default' : blockIdOrName; const name = legacy ? blockIdOrName : maybeName; const blocks = canonicalBlocks(document).map((blockValue) => blockValue.id === blockId ? { ...blockValue, inputs: blockValue.inputs.filter((item) => item.name !== name), outputs: blockValue.outputs.filter((item) => item.name !== name), knx_bindings: blockValue.knx_bindings.filter((item) => item.endpoint !== name), signal_bindings: (blockValue.signal_bindings ?? []).filter((item) => item.endpoint !== name) } : blockValue); return legacy ? { ...document, inputs: blocks[0]?.inputs ?? [], outputs: blocks[0]?.outputs ?? [], blocks } : { ...document, blocks } as AutomationDocument; }
-export function removeBinding(document: AutomationDocument, blockIdOrIndex: string | number, indexMaybe?: number): AutomationDocument { const legacy = indexMaybe === undefined; const blockId = legacy ? 'default' : String(blockIdOrIndex); const index = legacy ? Number(blockIdOrIndex) : indexMaybe; const blocks = canonicalBlocks(document).map((blockValue) => blockValue.id === blockId ? { ...blockValue, knx_bindings: blockValue.knx_bindings.filter((_, current) => current !== index) } : blockValue); return legacy ? { ...document, blocks } : { blocks } as AutomationDocument; }
+export function removeEndpoint(document: AutomationDocument, blockIdOrName: string, maybeName?: string): AutomationDocument { const legacy = maybeName === undefined; const blockId = legacy ? 'default' : blockIdOrName; const name = legacy ? blockIdOrName : maybeName; const blocks = canonicalBlocks(document).map((blockValue) => blockValue.id === blockId ? { ...blockValue, inputs: blockValue.inputs.filter((item) => item.name !== name), outputs: blockValue.outputs.filter((item) => item.name !== name), knx_bindings: blockValue.knx_bindings.filter((item) => item.endpoint !== name), signal_bindings: (blockValue.signal_bindings ?? []).filter((item) => item.endpoint !== name), http_bindings: (blockValue.http_bindings ?? []).filter((item) => item.endpoint !== name), webhook_bindings: (blockValue.webhook_bindings ?? []).filter((item) => item.endpoint !== name) } : blockValue); return legacy ? { ...document, inputs: blocks[0]?.inputs ?? [], outputs: blocks[0]?.outputs ?? [], blocks } : { ...document, blocks } as AutomationDocument; }
+export function removeBinding(document: AutomationDocument, blockIdOrIndex: string | number, indexMaybe?: number): AutomationDocument { const legacy = indexMaybe === undefined; const blockId = legacy ? 'default' : String(blockIdOrIndex); const index = legacy ? Number(blockIdOrIndex) : indexMaybe; const blocks = canonicalBlocks(document).map((blockValue) => blockValue.id === blockId ? { ...blockValue, knx_bindings: blockValue.knx_bindings.filter((_, current) => current !== index) } : blockValue); return legacy ? { ...document, blocks } : { ...document, blocks } as AutomationDocument; }
 export function compatibleEndpoints(document: AutomationDocument, blockIdOrDirection: string, directionOrDpt: 'input' | 'output' | Dpt, dptMaybe?: Dpt): AutomationEndpoint[] { const legacy = dptMaybe === undefined; const blockId = legacy ? 'default' : blockIdOrDirection; const direction = (legacy ? blockIdOrDirection : directionOrDpt) as 'input' | 'output'; const dptValue = (legacy ? directionOrDpt : dptMaybe) as Dpt; const blockValue = blockById(document, blockId); return (direction === 'input' ? blockValue?.inputs : blockValue?.outputs)?.filter((item) => item.dpt === dptValue) ?? []; }
 import { isRevisionToken, parseRevisionToken, type RevisionToken } from './revision';

@@ -901,3 +901,5 @@ impl Runtime {
         }
     }
 }
+
+include!("runtime_input_updates.rs");

@@ -3,6 +3,7 @@
 mod automation;
 mod configuration;
 pub mod diagnostics;
+mod external;
 mod host;
 mod protocol;
 mod simulation;
@@ -10,6 +11,7 @@ pub mod web;
 
 pub use automation::*;
 pub use configuration::*;
+pub use external::*;
 pub use host::*;
 pub use protocol::*;
 pub use simulation::*;

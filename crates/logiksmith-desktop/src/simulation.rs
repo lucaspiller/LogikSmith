@@ -28,7 +28,7 @@ impl DptMessage {
         if !dpt.is_supported() {
             return Err(ProtocolError::Field(
                 field_name,
-                "must be 1.001 or 5.001".to_owned(),
+                "must be 1.001, 5.001, or 9.001".to_owned(),
             ));
         }
         Ok(dpt)
@@ -49,11 +49,24 @@ pub struct PercentValueMessage {
     pub value: u8,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemperatureValueMessage {
+    pub kind: String,
+    pub value: f64,
+}
+
+// Temperature values are validated as finite canonical centi-degrees at every
+// boundary.  Retain the existing model's Eq ergonomics for snapshots and
+// protocol records while carrying the browser-friendly Celsius number.
+impl Eq for TemperatureValueMessage {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ValueMessage {
     Bool(BoolValueMessage),
     Percent(PercentValueMessage),
+    Temperature(TemperatureValueMessage),
 }
 
 impl ValueMessage {
@@ -67,6 +80,10 @@ impl ValueMessage {
                 kind: "percent".to_owned(),
                 value,
             }),
+            Value::Temperature(value) => Self::Temperature(TemperatureValueMessage {
+                kind: "temperature".to_owned(),
+                value: f64::from(value) / 100.0,
+            }),
         }
     }
     pub(crate) fn core(
@@ -77,6 +94,10 @@ impl ValueMessage {
         let value = match self {
             Self::Bool(value) if value.kind == "bool" => Value::Bool(value.value),
             Self::Percent(value) if value.kind == "percent" => Value::Percent(value.value),
+            Self::Temperature(value) if value.kind == "temperature" => {
+                return TypedValue::temperature(value.value)
+                    .map_err(|error| ProtocolError::Field(field_name, error.to_string()));
+            }
             Self::Bool(_) => {
                 return Err(ProtocolError::Field(
                     "value.kind",
@@ -87,6 +108,12 @@ impl ValueMessage {
                 return Err(ProtocolError::Field(
                     "value.kind",
                     "must be 'percent'".to_owned(),
+                ));
+            }
+            Self::Temperature(_) => {
+                return Err(ProtocolError::Field(
+                    "value.kind",
+                    "must be 'temperature'".to_owned(),
                 ));
             }
         };

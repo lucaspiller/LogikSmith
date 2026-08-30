@@ -1,7 +1,10 @@
-use logiksmith_core::{BlockId, InputEvent, MonotonicMs, Runtime, TypedValue};
+use logiksmith_core::{
+    BlockId, ClockSample, InputEvent, InputUpdate, MonotonicMs, Runtime, TypedValue,
+};
 use logiksmith_desktop::{
     AutomationBlock, AutomationDocument, AutomationEndpoint, AutomationSignal, BoolValueMessage,
-    DptMessage, KnxBinding, SignalBinding, ValueMessage, build_automation,
+    DptMessage, HttpBinding, HttpPoll, HttpPollValue, KnxBinding, SignalBinding, ValueMessage,
+    WebhookBinding, WebhookInput, build_automation,
     diagnostics::{DiagnosticStore, LogicalTriggerRecord},
 };
 use std::path::PathBuf;
@@ -9,6 +12,8 @@ use std::path::PathBuf;
 fn make_runtime(source: &str) -> logiksmith_desktop::AutomationRuntime {
     build_automation(AutomationDocument {
         signals: Vec::new(),
+        http_polls: Vec::new(),
+        webhook_inputs: Vec::new(),
         blocks: vec![AutomationBlock {
             id: "test".to_owned(),
             revision: 1,
@@ -42,6 +47,8 @@ fn make_runtime(source: &str) -> logiksmith_desktop::AutomationRuntime {
                 },
             ],
             signal_bindings: Vec::new(),
+            http_bindings: Vec::new(),
+            webhook_bindings: Vec::new(),
             source: source.to_owned(),
             schedules: Vec::new(),
         }],
@@ -58,12 +65,169 @@ fn store(runtime: &logiksmith_desktop::AutomationRuntime) -> DiagnosticStore {
 }
 
 #[test]
+fn external_source_health_and_execution_origin_are_projected() {
+    let runtime = build_automation(AutomationDocument {
+        signals: Vec::new(),
+        http_polls: vec![HttpPoll {
+            name: "forecast".to_owned(),
+            url: "https://api.example.test/v1/forecast?token=secret".to_owned(),
+            every: "1h".to_owned(),
+            timeout: "5s".to_owned(),
+            stale_after: "2h".to_owned(),
+            headers: Vec::new(),
+            values: vec![HttpPollValue {
+                name: "today_max".to_owned(),
+                dpt: "9.001".to_owned(),
+                json_pointer: "/daily/temperature_2m_max/0".to_owned(),
+            }],
+        }],
+        webhook_inputs: vec![WebhookInput {
+            name: "override".to_owned(),
+            dpt: "1.001".to_owned(),
+            json_pointer: "/enabled".to_owned(),
+            bearer_token_env: None,
+        }],
+        blocks: vec![AutomationBlock {
+            id: "weather".to_owned(),
+            revision: 1,
+            enabled: true,
+            inputs: vec![
+                AutomationEndpoint {
+                    name: "today_max".to_owned(),
+                    dpt: "9.001".to_owned(),
+                },
+                AutomationEndpoint {
+                    name: "override".to_owned(),
+                    dpt: "1.001".to_owned(),
+                },
+            ],
+            outputs: Vec::new(),
+            knx_bindings: Vec::new(),
+            signal_bindings: Vec::new(),
+            http_bindings: vec![HttpBinding {
+                endpoint: "today_max".to_owned(),
+                source: "today_max".to_owned(),
+            }],
+            webhook_bindings: vec![WebhookBinding {
+                endpoint: "override".to_owned(),
+                source: "override".to_owned(),
+            }],
+            source: "function handle(event, input) return nil end".to_owned(),
+            schedules: Vec::new(),
+        }],
+    })
+    .expect("valid external automation");
+    let store = store(&runtime);
+    let initial = serde_json::to_value(store.snapshot()).unwrap();
+    assert_eq!(
+        initial["external_inputs"]["http_polls"][0]["url"],
+        "https://api.example.test/v1/forecast"
+    );
+    assert_eq!(
+        initial["external_inputs"]["http_polls"][0]["status"],
+        "starting"
+    );
+    assert_eq!(
+        initial["external_inputs"]["webhook_inputs"][0]["route"],
+        "/api/webhooks/override"
+    );
+
+    let sample = ClockSample {
+        monotonic_ms: store.now(),
+        utc_unix_ms: Some(1_700_000_000_000),
+    };
+    let site_time = logiksmith_desktop::diagnostics::site_time_snapshot_live(
+        &runtime.core_config.site,
+        &sample,
+    );
+    store.set_site_time_sample(sample, site_time);
+    store.record_external_poll_attempt("forecast");
+
+    let temperature = TypedValue::temperature(21.75).unwrap();
+    store.record_external_poll_success(
+        "forecast",
+        std::time::Duration::from_secs(7200),
+        &[("today_max".to_owned(), temperature)],
+    );
+    store.record_external_poll_next_attempt("forecast", std::time::Duration::from_secs(3600));
+    let healthy = serde_json::to_value(store.snapshot_at(MonotonicMs(5))).unwrap();
+    assert_eq!(
+        healthy["external_inputs"]["http_polls"][0]["status"],
+        "healthy"
+    );
+    assert_eq!(
+        healthy["external_inputs"]["http_polls"][0]["values"][0]["value"]["value"],
+        21.75
+    );
+    let last_attempt = healthy["external_inputs"]["http_polls"][0]["last_attempt_at_ms"]
+        .as_u64()
+        .unwrap();
+    let last_success = healthy["external_inputs"]["http_polls"][0]["last_success_at_ms"]
+        .as_u64()
+        .unwrap();
+    let stale_at = healthy["external_inputs"]["http_polls"][0]["stale_at_ms"]
+        .as_u64()
+        .unwrap();
+    let next_attempt = healthy["external_inputs"]["http_polls"][0]["next_attempt_at_ms"]
+        .as_u64()
+        .unwrap();
+    assert!((1_700_000_000_000..1_700_000_010_000).contains(&last_attempt));
+    assert!((1_700_000_000_000..1_700_000_010_000).contains(&last_success));
+    assert!((1_700_007_200_000..1_700_007_210_000).contains(&stale_at));
+    assert!((1_700_003_600_000..1_700_003_610_000).contains(&next_attempt));
+    store.record_external_poll_stale("forecast");
+    let stale = serde_json::to_value(store.snapshot()).unwrap();
+    assert_eq!(stale["external_inputs"]["http_polls"][0]["status"], "stale");
+    assert!(
+        !stale["external_inputs"]["http_polls"][0]["values"][0]["valid"]
+            .as_bool()
+            .unwrap()
+    );
+
+    let mut core = Runtime::new(runtime.core_config.clone());
+    let execution = core
+        .process_input_update_sampled(
+            &BlockId::parse("weather").unwrap(),
+            "override".parse().unwrap(),
+            InputUpdate::Trigger(TypedValue::bool(true)),
+            ClockSample {
+                monotonic_ms: MonotonicMs(8),
+                utc_unix_ms: None,
+            },
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+    store.record_block_execution_with_origin(
+        &execution,
+        MonotonicMs(8),
+        1,
+        &runtime,
+        None,
+        Some(logiksmith_desktop::diagnostics::ExecutionOrigin::Webhook {
+            source: "override".to_owned(),
+        }),
+    );
+    let projected = serde_json::to_value(store.snapshot()).unwrap();
+    assert_eq!(
+        projected["blocks"][0]["executions"][0]["origin"]["kind"],
+        "webhook"
+    );
+    assert_eq!(
+        projected["blocks"][0]["executions"][0]["origin"]["source"],
+        "override"
+    );
+}
+
+#[test]
 fn signal_snapshot_and_endpoint_binding_shape_are_serialized() {
     let runtime = build_automation(AutomationDocument {
         signals: vec![AutomationSignal {
             name: "house_occupied".to_owned(),
             dpt: "1.001".to_owned(),
         }],
+        http_polls: Vec::new(),
+        webhook_inputs: Vec::new(),
         blocks: vec![
             AutomationBlock {
                 id: "source".to_owned(),
@@ -85,6 +249,8 @@ fn signal_snapshot_and_endpoint_binding_shape_are_serialized() {
                     endpoint: "occupied".to_owned(),
                     signal: "house_occupied".to_owned(),
                 }],
+                http_bindings: Vec::new(),
+                webhook_bindings: Vec::new(),
                 source: "function handle(event, input, meta) return nil end".to_owned(),
                 schedules: Vec::new(),
             },
@@ -108,6 +274,8 @@ fn signal_snapshot_and_endpoint_binding_shape_are_serialized() {
                     endpoint: "occupied".to_owned(),
                     signal: "house_occupied".to_owned(),
                 }],
+                http_bindings: Vec::new(),
+                webhook_bindings: Vec::new(),
                 source: "function handle(event, input, meta) return nil end".to_owned(),
                 schedules: Vec::new(),
             },
@@ -132,6 +300,8 @@ fn cascade_execution_diagnostics_keep_signal_provenance() {
             name: "occupied".to_owned(),
             dpt: "1.001".to_owned(),
         }],
+        http_polls: Vec::new(),
+        webhook_inputs: Vec::new(),
         blocks: vec![
             AutomationBlock {
                 id: "source".to_owned(),
@@ -153,6 +323,8 @@ fn cascade_execution_diagnostics_keep_signal_provenance() {
                     endpoint: "out".to_owned(),
                     signal: "occupied".to_owned(),
                 }],
+                http_bindings: Vec::new(),
+                webhook_bindings: Vec::new(),
                 source:
                     "function handle(event, input) return { outputs = { out = input.trigger } } end"
                         .to_owned(),
@@ -172,6 +344,8 @@ fn cascade_execution_diagnostics_keep_signal_provenance() {
                     endpoint: "occupied".to_owned(),
                     signal: "occupied".to_owned(),
                 }],
+                http_bindings: Vec::new(),
+                webhook_bindings: Vec::new(),
                 source: "function handle(event, input) return nil end".to_owned(),
                 schedules: Vec::new(),
             },

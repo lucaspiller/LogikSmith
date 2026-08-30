@@ -10,6 +10,7 @@ import asyncio
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import logging
+import math
 import sys
 from typing import Any, Callable, TextIO
 
@@ -17,6 +18,7 @@ from .protocol import (
     BRIDGE_VERSION,
     DPT_1_001,
     DPT_5_001,
+    DPT_9_001,
     BridgeHello,
     BoolValue,
     CommandResult,
@@ -28,6 +30,7 @@ from .protocol import (
     KnxWrite,
     Message,
     PercentValue,
+    TemperatureValue,
     ProtocolError,
     Ready,
     Shutdown,
@@ -83,11 +86,23 @@ def percent_from_xknx(value: Any) -> int:
     raise ValueError(f"unsupported DPT 5.001 value: {value!r}")
 
 
-def value_from_xknx(value: Any, dpt: Dpt) -> BoolValue | PercentValue:
+def temperature_from_xknx(value: Any) -> float:
+    """Convert a DPT 9.001 value to finite degrees Celsius."""
+    candidate = value
+    if type(candidate) not in (int, float):
+        candidate = getattr(value, "value", None)
+    if type(candidate) not in (int, float) or not math.isfinite(candidate):
+        raise ValueError(f"unsupported DPT 9.001 value: {value!r}")
+    return float(candidate)
+
+
+def value_from_xknx(value: Any, dpt: Dpt) -> BoolValue | PercentValue | TemperatureValue:
     if dpt == DPT_1_001:
         return BoolValue("bool", bool_from_xknx(value))
     if dpt == DPT_5_001:
         return PercentValue("percent", percent_from_xknx(value))
+    if dpt == DPT_9_001:
+        return TemperatureValue("temperature", temperature_from_xknx(value))
     raise ValueError(f"unsupported configured DPT: {dpt}")
 
 
@@ -112,7 +127,7 @@ def _configured_dpt_map(
             raise ProtocolError(f"duplicate configured group address: {canonical}")
         if not isinstance(dpt, Dpt):
             raise ProtocolError(f"DPT for {canonical} must be a DPT record")
-        if dpt not in (DPT_1_001, DPT_5_001):
+        if dpt not in (DPT_1_001, DPT_5_001, DPT_9_001):
             raise ProtocolError(f"unsupported configured DPT for {canonical}: {dpt}")
         result[canonical] = dpt
     if not result:

@@ -2,6 +2,7 @@ fn typed_value_to_lua(value: TypedValue) -> LuaValue {
     match value.value() {
         Value::Bool(value) => LuaValue::Boolean(value),
         Value::Percent(value) => LuaValue::Integer(i64::from(value)),
+        Value::Temperature(value) => LuaValue::Number(f64::from(value) / 100.0),
     }
 }
 
@@ -426,6 +427,28 @@ fn lua_to_typed_value(endpoint: &Endpoint, value: LuaValue) -> Result<TypedValue
             value => Err(LogicError::InvalidResult {
                 message: format!(
                     "output {} expects an integer percentage, got {}",
+                    endpoint.name,
+                    value.type_name()
+                ),
+                line: None,
+            }),
+        },
+        dpt if dpt.is_temperature() => match value {
+            LuaValue::Integer(value) => TypedValue::temperature(value as f64).map_err(|error| {
+                LogicError::InvalidResult {
+                    message: format!("output {} temperature: {error}", endpoint.name),
+                    line: None,
+                }
+            }),
+            LuaValue::Number(value) => TypedValue::temperature(value).map_err(|error| {
+                LogicError::InvalidResult {
+                    message: format!("output {} temperature: {error}", endpoint.name),
+                    line: None,
+                }
+            }),
+            value => Err(LogicError::InvalidResult {
+                message: format!(
+                    "output {} expects a finite temperature number, got {}",
                     endpoint.name,
                     value.type_name()
                 ),

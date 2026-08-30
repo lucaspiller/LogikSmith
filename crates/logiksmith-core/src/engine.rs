@@ -219,13 +219,12 @@ impl Engine {
         observation: InputObservation,
         now: MonotonicMs,
     ) -> Result<(), EventError> {
-        let index = self.validate_input(&observation.endpoint, observation.value)?;
-        self.accept_time(now)?;
-        self.inputs[index] = InputState {
-            value: Some(observation.value),
-            observed_at: Some(now),
-        };
-        Ok(())
+        self.process_input_update(
+            observation.endpoint,
+            InputUpdate::Observe(observation.value),
+            now,
+        )
+        .map(|_| ())
     }
 
     /// Updates the triggering input before evaluating the active source.
@@ -236,7 +235,8 @@ impl Engine {
         event: InputEvent,
         now: MonotonicMs,
     ) -> Result<Execution, EventError> {
-        self.process_input_with_context(event, now, &default_site(), None)
+        self.process_input_update(event.endpoint, InputUpdate::Trigger(event.value), now)
+            .map(|execution| execution.expect("trigger input always produces an execution"))
     }
 
     /// ClockSample variant: captures the frozen time context from `site` and
@@ -247,62 +247,13 @@ impl Engine {
         sample: ClockSample,
         site: &SiteTimeConfig,
     ) -> Result<Execution, EventError> {
-        self.process_input_with_context(event, sample.monotonic_ms, site, sample.utc_unix_ms)
-    }
-
-    fn process_input_with_context(
-        &mut self,
-        event: InputEvent,
-        now: MonotonicMs,
-        site: &SiteTimeConfig,
-        utc_unix_ms: Option<i64>,
-    ) -> Result<Execution, EventError> {
-        let index = self.validate_input(&event.endpoint, event.value)?;
-        self.accept_time(now)?;
-        let previous = self.inputs[index].value;
-        self.inputs[index] = InputState {
-            value: Some(event.value),
-            observed_at: Some(now),
-        };
-        let trigger = input_trigger(event.endpoint, event.value, previous);
-        let snapshots = self.input_snapshots(now);
-        let state_before = self.state.clone();
-        let outcome = execute_logic(
-            &self.config.endpoints,
-            &self.config.logic,
-            &snapshots,
-            &Trigger::Input(trigger.clone()),
-            &state_before,
-            &self.pending_timers,
-            now,
-            &TimeContext::capture(site, utc_unix_ms),
-        );
-        let mut state_after = state_before.clone();
-        let mut pending_timers = self.pending_timers();
-        if let Ok(transition) = &outcome {
-            state_after = merge_state(&state_before, &transition.state)
-                .expect("validated transition state must merge");
-            let candidate = apply_timer_effects(
-                &self.pending_timers,
-                &transition.timers,
-                now,
-                self.active_logic_revision(),
-            );
-            pending_timers = candidate.values().cloned().collect();
-            self.state = state_after.clone();
-            self.pending_timers = candidate;
-        }
-        Ok(Execution::with_now(
-            self.active_logic_revision(),
-            Trigger::Input(trigger),
-            snapshots,
-            state_before,
-            state_after,
-            pending_timers,
-            outcome,
+        self.process_input_update_sampled(
+            event.endpoint,
+            InputUpdate::Trigger(event.value),
+            sample,
             site,
-            utc_unix_ms,
-        ))
+        )?
+        .ok_or_else(|| unreachable!("trigger input always produces an execution"))
     }
 
     /// The legacy MonotonicMs variant captures an unavailable time context.
@@ -751,6 +702,22 @@ impl Engine {
         endpoint_name: &EndpointName,
         value: TypedValue,
     ) -> Result<usize, EventError> {
+        let index = self.validate_endpoint(endpoint_name)?;
+        let endpoint = &self.config.endpoints[index];
+        if endpoint.dpt != value.dpt() {
+            return Err(EventError::DptMismatch {
+                endpoint: endpoint_name.clone(),
+                expected: endpoint.dpt,
+                actual: value.dpt(),
+            });
+        }
+        Ok(index)
+    }
+
+    pub(crate) fn validate_endpoint(
+        &self,
+        endpoint_name: &EndpointName,
+    ) -> Result<usize, EventError> {
         let (index, endpoint) = self
             .config
             .endpoints
@@ -762,13 +729,6 @@ impl Engine {
             return Err(EventError::EndpointNotInput {
                 endpoint: endpoint_name.clone(),
                 actual: endpoint.direction,
-            });
-        }
-        if endpoint.dpt != value.dpt() {
-            return Err(EventError::DptMismatch {
-                endpoint: endpoint_name.clone(),
-                expected: endpoint.dpt,
-                actual: value.dpt(),
             });
         }
         Ok(index)
@@ -961,6 +921,8 @@ impl Engine {
             .collect()
     }
 }
+
+include!("engine_input_updates.rs");
 
 impl Default for InputState {
     fn default() -> Self {

@@ -30,6 +30,8 @@
                 },
             ],
             signal_bindings: Vec::new(),
+            http_bindings: Vec::new(),
+            webhook_bindings: Vec::new(),
             source: "function handle(event, input) return nil end".to_owned(),
             schedules: Vec::new(),
         }
@@ -39,6 +41,8 @@
     fn nested_document_supports_sixty_four_blocks_and_rejects_sixty_five() {
         let document = AutomationDocument {
             signals: Vec::new(),
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: (0..64)
                 .map(|index| {
                     block(
@@ -53,6 +57,8 @@
         assert_eq!(runtime.blocks.len(), 64);
         let too_many = AutomationDocument {
             signals: Vec::new(),
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: (0..65)
                 .map(|index| {
                     block(
@@ -70,6 +76,8 @@
     fn structural_revision_ignores_source_enabled_and_persisted_block_revision() {
         let mut first = AutomationDocument {
             signals: Vec::new(),
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: vec![block("one", "6/1/1", "6/2/1")],
         };
         let mut second = first.clone();
@@ -124,6 +132,8 @@
 
         assert!(build_automation(AutomationDocument {
             signals: Vec::new(),
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: vec![schedule_only],
         })
         .is_ok());
@@ -163,6 +173,8 @@ group_address = "2/2/1"
     fn shared_same_dpt_address_fans_out_in_declaration_order() {
         let runtime = build_automation(AutomationDocument {
             signals: Vec::new(),
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: vec![
                 block("first", "3/1/1", "3/2/1"),
                 block("second", "3/1/1", "3/2/2"),
@@ -189,6 +201,8 @@ group_address = "2/2/1"
         conflicting.inputs[0].dpt = "5.001".to_owned();
         let errors = build_automation(AutomationDocument {
             signals: Vec::new(),
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: vec![block("first", "4/1/1", "4/2/2"), conflicting],
         })
         .unwrap_err();
@@ -202,6 +216,8 @@ group_address = "2/2/1"
         duplicate.knx_bindings[1].group_address = "5/1/1".to_owned();
         let errors = build_automation(AutomationDocument {
             signals: Vec::new(),
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: vec![duplicate],
         })
         .unwrap_err();
@@ -225,6 +241,8 @@ group_address = "2/2/1"
                 name: "house_occupied".to_owned(),
                 dpt: "1.001".to_owned(),
             }],
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: vec![producer],
         };
         let runtime = build_automation(document.clone()).expect("valid signal binding");
@@ -264,6 +282,8 @@ group_address = "2/2/1"
                 name: "allowed".to_owned(),
                 dpt: "1.001".to_owned(),
             }],
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: vec![first, second],
         })
         .unwrap_err();
@@ -280,6 +300,8 @@ group_address = "2/2/1"
                 name: "allowed".to_owned(),
                 dpt: "1.001".to_owned(),
             }],
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: vec![mismatched],
         })
         .unwrap_err();

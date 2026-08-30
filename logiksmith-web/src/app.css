@@ -91,6 +91,16 @@ small { color: #607080; }
 .runtime-projection { min-width: 0; border: 1px solid #e1e5e8; padding: 10px; background: #f8fafb; }
 .runtime-projection h3 { margin: 0; font-size: 0.82rem; letter-spacing: 0.04em; text-transform: uppercase; }
 .runtime-projection .table-wrap { margin: 0 -2px; }
+.external-inputs { border-top: 4px solid #8b5cf6; }
+.external-source-list { display: grid; gap: 14px; }
+.external-source { min-width: 0; border: 1px solid #e1e5e8; padding: 12px; background: #f8fafb; }
+.external-source h3 { margin: 0; font-size: 0.82rem; letter-spacing: 0.04em; text-transform: uppercase; }
+.external-source .subtle { overflow: hidden; margin: 4px 0 0; text-overflow: ellipsis; white-space: nowrap; }
+.external-kind { color: #6d28d9; font-size: 0.68rem; letter-spacing: 0.08em; }
+.external-facts { margin: 10px 0 14px; font-size: 0.78rem; }
+.external-error { color: #8c1d1d; }
+.external-values { font-size: 0.75rem; }
+.external-values td { white-space: normal; }
 .countdown { display: inline-block; min-width: 66px; }
 .countdown.stale { padding: 3px 5px; font-size: inherit; }
 .trigger-kind { color: #244b63; font-weight: 700; }

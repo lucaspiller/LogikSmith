@@ -106,6 +106,19 @@ describe('automation editor model', () => {
     expect(emptyAutomation().logic).toEqual({ source: '' });
   });
 
+  it('round-trips external sources, bindings, and temperature endpoints', async () => {
+    const external = decodeAutomationDocument({
+      http_polls: [{ name: 'weather', url: 'https://api.example.test/forecast', every: '15m', timeout: '5s', stale_after: '1h', values: [{ name: 'max_temp', dpt: '9.001', json_pointer: '/daily/max/0' }] }],
+      webhook_inputs: [{ name: 'alarm', dpt: '1.001', json_pointer: '/active', bearer_token_env: 'ALARM_TOKEN' }],
+      blocks: [{ id: 'weather_block', revision: '2', enabled: true, inputs: [{ name: 'max_temp_in', dpt: '9.001' }, { name: 'alarm_in', dpt: '1.001' }], outputs: [], knx_bindings: [], http_bindings: [{ endpoint: 'max_temp_in', source: 'weather.max_temp' }], webhook_bindings: [{ endpoint: 'alarm_in', source: 'alarm' }], source: 'return nil', schedules: [] }]
+    });
+    expect(external.http_polls?.[0].values[0].dpt).toBe('9.001');
+    expect(external.blocks?.[0].http_bindings?.[0]).toEqual({ endpoint: 'max_temp_in', source: 'weather.max_temp' });
+    let request: RequestInit | undefined;
+    await saveAutomation(external, 1, async (_url, init) => { request = init; return new Response(JSON.stringify({ revision: 2, logic_activated: false, restart_required: false }), { status: 200 }); });
+    expect(JSON.parse(String(request?.body))).toEqual({ document: { http_polls: external.http_polls, webhook_inputs: external.webhook_inputs, blocks: external.blocks } });
+  });
+
   it('uses structural revisions instead of the document revision to determine restart state', () => {
     const snapshot = decodeSnapshot({
       revision: 9,

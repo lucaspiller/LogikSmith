@@ -7,6 +7,8 @@
     fn store() -> DiagnosticStore {
         let runtime = crate::build_automation(crate::AutomationDocument {
             signals: Vec::new(),
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: vec![crate::AutomationBlock {
                 id: "test".to_owned(),
                 revision: 1,
@@ -50,6 +52,8 @@
                     },
                 ],
                 signal_bindings: Vec::new(),
+                http_bindings: Vec::new(),
+                webhook_bindings: Vec::new(),
                 source: "function handle(event, input) return nil end".to_owned(),
                 schedules: Vec::new(),
             }],
@@ -74,6 +78,8 @@
         ));
         let document = AutomationDocument {
             signals: Vec::new(),
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: vec![crate::AutomationBlock {
                 id: "test".to_owned(),
                 revision: 1,
@@ -97,6 +103,8 @@
                     },
                 ],
                 signal_bindings: Vec::new(),
+                http_bindings: Vec::new(),
+                webhook_bindings: Vec::new(),
                 source: "function handle() end".to_owned(),
                 schedules: Vec::new(),
             }],
@@ -114,6 +122,8 @@
     fn block_revisions_increment_only_for_changed_blocks() {
         let current = AutomationDocument {
             signals: Vec::new(),
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: vec![
                 crate::AutomationBlock {
                     id: "first".to_owned(),
@@ -123,6 +133,8 @@
                     outputs: vec![],
                     knx_bindings: vec![],
                     signal_bindings: vec![],
+                    http_bindings: vec![],
+                    webhook_bindings: vec![],
                     source: "return 1".to_owned(),
                     schedules: Vec::new(),
                 },
@@ -134,6 +146,8 @@
                     outputs: vec![],
                     knx_bindings: vec![],
                     signal_bindings: vec![],
+                    http_bindings: vec![],
+                    webhook_bindings: vec![],
                     source: "return 2".to_owned(),
                     schedules: Vec::new(),
                 },
@@ -289,6 +303,8 @@
     ) -> crate::AutomationRuntime {
         crate::build_automation(crate::AutomationDocument {
             signals: Vec::new(),
+            http_polls: Vec::new(),
+            webhook_inputs: Vec::new(),
             blocks: vec![crate::AutomationBlock {
                 id: "test".to_owned(),
                 revision: 1,
@@ -322,6 +338,8 @@
                     },
                 ],
                 signal_bindings: Vec::new(),
+                http_bindings: Vec::new(),
+                webhook_bindings: Vec::new(),
                 source: source.to_owned(),
                 schedules,
             }],
@@ -453,6 +471,8 @@
             &root,
             None,
             Some(sender),
+            None,
+            std::sync::Arc::new(std::collections::HashMap::new()),
         )
         .await
         .unwrap();
@@ -657,6 +677,8 @@
             &root,
             None,
             Some(sender),
+            None,
+            std::sync::Arc::new(std::collections::HashMap::new()),
         )
         .await
         .unwrap();
@@ -721,6 +743,8 @@
             &root,
             None,
             Some(sender),
+            None,
+            std::sync::Arc::new(std::collections::HashMap::new()),
         )
         .await
         .unwrap();
@@ -764,6 +788,8 @@
             &root,
             None,
             Some(sender),
+            None,
+            std::sync::Arc::new(std::collections::HashMap::new()),
         )
         .await
         .unwrap();
@@ -799,6 +825,8 @@
             &root,
             None,
             Some(sender),
+            None,
+            std::sync::Arc::new(std::collections::HashMap::new()),
         )
         .await
         .unwrap();

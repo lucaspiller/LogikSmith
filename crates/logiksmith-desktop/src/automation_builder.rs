@@ -50,6 +50,182 @@ pub fn build_automation(
             dpt,
         });
     }
+    let mut source_dpts = HashMap::<String, Dpt>::new();
+    let mut http_polls = Vec::new();
+    let mut poll_names = HashSet::new();
+    let mut source_values_and_bindings = 0usize;
+    if document.http_polls.len() + document.webhook_inputs.len() > MAX_EXTERNAL_SOURCES {
+        errors.push(FieldError {
+            path: "http_polls".to_owned(),
+            message: format!("http_polls plus webhook_inputs must contain at most {MAX_EXTERNAL_SOURCES} sources"),
+        });
+    }
+    for (poll_index, poll) in document.http_polls.iter().enumerate() {
+        let path = format!("http_polls[{poll_index}]");
+        let Some(name) = source_name(&format!("{path}.name"), &poll.name, &mut errors) else {
+            continue;
+        };
+        if !poll_names.insert(name.clone()) {
+            errors.push(FieldError {
+                path: format!("{path}.name"),
+                message: "must be unique".to_owned(),
+            });
+        }
+        if poll.url.len() > MAX_HTTP_URL_BYTES {
+            errors.push(FieldError {
+                path: format!("{path}.url"),
+                message: format!("must not exceed {MAX_HTTP_URL_BYTES} bytes"),
+            });
+        }
+        let parsed_url = match reqwest::Url::parse(&poll.url) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") => Some(url),
+            Ok(_) => {
+                errors.push(FieldError {
+                    path: format!("{path}.url"),
+                    message: "must use http or https".to_owned(),
+                });
+                None
+            }
+            Err(error) => {
+                errors.push(FieldError {
+                    path: format!("{path}.url"),
+                    message: format!("must be a valid HTTP URL: {error}"),
+                });
+                None
+            }
+        };
+        if let Some(url) = parsed_url
+            && (url.username() != "" || url.password().is_some() || url.fragment().is_some())
+        {
+            errors.push(FieldError {
+                path: format!("{path}.url"),
+                message: "must not include user-info or a fragment".to_owned(),
+            });
+        }
+        let every = parse_source_duration(&format!("{path}.every"), &poll.every, &mut errors);
+        if let Some(every) = every
+            && !(std::time::Duration::from_secs(MIN_POLL_INTERVAL_SECONDS)..=std::time::Duration::from_secs(MAX_POLL_INTERVAL_SECONDS)).contains(&every)
+        {
+            errors.push(FieldError {
+                path: format!("{path}.every"),
+                message: "must be between 1s and 24h".to_owned(),
+            });
+        }
+        let timeout = parse_timeout_duration(&format!("{path}.timeout"), &poll.timeout, &mut errors);
+        if let (Some(timeout), Some(every)) = (timeout, every)
+            && timeout > every
+        {
+            errors.push(FieldError {
+                path: format!("{path}.timeout"),
+                message: "must not exceed every".to_owned(),
+            });
+        }
+        let stale_after = parse_source_duration(&format!("{path}.stale_after"), &poll.stale_after, &mut errors);
+        if let (Some(stale_after), Some(every)) = (stale_after, every)
+            && (stale_after < every || stale_after > std::time::Duration::from_secs(MAX_FRESHNESS_SECONDS))
+        {
+            errors.push(FieldError {
+                path: format!("{path}.stale_after"),
+                message: "must be at least every and no more than 7d".to_owned(),
+            });
+        }
+        if poll.headers.len() > MAX_HTTP_HEADERS {
+            errors.push(FieldError {
+                path: format!("{path}.headers"),
+                message: format!("must contain at most {MAX_HTTP_HEADERS} headers"),
+            });
+        }
+        let mut headers = Vec::new();
+        let mut header_names = HashSet::new();
+        for (header_index, header) in poll.headers.iter().enumerate() {
+            let header_path = format!("{path}.headers[{header_index}]");
+            if !header_names.insert(header.name.to_ascii_lowercase()) {
+                errors.push(FieldError {
+                    path: format!("{header_path}.name"),
+                    message: "must be unique within a poll".to_owned(),
+                });
+            }
+            if let Some(value) = validate_header(&header_path, header, &mut errors) {
+                headers.push(value);
+            }
+        }
+        if poll.values.is_empty() {
+            errors.push(FieldError {
+                path: format!("{path}.values"),
+                message: "must contain at least one extracted value".to_owned(),
+            });
+        }
+        let mut values = Vec::new();
+        let mut value_names = HashSet::new();
+        for (value_index, value) in poll.values.iter().enumerate() {
+            source_values_and_bindings = source_values_and_bindings.saturating_add(1);
+            let value_path = format!("{path}.values[{value_index}]");
+            let Some(name) = source_name(&format!("{value_path}.name"), &value.name, &mut errors) else {
+                continue;
+            };
+            if !value_names.insert(name.clone()) {
+                errors.push(FieldError {
+                    path: format!("{value_path}.name"),
+                    message: "must be unique within a poll".to_owned(),
+                });
+                continue;
+            }
+            let dpt = match parse_dpt(&format!("{value_path}.dpt"), &value.dpt) {
+                Ok(dpt) => dpt,
+                Err(error) => { errors.push(error); continue; }
+            };
+            validate_json_pointer(&format!("{value_path}.json_pointer"), &value.json_pointer, &mut errors);
+            if let Some(previous) = source_dpts.insert(name.clone(), dpt) {
+                errors.push(FieldError {
+                    path: format!("{value_path}.name"),
+                    message: format!("must be unique; conflicts with DPT {previous}"),
+                });
+                continue;
+            }
+            values.push(HttpPollValueRuntime { name, dpt, json_pointer: value.json_pointer.clone() });
+        }
+        if let (Some(every), Some(timeout), Some(stale_after)) = (every, timeout, stale_after) {
+            http_polls.push(HttpPollRuntime {
+                name,
+                url: poll.url.clone(),
+                every,
+                timeout,
+                stale_after,
+                headers,
+                values,
+            });
+        }
+    }
+    let mut webhook_inputs = Vec::new();
+    for (source_index, source) in document.webhook_inputs.iter().enumerate() {
+        let path = format!("webhook_inputs[{source_index}]");
+        let Some(name) = source_name(&format!("{path}.name"), &source.name, &mut errors) else {
+            continue;
+        };
+        let dpt = match parse_dpt(&format!("{path}.dpt"), &source.dpt) {
+            Ok(dpt) => dpt,
+            Err(error) => { errors.push(error); continue; }
+        };
+        validate_json_pointer(&format!("{path}.json_pointer"), &source.json_pointer, &mut errors);
+        let bearer_token = match &source.bearer_token_env {
+            None => None,
+            Some(variable) if variable.is_empty() => {
+                errors.push(FieldError { path: format!("{path}.bearer_token_env"), message: "must not be empty".to_owned() });
+                None
+            }
+            Some(variable) => match std::env::var(variable) {
+                Ok(value) if !value.is_empty() && !value.contains(['\r', '\n']) => Some(value),
+                Ok(_) => { errors.push(FieldError { path: format!("{path}.bearer_token_env"), message: "environment variable must contain a non-empty token without CR/LF".to_owned() }); None }
+                Err(_) => { errors.push(FieldError { path: format!("{path}.bearer_token_env"), message: format!("environment variable {variable:?} is not set") }); None }
+            }
+        };
+        source_values_and_bindings = source_values_and_bindings.saturating_add(1);
+        if let Some(previous) = source_dpts.insert(name.clone(), dpt) {
+            errors.push(FieldError { path: format!("{path}.name"), message: format!("must be unique; conflicts with DPT {previous}") });
+            continue;
+        }
+        webhook_inputs.push(WebhookInputRuntime { name, dpt, json_pointer: source.json_pointer.clone(), bearer_token });
+    }
     if document.blocks.is_empty() {
         errors.push(FieldError {
             path: "blocks".to_owned(),
@@ -67,11 +243,13 @@ pub fn build_automation(
     let mut output_to_address = HashMap::new();
     let mut signal_to_inputs: HashMap<SignalName, Vec<BlockSignalInputBinding>> = HashMap::new();
     let mut output_to_signal = HashMap::new();
+    let mut http_to_inputs: HashMap<String, Vec<BlockExternalInputBinding>> = HashMap::new();
+    let mut webhook_to_inputs: HashMap<String, Vec<BlockExternalInputBinding>> = HashMap::new();
+    let mut external_binding_count = 0usize;
     let mut address_dpts = HashMap::new();
     let mut address_origins: HashMap<GroupAddress, (BlockId, EndpointName)> = HashMap::new();
     let mut signal_producers: HashMap<SignalName, (BlockId, EndpointName)> = HashMap::new();
     let mut signal_binding_count = 0usize;
-
     for (block_index, block) in document.blocks.iter().enumerate() {
         let block_path = format!("blocks[{block_index}]");
         let id = match block.id.parse::<BlockId>() {
@@ -138,9 +316,9 @@ pub fn build_automation(
                 message: "must not exceed 65536 bytes".to_owned(),
             });
         }
-
         let mut endpoint_to_address = HashMap::new();
         let mut endpoint_to_signal = HashMap::new();
+        let mut endpoint_to_external = HashMap::new();
         let mut local_addresses = HashSet::new();
         for (index, binding) in block.knx_bindings.iter().enumerate() {
             let path = format!("{block_path}.knx_bindings[{index}]");
@@ -299,9 +477,78 @@ pub fn build_automation(
                 output_to_signal.insert((id.clone(), name), signal);
             }
         }
+        for (index, binding) in block.http_bindings.iter().enumerate() {
+            external_binding_count = external_binding_count.saturating_add(1);
+            let path = format!("{block_path}.http_bindings[{index}]");
+            let name = match endpoint_name(&format!("{path}.endpoint"), &binding.endpoint) {
+                Ok(name) => name,
+                Err(error) => { errors.push(error); continue; }
+            };
+            let Some(&dpt) = endpoint_dpts.get(&name) else {
+                errors.push(FieldError { path: format!("{path}.endpoint"), message: "must reference an existing endpoint in this block".to_owned() });
+                continue;
+            };
+            if endpoint_directions.get(&name) != Some(&EndpointDirection::Input) {
+                errors.push(FieldError { path: format!("{path}.endpoint"), message: "must reference an input endpoint".to_owned() });
+                continue;
+            }
+            let Some(&source_dpt) = source_dpts.get(&binding.source) else {
+                errors.push(FieldError { path: format!("{path}.source"), message: "must reference an HTTP poll value".to_owned() });
+                continue;
+            };
+            if source_dpt != dpt {
+                errors.push(FieldError { path: format!("{path}.source"), message: format!("DPT {source_dpt} conflicts with endpoint {name} DPT {dpt}") });
+                continue;
+            }
+            if !http_polls.iter().any(|poll| poll.values.iter().any(|value| value.name == binding.source)) {
+                errors.push(FieldError { path: format!("{path}.source"), message: "must reference an HTTP poll value, not a webhook".to_owned() });
+                continue;
+            }
+            if endpoint_to_address.contains_key(&name) || endpoint_to_signal.contains_key(&name) || endpoint_to_external.contains_key(&name) {
+                errors.push(FieldError { path: format!("{path}.endpoint"), message: "must have exactly one binding across KNX, signals, HTTP, and webhooks".to_owned() });
+                continue;
+            }
+            endpoint_to_external.insert(name.clone(), binding.source.clone());
+            http_to_inputs.entry(binding.source.clone()).or_default().push(BlockExternalInputBinding { block_id: id.clone(), endpoint: name, dpt, source: binding.source.clone() });
+        }
+        for (index, binding) in block.webhook_bindings.iter().enumerate() {
+            external_binding_count = external_binding_count.saturating_add(1);
+            let path = format!("{block_path}.webhook_bindings[{index}]");
+            let name = match endpoint_name(&format!("{path}.endpoint"), &binding.endpoint) {
+                Ok(name) => name,
+                Err(error) => { errors.push(error); continue; }
+            };
+            let Some(&dpt) = endpoint_dpts.get(&name) else {
+                errors.push(FieldError { path: format!("{path}.endpoint"), message: "must reference an existing endpoint in this block".to_owned() });
+                continue;
+            };
+            if endpoint_directions.get(&name) != Some(&EndpointDirection::Input) {
+                errors.push(FieldError { path: format!("{path}.endpoint"), message: "must reference an input endpoint".to_owned() });
+                continue;
+            }
+            let Some(&source_dpt) = source_dpts.get(&binding.source) else {
+                errors.push(FieldError { path: format!("{path}.source"), message: "must reference a webhook input".to_owned() });
+                continue;
+            };
+            if source_dpt != dpt {
+                errors.push(FieldError { path: format!("{path}.source"), message: format!("DPT {source_dpt} conflicts with endpoint {name} DPT {dpt}") });
+                continue;
+            }
+            if !webhook_inputs.iter().any(|source| source.name == binding.source) {
+                errors.push(FieldError { path: format!("{path}.source"), message: "must reference a webhook input, not an HTTP poll value".to_owned() });
+                continue;
+            }
+            if endpoint_to_address.contains_key(&name) || endpoint_to_signal.contains_key(&name) || endpoint_to_external.contains_key(&name) {
+                errors.push(FieldError { path: format!("{path}.endpoint"), message: "must have exactly one binding across KNX, signals, HTTP, and webhooks".to_owned() });
+                continue;
+            }
+            endpoint_to_external.insert(name.clone(), binding.source.clone());
+            webhook_to_inputs.entry(binding.source.clone()).or_default().push(BlockExternalInputBinding { block_id: id.clone(), endpoint: name, dpt, source: binding.source.clone() });
+        }
         for endpoint in &endpoints {
             if !endpoint_to_address.contains_key(&endpoint.name)
                 && !endpoint_to_signal.contains_key(&endpoint.name)
+                && !endpoint_to_external.contains_key(&endpoint.name)
             {
                 let list = match endpoint.direction {
                     EndpointDirection::Input => "inputs",
@@ -322,8 +569,8 @@ pub fn build_automation(
                         || format!("{block_path}.{list}"),
                         |index| format!("{block_path}.{list}[{index}].name"),
                     ),
-                    message: format!(
-                        "endpoint {} must have exactly one binding across KNX and signals",
+                        message: format!(
+                        "endpoint {} must have exactly one binding across KNX, signals, HTTP, and webhooks",
                         endpoint.name
                     ),
                 });
@@ -344,6 +591,7 @@ pub fn build_automation(
             engine_config,
             endpoint_to_address,
             endpoint_to_signal,
+            endpoint_to_external,
             endpoint_dpts,
             schedules,
         });
@@ -353,6 +601,22 @@ pub fn build_automation(
             path: "blocks.signal_bindings".to_owned(),
             message: format!("must contain at most {MAX_SIGNAL_BINDINGS} bindings"),
         });
+    }
+    if source_values_and_bindings.saturating_add(external_binding_count)
+        > MAX_EXTERNAL_VALUES_AND_BINDINGS
+    {
+        errors.push(FieldError {
+            path: "blocks".to_owned(),
+            message: format!("extracted values plus bindings must contain at most {MAX_EXTERNAL_VALUES_AND_BINDINGS} entries"),
+        });
+    }
+    for source in source_dpts.keys() {
+        if !http_to_inputs.contains_key(source) && !webhook_to_inputs.contains_key(source) {
+            errors.push(FieldError {
+                path: "http_polls".to_owned(),
+                message: format!("source {source:?} must have at least one block binding"),
+            });
+        }
     }
     if !errors.is_empty() {
         return Err(errors);
@@ -422,10 +686,13 @@ pub fn build_automation(
         output_to_address,
         signal_to_inputs,
         output_to_signal,
+        http_to_inputs,
+        webhook_to_inputs,
+        http_polls,
+        webhook_inputs,
         address_dpts,
     })
 }
-
 fn core_validation_error(
     error: &logiksmith_core::RuntimeConfigError,
     document: &AutomationDocument,
@@ -522,7 +789,6 @@ fn core_validation_error(
         },
     }
 }
-
 pub fn automation_revision(source: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in source {
@@ -531,7 +797,6 @@ pub fn automation_revision(source: &[u8]) -> u64 {
     }
     hash
 }
-
 pub fn document_logic_revision(document: &AutomationDocument) -> u64 {
     let mut bytes = Vec::new();
     for block in &document.blocks {
@@ -542,7 +807,6 @@ pub fn document_logic_revision(document: &AutomationDocument) -> u64 {
     }
     automation_revision(&bytes)
 }
-
 pub fn load_automation(path: &Path) -> Result<(AutomationDocument, u16), AutomationFileError> {
     let source = fs::read(path).map_err(|source| AutomationFileError::Read {
         path: path.to_path_buf(),
@@ -566,7 +830,6 @@ pub fn load_automation(path: &Path) -> Result<(AutomationDocument, u16), Automat
     build_automation(stored.document.clone()).map_err(AutomationFileError::Invalid)?;
     Ok((stored.document, stored.revision))
 }
-
 pub fn serialize_automation(
     document: &AutomationDocument,
     _revision: u16,
@@ -578,7 +841,6 @@ pub fn serialize_automation(
     .map(|text| text.into_bytes())
     .map_err(|error| error.to_string())
 }
-
 pub fn load_config(
     config_path: &Path,
     automation_path: &Path,
@@ -698,6 +960,18 @@ fn load_config_with_bridge_validation(
     let listen_ip = parse_ip("web.listen_ip", &raw.web.listen_ip)?;
     if raw.web.listen_port == 0 || raw.web.listen_port > u16::MAX as u32 {
         return Err(field("web.listen_port", "must be in range 1..=65535"));
+    }
+    if !listen_ip.is_loopback()
+        && automation
+            .webhook_inputs
+            .iter()
+            .any(|source| source.bearer_token.is_none())
+    {
+        return Err(ConfigError::AutomationInvalid(vec![FieldError {
+            path: "webhook_inputs".to_owned(),
+            message: "every webhook requires bearer_token_env when web.listen_ip is not loopback"
+                .to_owned(),
+        }]));
     }
     Ok(RuntimeConfig {
         config_path: config_path.to_path_buf(),

@@ -5,11 +5,14 @@ use crate::{
     SimulationOutcome, SimulationPayload, SimulationRequest, WebConfig, build_automation,
     diagnostics::{DiagnosticStore, DiagnosticUpdate, Replay, Snapshot},
     load_automation, serialize_automation,
+    external::{self, ExternalInputMessage},
+    AutomationRuntime, WebhookInputRuntime,
 };
 use axum::{
     Router,
-    extract::{Json as ExtractJson, Query, State, rejection::JsonRejection},
-    http::StatusCode,
+    body::Bytes,
+    extract::{DefaultBodyLimit, Json as ExtractJson, Path as AxumPath, Query, State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Json, Response,
         sse::{Event, KeepAlive, Sse},
@@ -56,6 +59,8 @@ struct AppState {
     automation_lock: Arc<Mutex<()>>,
     activation: Option<mpsc::Sender<ActivationRequest>>,
     simulation: Option<mpsc::Sender<SimulationRequest>>,
+    external: Option<mpsc::Sender<ExternalInputMessage>>,
+    webhooks: Arc<std::collections::HashMap<String, WebhookInputRuntime>>,
 }
 
 fn block_statuses(snapshot: &Snapshot) -> Vec<AutomationBlockStatus> {
@@ -121,7 +126,16 @@ pub async fn start_web_server_with_assets(
     config: WebConfig,
     root: &Path,
 ) -> Result<WebServer, WebError> {
-    start_web_server_with_assets_and_activation(store, config, root, None, None).await
+    start_web_server_with_assets_and_activation(
+        store,
+        config,
+        root,
+        None,
+        None,
+        None,
+        Arc::new(Default::default()),
+    )
+    .await
 }
 
 /// Starts the dashboard with the runtime activation channel used for
@@ -140,7 +154,16 @@ pub async fn start_web_server_with_activation(
             .join("../..")
             .join(STATIC_ASSET_ROOT)
     };
-    start_web_server_with_assets_and_activation(store, config, &root, Some(activation), None).await
+    start_web_server_with_assets_and_activation(
+        store,
+        config,
+        &root,
+        Some(activation),
+        None,
+        None,
+        Arc::new(Default::default()),
+    )
+    .await
 }
 
 /// Starts the dashboard with the runtime-owned source activation and
@@ -150,6 +173,19 @@ pub async fn start_web_server_with_runtime(
     config: WebConfig,
     activation: mpsc::Sender<ActivationRequest>,
     simulation: mpsc::Sender<SimulationRequest>,
+) -> Result<WebServer, WebError> {
+    start_web_server_with_assets_and_activation(store, config, &root_for_assets(), Some(activation), Some(simulation), None, Arc::new(Default::default())).await
+}
+
+/// Starts the dashboard with runtime channels and configured webhook inputs.
+/// The webhook route only submits typed values to the serial runtime owner.
+pub async fn start_web_server_with_runtime_and_sources(
+    store: DiagnosticStore,
+    config: WebConfig,
+    activation: mpsc::Sender<ActivationRequest>,
+    simulation: mpsc::Sender<SimulationRequest>,
+    automation: &AutomationRuntime,
+    external: mpsc::Sender<ExternalInputMessage>,
 ) -> Result<WebServer, WebError> {
     let relative = Path::new(STATIC_ASSET_ROOT);
     let root = if relative.is_dir() {
@@ -165,8 +201,15 @@ pub async fn start_web_server_with_runtime(
         &root,
         Some(activation),
         Some(simulation),
+        Some(external),
+        Arc::new(automation.webhook_inputs.iter().cloned().map(|source| (source.name.clone(), source)).collect()),
     )
     .await
+}
+
+fn root_for_assets() -> PathBuf {
+    let relative = Path::new(STATIC_ASSET_ROOT);
+    if relative.is_dir() { relative.to_path_buf() } else { Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(STATIC_ASSET_ROOT) }
 }
 
 async fn start_web_server_with_assets_and_activation(
@@ -175,6 +218,8 @@ async fn start_web_server_with_assets_and_activation(
     root: &Path,
     activation: Option<mpsc::Sender<ActivationRequest>>,
     simulation: Option<mpsc::Sender<SimulationRequest>>,
+    external: Option<mpsc::Sender<ExternalInputMessage>>,
+    webhooks: Arc<std::collections::HashMap<String, WebhookInputRuntime>>,
 ) -> Result<WebServer, WebError> {
     let root = root.to_path_buf();
     let index = root.join("index.html");
@@ -201,6 +246,10 @@ async fn start_web_server_with_assets_and_activation(
         .route("/api/simulate", post(simulate))
         .route("/api/schedules/preview", post(preview_schedule))
         .route("/api/schedules/simulate", post(simulate_schedule))
+        .route(
+            "/api/webhooks/{source}",
+            post(webhook).layer(DefaultBodyLimit::max(crate::MAX_HTTP_BODY_BYTES)),
+        )
         .route("/api/events", get(events))
         .fallback_service(ServeDir::new(&root).not_found_service(ServeFile::new(index)))
         .with_state(AppState {
@@ -208,6 +257,8 @@ async fn start_web_server_with_assets_and_activation(
             automation_lock: Arc::new(Mutex::new(())),
             activation,
             simulation,
+            external,
+            webhooks,
         });
     let (sender, receiver) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -229,4 +280,85 @@ async fn start_web_server_with_assets_and_activation(
 
 async fn snapshot(State(state): State<AppState>) -> Json<Snapshot> {
     Json(state.store.snapshot())
+}
+
+async fn webhook(
+    AxumPath(source_name): AxumPath<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(source) = state.webhooks.get(&source_name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        state.store.record_webhook_rejected(&source_name);
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    if body.len() > crate::MAX_HTTP_BODY_BYTES {
+        state.store.record_webhook_rejected(&source_name);
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    if !external::webhook_authorized(
+        source,
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        state.store.record_webhook_rejected(&source_name);
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let value = match external::parse_webhook_value(source, &body) {
+        Ok(value) => value,
+        Err(external::ExternalError::BodyTooLarge) => {
+            state.store.record_webhook_rejected(&source_name);
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+        Err(external::ExternalError::MissingPointer(_))
+        | Err(external::ExternalError::InvalidValue(_)) => {
+            state.store.record_webhook_rejected(&source_name);
+            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        }
+        Err(external::ExternalError::InvalidJson(_)) => {
+            state.store.record_webhook_rejected(&source_name);
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        Err(_) => {
+            state.store.record_webhook_rejected(&source_name);
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    let Some(sender) = state.external.clone() else {
+        state.store.record_webhook_rejected(&source_name);
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let (reply, response) = tokio::sync::oneshot::channel();
+    let message = ExternalInputMessage {
+        source: source_name.clone(),
+        update: external::ExternalInputUpdate::Trigger(value),
+        kind: external::ExternalInputKind::Webhook { source: source_name.clone() },
+        reply: Some(reply),
+    };
+    if sender.send(message).await.is_err() {
+        state.store.record_webhook_rejected(&source_name);
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    match tokio::time::timeout(Duration::from_secs(10), response).await {
+        Ok(Ok(Ok(()))) => {
+            state.store.record_webhook_accepted(&source_name, value);
+            StatusCode::ACCEPTED.into_response()
+        }
+        _ => {
+            state.store.record_webhook_rejected(&source_name);
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
 }

@@ -58,3 +58,8 @@ mod signal_tests {
     use super::*;
     include!("signal_tests.rs");
 }
+
+#[cfg(test)]
+mod milestone11_tests {
+    include!("milestone11_tests.rs");
+}

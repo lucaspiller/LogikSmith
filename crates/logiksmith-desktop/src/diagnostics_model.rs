@@ -15,7 +15,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::broadcast;
 use tracing_subscriber::{
@@ -62,6 +62,70 @@ pub struct Snapshot {
     /// during the dashboard migration, but this is the authoritative M8 view.
     pub blocks: Vec<BlockSnapshot>,
     pub signals: Vec<SignalSnapshot>,
+    /// Host-owned HTTP poll and webhook health/value projections.
+    pub external_inputs: ExternalInputsSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ExternalInputsSnapshot {
+    pub http_polls: Vec<ExternalPollSnapshot>,
+    pub webhook_inputs: Vec<ExternalWebhookSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ExternalPollSnapshot {
+    pub kind: String,
+    pub name: String,
+    pub url: String,
+    pub interval_ms: u64,
+    pub status: String,
+    pub last_attempt_at_ms: Option<u64>,
+    pub next_attempt_at_ms: Option<u64>,
+    pub last_success_at_ms: Option<u64>,
+    pub stale_at_ms: Option<u64>,
+    pub consecutive_failures: u32,
+    pub last_error: Option<String>,
+    pub values: Vec<ExternalValueSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ExternalValueSnapshot {
+    pub name: String,
+    pub dpt: DptMessage,
+    pub json_pointer: String,
+    pub value: Option<ValueMessage>,
+    pub valid: bool,
+    pub age_ms: Option<u64>,
+    pub consumers: Vec<ExternalConsumerSnapshot>,
+    #[serde(skip)]
+    pub observed_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ExternalConsumerSnapshot {
+    pub block_id: String,
+    pub endpoint: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ExternalWebhookSnapshot {
+    pub kind: String,
+    pub name: String,
+    pub route: String,
+    pub dpt: DptMessage,
+    pub json_pointer: String,
+    pub status: String,
+    pub authentication_required: bool,
+    pub authentication_configured: bool,
+    pub last_accepted_at_ms: Option<u64>,
+    pub accepted_count: u64,
+    pub rejected_count: u64,
+    pub value: Option<ValueMessage>,
+    pub valid: bool,
+    pub age_ms: Option<u64>,
+    pub consumers: Vec<ExternalConsumerSnapshot>,
+    #[serde(skip)]
+    pub observed_at_ms: Option<u64>,
 }
 /// Read-only site wall-clock and astronomy facts for the dashboard card.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -195,6 +259,10 @@ pub struct AutomationSnapshot {
     pub knx_bindings: Vec<BindingSnapshot>,
     #[serde(rename = "signalBindings")]
     pub signal_bindings: Vec<SignalBindingSnapshot>,
+    #[serde(rename = "httpBindings")]
+    pub http_bindings: Vec<ExternalBindingSnapshot>,
+    #[serde(rename = "webhookBindings")]
+    pub webhook_bindings: Vec<ExternalBindingSnapshot>,
     pub logic: LogicSourceSnapshot,
 }
 
@@ -217,6 +285,10 @@ pub struct BlockSnapshot {
     pub knx_bindings: Vec<BindingSnapshot>,
     #[serde(rename = "signalBindings")]
     pub signal_bindings: Vec<SignalBindingSnapshot>,
+    #[serde(rename = "httpBindings")]
+    pub http_bindings: Vec<ExternalBindingSnapshot>,
+    #[serde(rename = "webhookBindings")]
+    pub webhook_bindings: Vec<ExternalBindingSnapshot>,
     pub values: ValuesSnapshot,
     pub state: BTreeMap<String, StateValueRecord>,
     pub pending_timers: Vec<PendingTimerRecord>,
@@ -243,11 +315,19 @@ pub struct EndpointSnapshot {
     #[serde(rename = "bindingKind")]
     pub binding_kind: String,
     pub signal: Option<String>,
+    pub source: Option<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BindingSnapshot {
     pub endpoint: String,
     pub group_address: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalBindingSnapshot {
+    pub endpoint: String,
+    pub source: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -377,8 +457,19 @@ pub struct ExecutionRecord {
     pub causal_signal: Option<String>,
     #[serde(rename = "causalLinks")]
     pub causal_links: Vec<CausalLinkSnapshot>,
+    /// Host transport provenance for the root input, when known.
+    pub origin: Option<ExecutionOrigin>,
     pub timer_effects: Vec<LogicalTimerEffectRecord>,
     pub error: Option<LogicErrorRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ExecutionOrigin {
+    Knx { group_address: Option<String> },
+    Signal { signal: String },
+    Http { poll: String, value: String },
+    Webhook { source: String },
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicalTriggerRecord {
@@ -673,6 +764,7 @@ struct Inner {
     pending_writes: BTreeMap<u64, WriteState>,
     blocks: BTreeMap<String, BlockDiagnosticState>,
     signals: Vec<SignalSnapshot>,
+    external_inputs: ExternalInputsSnapshot,
     block_order: Vec<String>,
     block_automation: BTreeMap<String, AutomationSnapshot>,
     block_endpoint_values: BTreeMap<(String, EndpointName), EndpointValueState>,

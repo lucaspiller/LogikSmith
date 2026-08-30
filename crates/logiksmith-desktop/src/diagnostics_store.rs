@@ -15,7 +15,6 @@ fn unique_execution_id(inner: &Inner, requested: Option<u64>) -> u64 {
     }
     candidate
 }
-
 impl DiagnosticStore {
     pub fn new(runtime: &AutomationRuntime, automation_path: PathBuf, revision: u64) -> Self {
         let (events, _) = broadcast::channel(JOURNAL_CAPACITY);
@@ -70,7 +69,10 @@ impl DiagnosticStore {
             block_automation.insert(block_id.clone(), block_automation_snapshot(runtime, block));
             for endpoint in block.engine_config.endpoints.iter() {
                 let address = block.endpoint_to_address.get(&endpoint.name).copied();
-                if address.is_none() && !block.endpoint_to_signal.contains_key(&endpoint.name) {
+                if address.is_none()
+                    && !block.endpoint_to_signal.contains_key(&endpoint.name)
+                    && !block.endpoint_to_external.contains_key(&endpoint.name)
+                {
                     continue;
                 }
                 // The legacy global value projection is retained for the
@@ -93,6 +95,7 @@ impl DiagnosticStore {
         }
         let automation = automation_snapshot(runtime);
         let signals = signal_snapshots(runtime);
+        let external_inputs = external_inputs_snapshot(runtime);
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 revision: 0,
@@ -146,6 +149,7 @@ impl DiagnosticStore {
                 schedule_status: BTreeMap::new(),
                 block_schedules,
                 signals,
+                external_inputs,
                 last_clock_sample: None,
             })),
             events,
@@ -180,10 +184,8 @@ impl DiagnosticStore {
             .automation_path
             .clone()
     }
-
-    /// Returns the document currently active in the serialized runtime. This
-    /// is deliberately separate from the file on disk: structural saves can
-    /// be pending restart while the old document is still running.
+    /// Returns the document currently active in the serialized runtime; saved
+    /// structural changes can remain pending restart.
     pub fn active_document(&self) -> crate::AutomationDocument {
         self.inner
             .lock()
@@ -191,7 +193,6 @@ impl DiagnosticStore {
             .active_document
             .clone()
     }
-
     /// Returns the persisted revision of the active block source used by the
     /// browser-facing simulation contract.
     pub fn active_block_revision(&self, block_id: &str) -> Option<u64> {
@@ -238,10 +239,7 @@ impl DiagnosticStore {
         inner.site_time = snapshot;
         self.publish_locked(&mut inner);
     }
-
-    /// Stores the site projection and the exact paired wall/monotonic sample
-    /// used to produce it. Schedule countdowns must derive from this sample,
-    /// not from a second independent `SystemTime` read.
+    /// Stores the site projection and its paired wall/monotonic sample.
     pub fn set_site_time_sample(&self, sample: ClockSample, snapshot: SiteTimeSnapshot) {
         let mut inner = self
             .inner
@@ -254,7 +252,6 @@ impl DiagnosticStore {
         inner.last_clock_sample = Some(sample);
         self.publish_locked(&mut inner);
     }
-
     /// Refreshes per-schedule scheduler status after a poll or restart.
     pub fn set_schedule_statuses(&self, statuses: Vec<ScheduleStatusFeed>) {
         let mut inner = self
@@ -288,7 +285,6 @@ impl DiagnosticStore {
         inner.restart_required = restart_required;
         self.publish_locked(&mut inner);
     }
-
     pub fn set_saved_document_state(
         &self,
         automation_revision: u64,
@@ -337,7 +333,6 @@ impl DiagnosticStore {
             inner.saved_structural_revision != inner.active_structural_revision;
         self.publish_locked(&mut inner);
     }
-
     /// Publishes a source activation together with its cancelled timer names
     /// and the new core projection in one SSE update.
     pub fn record_activation(
@@ -378,7 +373,6 @@ impl DiagnosticStore {
         }
         self.publish_locked(&mut inner);
     }
-
     /// Replaces the browser projection of core-owned transient state and
     /// pending timers. The session calls this after every serialized runtime
     /// operation, so snapshots and SSE updates share one coherent view.
@@ -398,7 +392,6 @@ impl DiagnosticStore {
         inner.pending_timers = pending_timers;
         self.publish_locked(&mut inner);
     }
-
     pub fn set_engine_snapshot(&self, snapshot: &logiksmith_core::EngineSnapshot) {
         let logic_revision = self
             .inner
@@ -414,7 +407,6 @@ impl DiagnosticStore {
                 .collect(),
         );
     }
-
     /// Projects all portable block state into the browser diagnostics view.
     /// Runtime state remains owned by the core; this method only copies its
     /// immutable snapshot into bounded dashboard data.
@@ -491,8 +483,7 @@ impl DiagnosticStore {
         }
         self.publish_locked(&mut inner);
     }
-
-    /// Records one tagged execution in the owning block's bounded history.
+    /// Records one tagged execution in the owning block history.
     pub fn record_block_execution(
         &self,
         execution: &BlockExecution,
@@ -500,6 +491,24 @@ impl DiagnosticStore {
         duration_us: u64,
         automation: &AutomationRuntime,
         schedule_handling: Option<ScheduleHandling>,
+    ) {
+        self.record_block_execution_with_origin(
+            execution,
+            now,
+            duration_us,
+            automation,
+            schedule_handling,
+            None,
+        );
+    }
+    pub fn record_block_execution_with_origin(
+        &self,
+        execution: &BlockExecution,
+        now: logiksmith_core::MonotonicMs,
+        duration_us: u64,
+        automation: &AutomationRuntime,
+        schedule_handling: Option<ScheduleHandling>,
+        origin: Option<ExecutionOrigin>,
     ) {
         let block_id = execution.block_id.to_string();
         let semantic = &execution.execution;
@@ -597,6 +606,7 @@ impl DiagnosticStore {
             causal_producer_block_id,
             causal_signal,
             causal_links,
+            origin,
             error: error.clone(),
         };
         let (block_revision, block_state, block_pending, block_executions) = {
@@ -648,7 +658,6 @@ impl DiagnosticStore {
         }
         self.publish_locked(&mut inner);
     }
-
     /// Applies the core's atomic source/enabled activation result to
     /// diagnostics. No block is updated if core activation failed.
     pub fn record_runtime_activation(
@@ -732,7 +741,6 @@ impl DiagnosticStore {
     ) {
         self.record_execution_at(execution, self.now(), duration_us, automation);
     }
-
     pub fn record_execution_at(
         &self,
         execution: &Execution,
@@ -817,6 +825,7 @@ impl DiagnosticStore {
             causal_producer_block_id,
             causal_signal: None,
             causal_links,
+            origin: None,
             error,
         });
         inner.state = state_record(&execution.state_after);

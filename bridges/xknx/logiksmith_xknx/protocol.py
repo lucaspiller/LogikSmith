@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import ipaddress
 import json
+import math
 from typing import Any, ClassVar, TypeAlias
 
 
@@ -133,15 +134,16 @@ class Dpt:
 
 DPT_1_001 = Dpt(1, 1)
 DPT_5_001 = Dpt(5, 1)
+DPT_9_001 = Dpt(9, 1)
 
-_SUPPORTED_DPTS = frozenset({DPT_1_001, DPT_5_001})
+_SUPPORTED_DPTS = frozenset({DPT_1_001, DPT_5_001, DPT_9_001})
 
 
 def validate_supported_dpt(dpt: Dpt, field: str = "dpt") -> Dpt:
     if not isinstance(dpt, Dpt):
         raise ProtocolError(f"{field} must be a DPT record")
     if dpt not in _SUPPORTED_DPTS:
-        raise ValidationError(f"{field} must be 1.001 or 5.001")
+        raise ValidationError(f"{field} must be 1.001, 5.001, or 9.001")
     return dpt
 
 
@@ -191,21 +193,49 @@ class PercentValue:
         return {"kind": self.kind, "value": self.value}
 
 
-TypedValue: TypeAlias = BoolValue | PercentValue
+@dataclass(frozen=True, slots=True)
+class TemperatureValue:
+    kind: str
+    value: float
+
+    def __post_init__(self) -> None:
+        if self.kind != "temperature":
+            raise ValidationError("value.kind must be 'temperature'")
+        if type(self.value) not in (int, float) or not math.isfinite(self.value):
+            raise ValidationError("value.value must be a finite number")
+
+    @classmethod
+    def from_obj(cls, value: Any) -> TemperatureValue:
+        obj = _require_object(value, "value")
+        _require_keys(obj, {"kind", "value"})
+        raw = obj["value"]
+        if type(raw) not in (int, float) or not math.isfinite(raw):
+            raise ValidationError("value.value must be a finite number")
+        return cls(_string(obj["kind"], "value.kind"), float(raw))
+
+    def to_obj(self) -> dict[str, str | float]:
+        return {"kind": self.kind, "value": self.value}
+
+
+TypedValue: TypeAlias = BoolValue | PercentValue | TemperatureValue
 
 
 def value_from_obj(value: Any, dpt: Dpt) -> TypedValue:
     validate_supported_dpt(dpt)
     if dpt == DPT_1_001:
         return BoolValue.from_obj(value)
-    return PercentValue.from_obj(value)
+    if dpt == DPT_5_001:
+        return PercentValue.from_obj(value)
+    return TemperatureValue.from_obj(value)
 
 
 def validate_value_for_dpt(value: Any, dpt: Dpt, field: str = "value") -> TypedValue:
     validate_supported_dpt(dpt)
-    expected = BoolValue if dpt == DPT_1_001 else PercentValue
+    expected = (
+        BoolValue if dpt == DPT_1_001 else PercentValue if dpt == DPT_5_001 else TemperatureValue
+    )
     if not isinstance(value, expected):
-        expected_kind = "bool" if dpt == DPT_1_001 else "percent"
+        expected_kind = "bool" if dpt == DPT_1_001 else "percent" if dpt == DPT_5_001 else "temperature"
         raise ValidationError(f"{field}.kind must match dpt {dpt} ('{expected_kind}')")
     return value
 

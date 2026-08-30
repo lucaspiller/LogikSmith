@@ -4,10 +4,10 @@ export type ConnectionState = 'starting' | 'connecting' | 'connected' | 'disconn
 export type TimerState = 'idle' | 'pending';
 export type StreamStatus = 'connecting' | 'connected' | 'stale' | 'error';
 export type WriteStatus = 'idle' | 'pending' | 'succeeded' | 'failed';
-export type DisplayEndpointBindingKind = 'knx' | 'signal' | 'unbound';
+export type DisplayEndpointBindingKind = 'knx' | 'signal' | 'http' | 'webhook' | 'unbound';
 
-export interface DisplayEndpoint { name?: string; address: string; dpt: string; direction?: 'input' | 'output'; bindingKind?: DisplayEndpointBindingKind; signal?: string | null; observed?: boolean | number | null; requested?: boolean | number | null; }
-export interface DisplayBinding { endpoint: string; groupAddress: string; kind?: DisplayEndpointBindingKind; signal?: string; }
+export interface DisplayEndpoint { name?: string; address: string; dpt: string; direction?: 'input' | 'output'; bindingKind?: DisplayEndpointBindingKind; signal?: string | null; /** External source name for HTTP/webhook bindings. */ source?: string | null; observed?: boolean | number | null; requested?: boolean | number | null; }
+export interface DisplayBinding { endpoint: string; groupAddress?: string; kind?: DisplayEndpointBindingKind; signal?: string; source?: string; poll?: string; value?: string; }
 export interface DisplaySignalBinding { endpoint: string; signal: string; dpt?: string; }
 export interface DisplayAutomation { inputs: DisplayEndpoint[]; outputs: DisplayEndpoint[]; bindings: DisplayBinding[]; signalBindings?: DisplaySignalBinding[]; source: string; }
 export interface DisplayLogicError { category: string; message: string; line: number | null; }
@@ -68,6 +68,54 @@ export interface DisplaySignal {
   consumers: DisplaySignalConsumer[];
   recentChanges: DisplaySignalChange[];
   structuralRevision: RevisionToken | null;
+}
+
+/** A block endpoint reached through a host-managed external input. */
+export interface DisplayExternalConsumer { blockId: string; endpoint: string; }
+export interface DisplayExternalValue {
+  name: string;
+  dpt: string;
+  jsonPointer: string;
+  value: boolean | number | null;
+  valid: boolean;
+  ageMs: number | null;
+  consumers: DisplayExternalConsumer[];
+}
+export type DisplayExternalHealth = 'starting' | 'healthy' | 'failing' | 'stale';
+export interface DisplayHttpPoll {
+  kind: 'http';
+  name: string;
+  url: string;
+  intervalMs: number;
+  status: DisplayExternalHealth;
+  lastAttemptAtMs: number | null;
+  nextAttemptAtMs: number | null;
+  lastSuccessAtMs: number | null;
+  staleAtMs: number | null;
+  consecutiveFailures: number;
+  lastError: string | null;
+  values: DisplayExternalValue[];
+}
+export interface DisplayWebhookInput {
+  kind: 'webhook';
+  name: string;
+  route: string;
+  dpt: string;
+  jsonPointer: string;
+  status: DisplayExternalHealth;
+  authenticationRequired: boolean;
+  authenticationConfigured: boolean;
+  lastAcceptedAtMs: number | null;
+  acceptedCount: number;
+  rejectedCount: number;
+  value: boolean | number | null;
+  valid: boolean;
+  ageMs: number | null;
+  consumers: DisplayExternalConsumer[];
+}
+export interface DisplayExternalInputs {
+  httpPolls: DisplayHttpPoll[];
+  webhooks: DisplayWebhookInput[];
 }
 
 /** A captured civil calendar value. Unavailable values expose null fields. */
@@ -162,6 +210,8 @@ export interface DisplayExecution {
   logicRevision: RevisionToken | null;
   status: 'succeeded' | 'failed';
   trigger: DisplayExecutionTrigger;
+  /** Host transport provenance; absent for legacy execution records. */
+  origin: DisplayExecutionOrigin | null;
   inputs: DisplayExecutionInput[];
   transition: DisplayTransition | null;
   stateBefore: DisplayState;
@@ -177,6 +227,12 @@ export interface DisplayExecution {
   timeContext: DisplayTimeContext | null;
   error: DisplayLogicError | null;
 }
+
+export type DisplayExecutionOrigin =
+  | { kind: 'knx'; groupAddress: string | null }
+  | { kind: 'signal'; signal: string }
+  | { kind: 'http'; poll: string; value: string }
+  | { kind: 'webhook'; source: string };
 
 export interface DisplayPendingTimer { name: string; scheduledAtMs: number; dueAtMs: number; logicRevision: RevisionToken; }
 export interface DisplayBlock {
@@ -201,7 +257,7 @@ export interface DisplayBlock {
   lastError: DisplayLogicError | null;
 }
 
-export type SimulationTypedValue = { kind: 'bool'; value: boolean } | { kind: 'percent'; value: number };
+export type SimulationTypedValue = { kind: 'bool'; value: boolean } | { kind: 'percent'; value: number } | { kind: 'temperature'; value: number };
 export interface SimulationInputTriggerRequest { type?: 'input'; endpoint: string; value: SimulationTypedValue; previous: SimulationTypedValue | null; }
 export interface SimulationTimerTriggerRequest { type: 'timer'; name?: string; timer?: string; firedAtMs: number; }
 export interface SimulationScheduleTriggerRequest { type: 'schedule'; schedule: string; occurrenceAtMs: number | null; }
@@ -259,6 +315,8 @@ export interface DisplaySnapshot {
   /** Site-time card; null only for legacy snapshots without one. */
   siteTime: DisplaySiteTime | null;
   signals: DisplaySignal[];
+  /** Host-managed HTTP poll and webhook diagnostics. */
+  externalInputs: DisplayExternalInputs;
   write: DisplayWrite;
   timer: DisplayTimer;
   telegrams: DisplayTelegram[];

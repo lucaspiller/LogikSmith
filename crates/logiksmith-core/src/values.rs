@@ -64,6 +64,15 @@ impl Dpt {
         subtype: 1,
     };
 
+    /// DPT 9.001 temperature in degrees Celsius.
+    pub const TEMPERATURE: Self = Self {
+        major: 9,
+        subtype: 1,
+    };
+
+    /// Short alias for the DPT 9.001 temperature type.
+    pub const TEMP: Self = Self::TEMPERATURE;
+
     /// Alias for callers that spell out the value's semantic name.
     pub const PERCENTAGE: Self = Self::PERCENT;
 
@@ -97,8 +106,12 @@ impl Dpt {
         self.major == Self::PERCENT.major && self.subtype == Self::PERCENT.subtype
     }
 
+    pub const fn is_temperature(self) -> bool {
+        self.major == Self::TEMPERATURE.major && self.subtype == Self::TEMPERATURE.subtype
+    }
+
     pub const fn is_supported(self) -> bool {
-        self.is_bool() || self.is_percent()
+        self.is_bool() || self.is_percent() || self.is_temperature()
     }
 }
 
@@ -156,6 +169,8 @@ impl Error for DptError {}
 pub enum Value {
     Bool(bool),
     Percent(u8),
+    /// DPT 9.001 signed hundredths of a degree Celsius.
+    Temperature(i32),
 }
 
 /// A value with its DPT identity attached.
@@ -176,6 +191,10 @@ impl TypedValue {
             (dpt, Value::Percent(value)) if dpt.is_percent() => {
                 Err(ValueError::PercentOutOfRange(value))
             }
+            (dpt, Value::Temperature(value)) if dpt.is_temperature() => Ok(Self {
+                dpt,
+                value: Value::Temperature(value),
+            }),
             (dpt, _) if !dpt.is_supported() => Err(ValueError::UnsupportedDpt(dpt)),
             (dpt, value) => Err(ValueError::DptValueMismatch { dpt, value }),
         }
@@ -192,6 +211,53 @@ impl TypedValue {
         Self::new(Dpt::PERCENT, Value::Percent(value))
     }
 
+    /// Creates a DPT 9.001 value from signed hundredths of a degree Celsius.
+    ///
+    /// Keeping the canonical representation integral makes equality, signal
+    /// propagation, and snapshots deterministic across hosts.
+    pub fn temperature_centi_degrees(value: i32) -> Result<Self, ValueError> {
+        Self::new(Dpt::TEMPERATURE, Value::Temperature(value))
+    }
+
+    /// Creates a DPT 9.001 value from degrees Celsius. Values must be finite
+    /// and have no more than two decimal places.
+    pub fn temperature(value: f64) -> Result<Self, ValueError> {
+        if !value.is_finite() {
+            return Err(ValueError::TemperatureNotFinite);
+        }
+        let scaled = value * 100.0;
+        let rounded = scaled.round();
+        // The tolerance only absorbs ordinary binary floating point noise for
+        // decimal values such as 12.34. A third decimal place remains well
+        // outside this tolerance and is rejected.
+        if (scaled - rounded).abs() > 1e-9 {
+            return Err(ValueError::TemperaturePrecision);
+        }
+        if rounded < i32::MIN as f64 || rounded > i32::MAX as f64 {
+            return Err(ValueError::TemperatureOutOfRange);
+        }
+        Self::temperature_centi_degrees(rounded as i32)
+    }
+
+    /// Explicit spelling for callers converting a host's Celsius scalar.
+    pub fn temperature_celsius(value: f64) -> Result<Self, ValueError> {
+        Self::temperature(value)
+    }
+
+    /// Returns the canonical signed hundredths-of-a-degree representation.
+    pub const fn temperature_centi(self) -> Option<i32> {
+        match self.value {
+            Value::Temperature(value) if self.dpt.is_temperature() => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Returns a DPT 9.001 value in degrees Celsius.
+    pub fn temperature_celsius_value(self) -> Option<f64> {
+        self.temperature_centi()
+            .map(|value| f64::from(value) / 100.0)
+    }
+
     pub const fn dpt(self) -> Dpt {
         self.dpt
     }
@@ -206,6 +272,9 @@ pub enum ValueError {
     UnsupportedDpt(Dpt),
     DptValueMismatch { dpt: Dpt, value: Value },
     PercentOutOfRange(u8),
+    TemperatureNotFinite,
+    TemperaturePrecision,
+    TemperatureOutOfRange,
 }
 
 impl fmt::Display for ValueError {
@@ -220,6 +289,13 @@ impl fmt::Display for ValueError {
                     formatter,
                     "percentage value {value} must be in range 0..=100"
                 )
+            }
+            Self::TemperatureNotFinite => formatter.write_str("temperature must be finite"),
+            Self::TemperaturePrecision => {
+                formatter.write_str("temperature must have at most two decimal places")
+            }
+            Self::TemperatureOutOfRange => {
+                formatter.write_str("temperature is outside the signed centi-degree range")
             }
         }
     }
@@ -269,6 +345,18 @@ impl InputEvent {
 pub struct InputObservation {
     pub endpoint: EndpointName,
     pub value: TypedValue,
+}
+
+/// A transport-neutral input update supplied by a host.
+///
+/// `Observe` refreshes a known value without evaluating Lua. `Trigger` stores
+/// the value and evaluates the block. `Invalidate` clears the known value
+/// without evaluating Lua, leaving the input unknown until a later update.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputUpdate {
+    Observe(TypedValue),
+    Trigger(TypedValue),
+    Invalidate,
 }
 
 impl InputObservation {

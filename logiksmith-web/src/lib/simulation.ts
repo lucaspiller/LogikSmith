@@ -119,6 +119,7 @@ export function typedValueForDpt(dpt: string, value: SimulationValue): Simulatio
   if (value === null) return null;
   if (dpt === '1.001' && typeof value === 'boolean') return { kind: 'bool', value };
   if (dpt === '5.001' && typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 100) return { kind: 'percent', value };
+  if (dpt === '9.001' && typeof value === 'number' && Number.isFinite(value)) return { kind: 'temperature', value };
   return null;
 }
 

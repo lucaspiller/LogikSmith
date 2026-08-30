@@ -67,4 +67,45 @@ test.describe('dashboard golden paths', () => {
     await expect(capture).toContainText('Eligible consumers (not executed)');
     await expect(capture).toContainText('does not propagate or execute them');
   });
+
+  test('renders HTTP poll and webhook health, values, and consumers', async ({ page }) => {
+    const external = page.getByRole('region', { name: 'External inputs' });
+    await expect(external.getByRole('heading', { name: 'External inputs' })).toBeVisible();
+
+    const poll = external.getByRole('article', { name: 'HTTP poll berlin_today_forecast' });
+    await expect(poll).toContainText('healthy');
+    await expect(poll).toContainText('Next attempt');
+    await expect(poll).toContainText('https://api.open-meteo.com/v1/forecast');
+    await expect(poll).toContainText('today_temperature_max');
+    await expect(poll).toContainText('9.001');
+    await expect(poll).toContainText('/daily/temperature_2m_max/0');
+    await expect(poll).toContainText('scheduled_light_test.today_temperature_max');
+
+    const webhook = external.getByRole('article', { name: 'Webhook external_override' });
+    await expect(webhook).toContainText('healthy');
+    await expect(webhook).toContainText('/api/webhooks/external_override');
+    await expect(webhook).toContainText('bearer token configured');
+    await expect(webhook).toContainText('3 / 1');
+    await expect(webhook).toContainText('scheduled_light_test.external_override');
+  });
+
+  test('shows external bindings on the selected block', async ({ page }) => {
+    await page.getByRole('button', { name: /scheduled_light_test/ }).click();
+    const block = page.getByRole('region', { name: 'Selected block' });
+    await expect(block).toContainText('today_temperature_max');
+    await expect(block).toContainText('HTTP');
+    await expect(block).toContainText('external_override');
+    await expect(block).toContainText('webhook');
+    await expect(block).toContainText('21.75');
+  });
+
+  test('shows HTTP provenance for an external execution', async ({ page }) => {
+    await page.getByRole('button', { name: /scheduled_light_test/ }).click();
+    const row = page.locator('.execution-history tbody tr').filter({ hasText: 'input:today_temperature_max' });
+    await expect(row).toHaveCount(1);
+    await row.click();
+
+    const origin = page.getByRole('region', { name: 'Selected execution origin' });
+    await expect(origin).toContainText('HTTP poll berlin_today_forecast / today_temperature_max');
+  });
 });

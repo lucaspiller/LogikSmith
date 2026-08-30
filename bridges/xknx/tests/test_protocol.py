@@ -1,10 +1,11 @@
 from types import SimpleNamespace
 import unittest
 
-from logiksmith_xknx.bridge import bool_from_xknx, event_from_telegram, percent_from_xknx
+from logiksmith_xknx.bridge import bool_from_xknx, event_from_telegram, percent_from_xknx, temperature_from_xknx
 from logiksmith_xknx.protocol import (
     DPT_1_001,
     DPT_5_001,
+    DPT_9_001,
     BoolValue,
     BridgeHello,
     CommandResult,
@@ -15,6 +16,7 @@ from logiksmith_xknx.protocol import (
     KnxEvent,
     KnxWrite,
     PercentValue,
+    TemperatureValue,
     ProtocolError,
     Ready,
     Shutdown,
@@ -45,6 +47,7 @@ class ProtocolRoundTripTests(unittest.TestCase):
             KnxEvent("1.1.42", "2/2/52", "group_value_write", DPT_1_001, BoolValue("bool", True)),
             KnxEvent("1.1.42", "2/3/52", "group_value_response", DPT_5_001, PercentValue("percent", 42)),
             KnxWrite(12, "2/3/52", DPT_5_001, PercentValue("percent", 100)),
+            KnxWrite(13, "2/4/52", DPT_9_001, TemperatureValue("temperature", -4.25)),
             CommandResult(12, True),
             CommandResult(13, False, "KNX connection unavailable"),
             Fatal("knx_connection_failed", "Unable to establish KNX/IP tunnel"),
@@ -88,6 +91,16 @@ class ProtocolRoundTripTests(unittest.TestCase):
         )
         self.assertEqual(parsed.group_addresses, (GroupAddressDpt("2/3/52", DPT_5_001),))
 
+    def test_config_accepts_temperature_dpt(self) -> None:
+        parsed = parse_line(
+            '{"v":1,"type":"configure","connection":{"type":"tunneling","gateway_ip":"192.0.2.20","gateway_port":3671,"local_ip":null},"group_addresses":[{"address":"2/4/52","dpt":{"major":9,"subtype":1}}]}'
+        )
+        self.assertEqual(parsed.group_addresses, (GroupAddressDpt("2/4/52", DPT_9_001),))
+
+    def test_temperature_value_rejects_non_finite(self) -> None:
+        with self.assertRaises(ProtocolError):
+            TemperatureValue.from_obj({"kind": "temperature", "value": float("nan")})
+
     def test_percent_value_validation_and_dpt_mismatch(self) -> None:
         self.assertEqual(PercentValue.from_obj({"kind": "percent", "value": 0}).value, 0)
         self.assertEqual(PercentValue.from_obj({"kind": "percent", "value": 100}).value, 100)
@@ -128,6 +141,13 @@ class ConversionTests(unittest.TestCase):
         for value in (-1, 101, 42.5, True, "42"):
             with self.assertRaises(ValueError):
                 percent_from_xknx(value)
+
+    def test_temperature_conversion_accepts_finite_numbers_only(self) -> None:
+        self.assertEqual(temperature_from_xknx(-4.25), -4.25)
+        self.assertEqual(temperature_from_xknx(SimpleNamespace(value=21.5)), 21.5)
+        for value in (True, float("nan"), float("inf"), "21.5"):
+            with self.assertRaises(ValueError):
+                temperature_from_xknx(value)
 
     def test_telegram_mapper_preserves_service(self) -> None:
         class GroupValueWrite:

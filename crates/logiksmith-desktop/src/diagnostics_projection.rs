@@ -691,6 +691,8 @@ fn automation_snapshot(runtime: &AutomationRuntime) -> AutomationSnapshot {
             outputs: Vec::new(),
             knx_bindings: Vec::new(),
             signal_bindings: Vec::new(),
+            http_bindings: Vec::new(),
+            webhook_bindings: Vec::new(),
             logic: LogicSourceSnapshot {
                 source: String::new(),
             },
@@ -710,15 +712,17 @@ fn block_automation_snapshot(
         .find(|candidate| candidate.id == block.id.as_str())
         .map(|candidate| candidate.source.as_str())
         .unwrap_or_default();
-    block_automation_snapshot_with_source(block, source)
+    block_automation_snapshot_with_source(runtime, block, source)
 }
 
 fn block_automation_snapshot_with_source(
+    runtime: &AutomationRuntime,
     block: &crate::BlockRuntime,
     source: &str,
 ) -> AutomationSnapshot {
     let endpoint = |name: &EndpointName, dpt: Dpt| {
         let signal = block.endpoint_to_signal.get(name).cloned();
+        let source = block.endpoint_to_external.get(name).cloned();
         EndpointSnapshot {
             name: name.to_string(),
             dpt: DptMessage::from_core(dpt),
@@ -726,11 +730,16 @@ fn block_automation_snapshot_with_source(
                 "knx"
             } else if signal.is_some() {
                 "signal"
+            } else if source.as_ref().is_some_and(|source| runtime.http_to_inputs.contains_key(source)) {
+                "http"
+            } else if source.as_ref().is_some_and(|source| runtime.webhook_to_inputs.contains_key(source)) {
+                "webhook"
             } else {
                 "unbound"
             }
             .to_owned(),
             signal: signal.map(|signal| signal.to_string()),
+            source,
         }
     };
     let inputs = block
@@ -765,11 +774,33 @@ fn block_automation_snapshot_with_source(
         })
         .collect();
     signal_bindings.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
+    let mut http_bindings: Vec<_> = block
+        .endpoint_to_external
+        .iter()
+        .filter(|(_, source)| runtime.http_to_inputs.contains_key(*source))
+        .map(|(endpoint, source)| ExternalBindingSnapshot {
+            endpoint: endpoint.to_string(),
+            source: source.clone(),
+        })
+        .collect();
+    http_bindings.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
+    let mut webhook_bindings: Vec<_> = block
+        .endpoint_to_external
+        .iter()
+        .filter(|(_, source)| runtime.webhook_to_inputs.contains_key(*source))
+        .map(|(endpoint, source)| ExternalBindingSnapshot {
+            endpoint: endpoint.to_string(),
+            source: source.clone(),
+        })
+        .collect();
+    webhook_bindings.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     AutomationSnapshot {
         inputs,
         outputs,
         knx_bindings,
         signal_bindings,
+        http_bindings,
+        webhook_bindings,
         logic: LogicSourceSnapshot {
             source: source.to_owned(),
         },
@@ -885,107 +916,4 @@ fn block_schedule_snapshots(
             }
         })
         .collect()
-}
-
-fn snapshot_locked(inner: &Inner, _now: logiksmith_core::MonotonicMs) -> Snapshot {
-    let values = ValuesSnapshot {
-        endpoints: inner
-            .endpoint_values
-            .iter()
-            .map(|(name, state)| EndpointValueSnapshot {
-                name: name.to_string(),
-                direction: state.direction.to_string(),
-                dpt: DptMessage::from_core(state.dpt),
-                observed: state.observed.clone(),
-                requested: state.requested.clone(),
-            })
-            .collect(),
-    };
-    let blocks = inner
-        .block_order
-        .iter()
-        .filter_map(|id| inner.blocks.get(id).map(|state| (id, state)))
-        .map(|(id, state)| {
-            let automation = inner.block_automation.get(id);
-            BlockSnapshot {
-                id: id.clone(),
-                active_enabled: state.active_enabled,
-                saved_enabled: state.saved_enabled,
-                active_revision: state.active_logic_revision,
-                saved_revision: state.saved_logic_revision,
-                active_logic_revision: state.active_logic_revision,
-                saved_logic_revision: state.saved_logic_revision,
-                source: if state.source.is_empty() {
-                    automation
-                        .map(|automation| automation.logic.source.clone())
-                        .unwrap_or_default()
-                } else {
-                    state.source.clone()
-                },
-                inputs: automation
-                    .map(|automation| automation.inputs.clone())
-                    .unwrap_or_default(),
-                outputs: automation
-                    .map(|automation| automation.outputs.clone())
-                    .unwrap_or_default(),
-                knx_bindings: automation
-                    .map(|automation| automation.knx_bindings.clone())
-                    .unwrap_or_default(),
-                signal_bindings: automation
-                    .map(|automation| automation.signal_bindings.clone())
-                    .unwrap_or_default(),
-                values: ValuesSnapshot {
-                    endpoints: inner
-                        .block_endpoint_values
-                        .iter()
-                        .filter(|((block_id, _), _)| block_id == id)
-                        .map(|((_, name), state)| EndpointValueSnapshot {
-                            name: name.to_string(),
-                            direction: state.direction.to_string(),
-                            dpt: DptMessage::from_core(state.dpt),
-                            observed: state.observed.clone(),
-                            requested: state.requested.clone(),
-                        })
-                        .collect(),
-                },
-                state: state.state.clone(),
-                pending_timers: state.pending_timers.clone(),
-                executions: state.executions.iter().rev().cloned().collect(),
-                schedules: block_schedule_snapshots(inner, id, state),
-                last_result: state.last_result.clone(),
-            }
-        })
-        .collect();
-    Snapshot {
-        revision: inner.revision,
-        connection: ConnectionSnapshot {
-            state: inner.connection,
-        },
-        config: ConfigSnapshot {
-            active: inner.automation.clone(),
-        },
-        automation: inner.automation.clone(),
-        active_automation_revision: inner.active_automation_revision,
-        saved_automation_revision: inner.saved_automation_revision,
-        captured_at_ms: inner.captured_at_ms,
-        site_time: inner.site_time.clone(),
-        state: inner.state.clone(),
-        pending_timers: inner.pending_timers.clone(),
-        values,
-        write: inner.last_write.clone(),
-        logic: LogicStatusSnapshot {
-            active_logic_revision: inner.active_logic_revision,
-            saved_logic_revision: inner.saved_logic_revision,
-            active_structural_revision: inner.active_structural_revision,
-            saved_structural_revision: inner.saved_structural_revision,
-            restart_required: inner.restart_required,
-            state: inner.state.clone(),
-            pending_timers: inner.pending_timers.clone(),
-            executions: inner.executions.iter().rev().cloned().collect(),
-        },
-        telegrams: inner.telegrams.iter().cloned().collect(),
-        logs: inner.logs.iter().cloned().collect(),
-        blocks,
-        signals: inner.signals.clone(),
-    }
 }
