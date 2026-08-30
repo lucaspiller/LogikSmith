@@ -38,7 +38,7 @@
   }
 </script>
 
-<div class="schedule-authoring"><div class="section-heading"><h3>Schedule definitions</h3><button type="button" class="small-button" disabled={schedules.length >= 32} on:click={add}>Add schedule</button></div><p class="subtle">Definitions belong to this block. Fixed and interval changes are saved with the block; astronomical rules use the desktop site-time context.</p>
+<div class="schedule-authoring"><div class="section-heading"><h3>Schedule definitions</h3><button type="button" class="small-button" disabled={schedules.length >= 32} on:click={add}>Add schedule</button></div><p class="subtle">Definitions belong to this block. Fixed and interval changes are saved with the block; astronomical rules use the desktop site-time context. Weekdays are the only schedule-side calendar filter.</p>
   {#if schedules.length}
     {#each schedules as schedule, index}
       <fieldset class="schedule-editor"><legend><code>{schedule.name}</code></legend><div class="schedule-fields">
@@ -53,8 +53,6 @@
         {:else}
           <label>Anchor<select aria-label={`Schedule ${index + 1} astronomical anchor`} value={schedule.anchor ?? 'sunset'} on:change={(event) => edit(index, { anchor: (event.currentTarget as HTMLSelectElement).value as AutomationSchedule['anchor'] })}>{#each anchors as anchor}<option value={anchor}>{anchor}</option>{/each}</select></label>
           <label>Offset<input aria-label={`Schedule ${index + 1} astronomical offset`} placeholder="-1h30m" value={schedule.offset ?? ''} on:input={(event) => edit(index, { offset: (event.currentTarget as HTMLInputElement).value })} /></label>
-          <label>Earliest (local)<input aria-label={`Schedule ${index + 1} earliest time`} placeholder="05:30" value={schedule.earliest ?? ''} on:input={(event) => edit(index, { earliest: (event.currentTarget as HTMLInputElement).value || undefined })} /></label>
-          <label>Latest (local)<input aria-label={`Schedule ${index + 1} latest time`} placeholder="23:30" value={schedule.latest ?? ''} on:input={(event) => edit(index, { latest: (event.currentTarget as HTMLInputElement).value || undefined })} /></label>
         {/if}
         <label>Weekdays<input aria-label={`Schedule ${index + 1} weekdays`} placeholder="mon, tue, wed" value={(schedule.weekdays ?? []).join(', ')} on:input={(event) => edit(index, { weekdays: weekdays((event.currentTarget as HTMLInputElement).value) })} /></label>
         <button type="button" class="small-button danger-button" on:click={() => remove(index)}>Remove</button>

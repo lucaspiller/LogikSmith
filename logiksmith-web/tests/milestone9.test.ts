@@ -10,7 +10,7 @@ function schedule(name: string, overrides: Record<string, unknown> = {}) {
     name,
     enabled: true,
     status: 'active',
-    rule: { kind: 'astronomical', summary: 'sunrise - 1h30m, earliest 05:30' },
+    rule: { kind: 'astronomical', summary: 'sunrise - 1h30m' },
     next_occurrence: '2026-08-29 05:30:00',
     next_occurrence_utc_ms: UTC_MS,
     relative_ms: 3_600_000,
@@ -171,7 +171,7 @@ describe('Milestone 9 per-block schedules', () => {
     expect(decoded.blocks[0].activeRevision).toBe('18446744073709551615');
     expect(decoded.blocks[0].savedRevision).toBe('18446744073709551615');
     const morning = decoded.blocks[0].schedules[0];
-    expect(morning).toMatchObject({ enabled: true, status: 'active', kind: 'astronomical', ruleSummary: 'sunrise - 1h30m, earliest 05:30', nextOccurrenceLocal: '2026-08-29 05:30:00', nextOccurrenceUtcMs: UTC_MS, relativeMs: 3_600_000, utcOffsetSeconds: 10_800, reason: null, lastOutcome: { status: 'none', executionId: null, timeMs: null } });
+    expect(morning).toMatchObject({ enabled: true, status: 'active', kind: 'astronomical', ruleSummary: 'sunrise - 1h30m', nextOccurrenceLocal: '2026-08-29 05:30:00', nextOccurrenceUtcMs: UTC_MS, relativeMs: 3_600_000, utcOffsetSeconds: 10_800, reason: null, lastOutcome: { status: 'none', executionId: null, timeMs: null } });
     expect(decoded.blocks[0].schedules[1]).toMatchObject({ status: 'paused', enabled: false, lastOutcome: { status: 'failed', executionId: 5, timeMs: 1_756_500_100_000 } });
     expect(decoded.blocks[0].schedules[2]).toMatchObject({ status: 'unavailable', reason: 'no sunset on this date' });
   });

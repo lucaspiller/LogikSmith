@@ -104,7 +104,7 @@ export interface DisplayBlockSchedule {
   enabled: boolean;
   status: 'active' | 'paused' | 'unavailable' | 'clock_error';
   kind: DisplayScheduleKind;
-  /** Server-rendered rule summary, e.g. "sunrise - 1h30m, earliest 05:30, Mon-Fri". */
+  /** Server-rendered rule summary, e.g. "sunrise - 1h30m, Mon-Fri". */
   ruleSummary: string;
   /** Next occurrence local civil rendering "YYYY-MM-DD HH:MM:SS"; null when none. */
   nextOccurrenceLocal: string | null;

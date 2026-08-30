@@ -445,12 +445,6 @@ fn schedule_config_snapshot(schedule: &crate::AutomationSchedule) -> ScheduleCon
             if let Some(offset) = &schedule.offset {
                 summary.push_str(&format!(" {offset}"));
             }
-            if let Some(earliest) = &schedule.earliest {
-                summary.push_str(&format!(" earliest {earliest}"));
-            }
-            if let Some(latest) = &schedule.latest {
-                summary.push_str(&format!(" latest {latest}"));
-            }
         }
         other => {
             summary.push_str(other);

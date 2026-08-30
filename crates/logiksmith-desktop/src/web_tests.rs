@@ -380,8 +380,6 @@
             every: Some("60s".to_owned()),
             offset: Some("0s".to_owned()),
             anchor: None,
-            earliest: None,
-            latest: None,
             weekdays: None,
             extra: std::collections::BTreeMap::new(),
         }

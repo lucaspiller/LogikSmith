@@ -8,7 +8,8 @@
 //! Semantics:
 //! - Fixed rules fire at a local wall-clock time on matching weekdays.
 //! - Interval rules use an absolute UTC phase.
-//! - Astronomical rules resolve solar events in the configured site timezone.
+//! - Astronomical rules resolve solar events in the configured site timezone;
+//!   weekday filtering is the only schedule-side calendar condition.
 
 include!("schedule_rules.rs");
 include!("schedule_astronomy.rs");

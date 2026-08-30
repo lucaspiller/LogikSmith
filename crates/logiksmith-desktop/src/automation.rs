@@ -348,10 +348,6 @@ pub struct AutomationSchedule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub earliest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weekdays: Option<Vec<String>>,
     #[serde(flatten)]
     pub extra: std::collections::BTreeMap<String, serde_json::Value>,

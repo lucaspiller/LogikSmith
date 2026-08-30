@@ -359,8 +359,6 @@ fn reject_disallowed_fields(
         ("every", schedule.every.is_some()),
         ("offset", schedule.offset.is_some()),
         ("anchor", schedule.anchor.is_some()),
-        ("earliest", schedule.earliest.is_some()),
-        ("latest", schedule.latest.is_some()),
         ("weekdays", schedule.weekdays.is_some()),
     ] {
         if present && !allowed.contains(&field) {
@@ -462,12 +460,7 @@ pub(crate) fn schedule_rule(
             })
         }
         "astronomical" => {
-            reject_disallowed_fields(
-                schedule,
-                path,
-                &["anchor", "offset", "earliest", "latest", "weekdays"],
-                errors,
-            );
+            reject_disallowed_fields(schedule, path, &["anchor", "offset", "weekdays"], errors);
             let anchor = match schedule.anchor.as_deref() {
                 Some(value) => parse_anchor(&format!("{path}.anchor"), value, errors),
                 None => {
@@ -488,14 +481,6 @@ pub(crate) fn schedule_rule(
                     None
                 }
             };
-            let earliest = match schedule.earliest.as_deref() {
-                Some(value) => parse_local_time(&format!("{path}.earliest"), value, errors),
-                None => None,
-            };
-            let latest = match schedule.latest.as_deref() {
-                Some(value) => parse_local_time(&format!("{path}.latest"), value, errors),
-                None => None,
-            };
             let weekdays = match schedule.weekdays.as_deref() {
                 Some(tokens) => parse_weekdays(&format!("{path}.weekdays"), tokens, errors),
                 None => None,
@@ -507,16 +492,6 @@ pub(crate) fn schedule_rule(
                 errors.push(FieldError {
                     path: format!("{path}.offset"),
                     message: "must be between -24h (-86400s) and +24h (86400s)".to_owned(),
-                });
-                return None;
-            }
-            if let (Some(earliest), Some(latest)) = (&earliest, &latest)
-                && (earliest.hour, earliest.minute, earliest.second)
-                    > (latest.hour, latest.minute, latest.second)
-            {
-                errors.push(FieldError {
-                    path: format!("{path}.earliest"),
-                    message: "must not be later than latest".to_owned(),
                 });
                 return None;
             }
@@ -537,8 +512,6 @@ pub(crate) fn schedule_rule(
             Some(ScheduleRule::Astronomical {
                 anchor,
                 offset_seconds: offset as i32,
-                earliest,
-                latest,
                 weekdays,
             })
         }

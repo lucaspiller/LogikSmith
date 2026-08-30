@@ -19,8 +19,6 @@ export interface AutomationSchedule {
   every?: string;
   offset?: string;
   anchor?: 'dawn' | 'sunrise' | 'sunset' | 'dusk';
-  earliest?: string;
-  latest?: string;
   weekdays?: ScheduleWeekday[];
 }
 export interface AutomationBlock {
@@ -129,10 +127,10 @@ function decodeSchedule(value: unknown, path: string): AutomationSchedule {
   if (typeof enabled !== 'boolean') throw new AutomationDecodeError(`${path}.enabled`, 'expected a boolean');
   const kind = required(source, 'kind', `${path}.kind`);
   if (kind !== 'fixed' && kind !== 'interval' && kind !== 'astronomical') throw new AutomationDecodeError(`${path}.kind`, 'expected fixed, interval, or astronomical');
-  const allowed = new Set(['name', 'enabled', 'kind', 'at', 'every', 'offset', 'anchor', 'earliest', 'latest', 'weekdays']);
+  const allowed = new Set(['name', 'enabled', 'kind', 'at', 'every', 'offset', 'anchor', 'weekdays']);
   for (const key of Object.keys(source)) if (!allowed.has(key)) throw new AutomationDecodeError(`${path}.${key}`, 'unknown schedule field');
   const result: AutomationSchedule = { name, enabled, kind };
-  for (const key of ['at', 'every', 'offset', 'anchor', 'earliest', 'latest'] as const) {
+  for (const key of ['at', 'every', 'offset', 'anchor'] as const) {
     const item = source[key];
     if (item !== undefined && item !== null) {
       if (typeof item !== 'string' || item.length === 0) throw new AutomationDecodeError(`${path}.${key}`, 'expected a non-empty string');
@@ -244,15 +242,15 @@ function validateSchedule(schedule: AutomationSchedule, blockIndex: number, sche
   if (typeof schedule.enabled !== 'boolean') addError(errors, `${path}.enabled`, 'must be a boolean');
   const present = (key: keyof AutomationSchedule): boolean => schedule[key] !== undefined && schedule[key] !== null;
   const reject = (keys: Array<keyof AutomationSchedule>): void => keys.filter(present).forEach((key) => addError(errors, `${path}.${String(key)}`, `is not allowed for a ${schedule.kind} schedule`));
-  const local = (key: 'at' | 'earliest' | 'latest'): void => { if (present(key) && (!validLocalTime(schedule[key]!) || typeof schedule[key] !== 'string')) addError(errors, `${path}.${key}`, 'must be a canonical local time HH:MM or HH:MM:SS'); };
+  const local = (key: 'at'): void => { if (present(key) && (!validLocalTime(schedule[key]!) || typeof schedule[key] !== 'string')) addError(errors, `${path}.${key}`, 'must be a canonical local time HH:MM or HH:MM:SS'); };
   const duration = (key: 'every' | 'offset', signed: boolean): void => { if (present(key) && (typeof schedule[key] !== 'string' || !validDuration(schedule[key]!, signed))) addError(errors, `${path}.${key}`, signed ? 'must be a signed whole-second duration such as -1h30m, 30m, or 45s' : 'must be a whole-second duration such as 1h30m, 60s, or 0s'); };
   if (schedule.kind === 'fixed') {
     // Fixed rules may be restricted to a weekday subset just like
     // astronomical rules; omitted weekdays mean every day on the desktop.
-    reject(['every', 'offset', 'anchor', 'earliest', 'latest']);
+    reject(['every', 'offset', 'anchor']);
     if (!present('at')) addError(errors, `${path}.at`, 'is required for a fixed schedule'); else local('at');
   } else if (schedule.kind === 'interval') {
-    reject(['at', 'anchor', 'earliest', 'latest', 'weekdays']);
+    reject(['at', 'anchor', 'weekdays']);
     if (!present('every')) addError(errors, `${path}.every`, 'is required for an interval schedule'); else duration('every', false);
     if (present('offset')) duration('offset', false);
     const every = typeof schedule.every === 'string' && validDuration(schedule.every, false) ? durationSeconds(schedule.every) : null;
@@ -263,8 +261,6 @@ function validateSchedule(schedule: AutomationSchedule, blockIndex: number, sche
     reject(['at', 'every']);
     if (!present('anchor')) addError(errors, `${path}.anchor`, 'is required for an astronomical schedule'); else if (!['dawn', 'sunrise', 'sunset', 'dusk'].includes(schedule.anchor!)) addError(errors, `${path}.anchor`, 'must be one of dawn, sunrise, sunset, or dusk');
     if (!present('offset')) addError(errors, `${path}.offset`, 'is required for an astronomical schedule'); else { duration('offset', true); const offset = typeof schedule.offset === 'string' && validDuration(schedule.offset, true) ? durationSeconds(schedule.offset) * (schedule.offset.startsWith('-') ? -1 : 1) : null; if (offset !== null && Math.abs(offset) > 86400) addError(errors, `${path}.offset`, 'must be between -24h (-86400s) and +24h (86400s)'); }
-    local('earliest'); local('latest');
-    if (schedule.earliest && schedule.latest && validLocalTime(schedule.earliest) && validLocalTime(schedule.latest) && schedule.earliest > schedule.latest) addError(errors, `${path}.earliest`, 'must not be later than latest');
   } else addError(errors, `${path}.kind`, 'must be one of fixed, interval, or astronomical');
   if (present('weekdays')) {
     if (!Array.isArray(schedule.weekdays) || schedule.weekdays.length === 0) addError(errors, `${path}.weekdays`, 'must not be empty');

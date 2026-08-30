@@ -184,7 +184,7 @@
                 },
             ),
             (
-                astro(SolarAnchor::Sunrise, 90_000, None, None, &Weekday::ALL),
+                astro(SolarAnchor::Sunrise, 90_000, &Weekday::ALL),
                 ScheduleError::InvalidAstronomicalOffset {
                     offset_seconds: 90_000,
                 },
@@ -212,7 +212,7 @@
         assert!(interval(60, 0).validate().is_ok());
         assert!(interval(604_800, 604_799).validate().is_ok());
         assert!(
-            astro(SolarAnchor::Dusk, -86_400, None, None, &Weekday::ALL)
+            astro(SolarAnchor::Dusk, -86_400, &Weekday::ALL)
                 .validate()
                 .is_ok()
         );
@@ -385,6 +385,61 @@
     }
 
     #[test]
+    fn ctx_datetime_values_compare_with_local_time_strings() {
+        let mut engine = ctx_engine(
+            r#"
+            function handle(event, input, meta, state, ctx)
+                return { state = {
+                    before_hour = ctx.now < "14:00",
+                    before_minute = ctx.now < "13:45",
+                    exact_minute = ctx.now <= "13:45:30",
+                    exact_minute_only = ctx.now <= "13:45",
+                    after_exact_second = ctx.now < "13:45:31",
+                    sunset_before_midnight = ctx.sun.sunset <= "23:59",
+                }}
+            end
+            "#,
+        );
+        let execution = engine
+            .process_input_sampled(
+                InputEvent::new("wall_switch".parse().unwrap(), TypedValue::bool(true)),
+                sample(utc_ms(2026, 6, 4, 13, 45, 30)),
+                &utc_site(),
+            )
+            .unwrap();
+        assert!(matches!(execution.outcome, Ok(_)), "{:?}", execution.outcome);
+        let state = &execution.state_after;
+        assert_eq!(state["before_hour"], StateValue::Bool(true));
+        assert_eq!(state["before_minute"], StateValue::Bool(false));
+        assert_eq!(state["exact_minute"], StateValue::Bool(true));
+        assert_eq!(state["exact_minute_only"], StateValue::Bool(false));
+        assert_eq!(state["after_exact_second"], StateValue::Bool(true));
+        assert_eq!(state["sunset_before_midnight"], StateValue::Bool(true));
+    }
+
+    #[test]
+    fn malformed_local_time_string_is_a_contained_runtime_error() {
+        for value in ["6:00", "24:00", "12:60", "12:00:60", "12:00:00:00"] {
+            let mut engine = ctx_engine(&format!(
+                "function handle(event, input, meta, state, ctx) return {{ state = {{ bad = ctx.now < {value:?} }} }} end"
+            ));
+            let execution = engine
+                .process_input_sampled(
+                    InputEvent::new("wall_switch".parse().unwrap(), TypedValue::bool(true)),
+                    sample(utc_ms(2026, 6, 4, 13, 45, 30)),
+                    &utc_site(),
+                )
+                .unwrap();
+            assert!(matches!(
+                execution.outcome,
+                Err(crate::LogicError::Runtime { ref message, .. })
+                    if message.contains("invalid local time")
+                        && message.contains("canonical HH:MM or HH:MM:SS")
+            ), "{value}: {:?}", execution.outcome);
+        }
+    }
+
+    #[test]
     fn ctx_unavailable_sentinels_compare_false_and_fields_nil() {
         let mut engine = ctx_engine(
             r#"
@@ -393,6 +448,8 @@
                     eq = ctx.now == ctx.sun.dawn,
                     lt = ctx.now < ctx.now,
                     le = ctx.now <= ctx.now,
+                    time_lt = ctx.now < "06:00",
+                    time_le = ctx.now <= "06:00",
                     year_nil = (ctx.now.year == nil),
                     month_nil = (ctx.now.month == nil),
                     weekday_nil = (ctx.now.weekday == nil),
@@ -419,6 +476,8 @@
         assert_eq!(state["eq"], StateValue::Bool(false));
         assert_eq!(state["lt"], StateValue::Bool(false));
         assert_eq!(state["le"], StateValue::Bool(false));
+        assert_eq!(state["time_lt"], StateValue::Bool(false));
+        assert_eq!(state["time_le"], StateValue::Bool(false));
         assert_eq!(state["year_nil"], StateValue::Bool(true));
         assert_eq!(state["month_nil"], StateValue::Bool(true));
         assert_eq!(state["weekday_nil"], StateValue::Bool(true));
