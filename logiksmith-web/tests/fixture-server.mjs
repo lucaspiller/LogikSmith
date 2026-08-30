@@ -5,13 +5,24 @@ import { fileURLToPath } from 'node:url';
 
 const root = join(fileURLToPath(new URL('.', import.meta.url)), '..', 'dist');
 const port = Number(process.argv[2] ?? 8090);
+const m12InitialBlocks = [
+  ['scheduled_light_test', { revision: '12', source: null, enabled: true }],
+  ['occupancy_source', { revision: '3', source: null, enabled: true }],
+  ['lighting_policy', { revision: '4', source: null, enabled: true }],
+  ['hall_light', { revision: '5', source: null, enabled: false }]
+];
+const m12State = { structuralRevision: '1', blocks: new Map(m12InitialBlocks) };
+function resetM12State() {
+  m12State.structuralRevision = '1';
+  m12State.blocks = new Map(m12InitialBlocks.map(([id, value]) => [id, { ...value }]));
+}
 const state = {
   phase: { kind: 'string', value: 'waiting_to_turn_off' },
   activation_count: { kind: 'integer', value: 2 }
 };
 const pendingTimers = [
-  { name: 'dim', scheduled_at_ms: 800, due_at_ms: 5300, logic_revision: 12 },
-  { name: 'off', scheduled_at_ms: 800, due_at_ms: 5800, logic_revision: 12 }
+  { name: 'dim', scheduled_at_ms: 800, due_at_ms: 5300, logic_revision: '12' },
+  { name: 'off', scheduled_at_ms: 800, due_at_ms: 5800, logic_revision: '12' }
 ];
 const siteTime = {
   timezone: 'Europe/Vilnius',
@@ -88,20 +99,20 @@ function scheduleTrigger() {
   return { type: 'schedule', name: 'morning_on', kind: 'astronomical', scheduled_for_utc_ms: 1_756_500_000_000, detected_at_utc_ms: 1_756_500_123_000, handled_at_utc_ms: 1_756_500_123_456, late_by_ms: 123_000, queue_delay_ms: 456, coalesced_count: 1, structural_revision: '17827391827' };
 }
 function timerTrigger() {
-  return { type: 'timer', endpoint: '', dpt: { major: 0, subtype: 0 }, value: { kind: 'bool', value: false }, previous: null, changed: false, rising: false, falling: false, name: 'dim', scheduled_at_ms: 800, due_at_ms: 5300, fired_at_ms: 5312, late_by_ms: 12, scheduled_logic_revision: 12 };
+  return { type: 'timer', endpoint: '', dpt: { major: 0, subtype: 0 }, value: { kind: 'bool', value: false }, previous: null, changed: false, rising: false, falling: false, name: 'dim', scheduled_at_ms: 800, due_at_ms: 5300, fired_at_ms: 5312, late_by_ms: 12, scheduled_logic_revision: '12' };
 }
 function scheduleExecution() {
-  return { execution_id: 8, time_ms: 1_756_500_123, duration_us: 42, logic_revision: 12, status: 'succeeded', trigger: scheduleTrigger(), inputs: [], state_before: state, state_after: state, transition: { state, effects: [], timers: [{ name: 'off', action: 'scheduled', after_ms: 5000, due_at_ms: 1_756_500_128_000 }] }, effects: [], timer_effects: [], time_context: timeContext, error: null };
+  return { execution_id: 8, time_ms: 1_756_500_123, duration_us: 42, logic_revision: '12', status: 'succeeded', trigger: scheduleTrigger(), inputs: [], state_before: state, state_after: state, transition: { state, effects: [], timers: [{ name: 'off', action: 'scheduled', after_ms: 5000, due_at_ms: 1_756_500_128_000 }] }, effects: [], timer_effects: [], time_context: timeContext, error: null };
 }
 function timerExecution() {
-  return { execution_id: 7, time_ms: 5312, duration_us: 42, logic_revision: 12, status: 'succeeded', trigger: timerTrigger(), inputs: [{ endpoint: 'wall_switch', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true }, valid: true, age_ms: 5312 }], state_before: state, state_after: { ...state, phase: { kind: 'string', value: 'dimmed' } }, transition: { state: { phase: { kind: 'string', value: 'dimmed' } }, effects: [], timers: [{ name: 'off', action: 'replaced', previous_due_at_ms: 5800, after_ms: 5000, due_at_ms: 10312 }] }, effects: [], timer_effects: [], time_context: timeContext, error: null };
+  return { execution_id: 7, time_ms: 5312, duration_us: 42, logic_revision: '12', status: 'succeeded', trigger: timerTrigger(), inputs: [{ endpoint: 'wall_switch', dpt: { major: 1, subtype: 1 }, value: { kind: 'bool', value: true }, valid: true, age_ms: 5312 }], state_before: state, state_after: { ...state, phase: { kind: 'string', value: 'dimmed' } }, transition: { state: { phase: { kind: 'string', value: 'dimmed' } }, effects: [], timers: [{ name: 'off', action: 'replaced', previous_due_at_ms: 5800, after_ms: 5000, due_at_ms: 10312 }] }, effects: [], timer_effects: [], time_context: timeContext, error: null };
 }
 function httpExecution() {
   const temperature = { kind: 'temperature', value: 21.75 };
-  return { execution_id: 9, time_ms: 1_756_500_124_000, duration_us: 38, logic_revision: 12, status: 'succeeded', trigger: { type: 'input', endpoint: 'today_temperature_max', dpt: { major: 9, subtype: 1 }, value: temperature, previous: null, changed: true, rising: false, falling: false }, origin: { kind: 'http', poll: 'berlin_today_forecast', value: 'today_temperature_max' }, inputs: [{ endpoint: 'today_temperature_max', dpt: { major: 9, subtype: 1 }, value: temperature, valid: true, age_ms: 200 }], state_before: state, state_after: state, transition: { state, effects: [], timers: [] }, effects: [], timer_effects: [], time_context: timeContext, error: null };
+  return { execution_id: 9, time_ms: 1_756_500_124_000, duration_us: 38, logic_revision: '12', status: 'succeeded', trigger: { type: 'input', endpoint: 'today_temperature_max', dpt: { major: 9, subtype: 1 }, value: temperature, previous: null, changed: true, rising: false, falling: false }, origin: { kind: 'http', poll: 'berlin_today_forecast', value: 'today_temperature_max' }, inputs: [{ endpoint: 'today_temperature_max', dpt: { major: 9, subtype: 1 }, value: temperature, valid: true, age_ms: 200 }], state_before: state, state_after: state, transition: { state, effects: [], timers: [] }, effects: [], timer_effects: [], time_context: timeContext, error: null };
 }
 function blocks() {
-  return [{
+  const values = [{
     id: 'scheduled_light_test',
     active_enabled: true,
     saved_enabled: true,
@@ -178,6 +189,115 @@ function blocks() {
     executions: [],
     lastResult: { status: 'none', executionId: null, timeMs: null, error: null }
   }];
+  return values.map((item) => {
+    const current = m12State.blocks.get(item.id);
+    if (!current) return item;
+    return {
+      ...item,
+      active_enabled: current.enabled,
+      saved_enabled: current.enabled,
+      activeEnabled: current.enabled,
+      savedEnabled: current.enabled,
+      active_revision: current.revision,
+      saved_revision: current.revision,
+      active_logic_revision: current.revision,
+      saved_logic_revision: current.revision,
+      source: current.source ?? item.source,
+      pending_timers: item.id === 'scheduled_light_test' && current.revision !== '12' ? [] : item.pending_timers
+    };
+  });
+}
+
+const decimalRevision = /^(0|[1-9]\d*)$/;
+function m12Fingerprint(source) {
+  let hash = 2166136261;
+  for (const byte of new TextEncoder().encode(source)) {
+    hash ^= byte;
+    hash = Math.imul(hash, 16777619);
+  }
+  return `fnv1a-${(hash >>> 0).toString(16).padStart(8, '0')}`;
+}
+function m12Block(blockId) {
+  return m12State.blocks.get(blockId) ?? null;
+}
+function m12Validation(source) {
+  if (typeof source !== 'string') return [{ path: 'source', category: 'request', message: 'must be a string', line: null }];
+  if (new TextEncoder().encode(source).byteLength > 65_536) return [{ path: 'source', category: 'source_limit', message: 'source exceeds the 65536 byte limit', line: null }];
+  if (!source.trim()) return [{ path: 'source', category: 'syntax', message: 'source must not be empty', line: 1 }];
+  if (/syntax[_ ]error|invalid[_ ]source/i.test(source)) return [{ path: 'source', category: 'syntax', message: 'unexpected symbol near \'end\'', line: 1 }];
+  return [];
+}
+function m12BodyErrors(body, required, optional = []) {
+  const errors = contractErrors(body, required, optional);
+  if (body && 'source_fingerprint' in body && typeof body.source_fingerprint !== 'string') errors.push({ path: 'source_fingerprint', message: 'must be a string' });
+  for (const key of ['expected_revision', 'expected_structural_revision']) {
+    if (body && key in body && (typeof body[key] !== 'string' || !decimalRevision.test(body[key]))) {
+      errors.push({ path: key, message: 'must be a decimal string' });
+    }
+  }
+  return errors;
+}
+function m12Conflict(body, current) {
+  if (body.expected_revision !== current.revision || body.expected_structural_revision !== m12State.structuralRevision) {
+    return {
+      error: 'active block or structural revision changed; refresh and retry',
+      current_revision: current.revision,
+      current_structural_revision: m12State.structuralRevision
+    };
+  }
+  return null;
+}
+function m12NextRevision(current) {
+  return (BigInt(current.revision) + 1n).toString();
+}
+function m12Trigger(body, blockId) {
+  const trigger = body.trigger ?? { type: 'input', endpoint: 'wall_switch', value: { kind: 'bool', value: true }, previous: null };
+  const typed = trigger.value ?? { kind: 'bool', value: true };
+  const inputEndpoint = trigger.endpoint ?? (blockId === 'lighting_policy' ? 'occupied' : blockId === 'hall_light' ? 'allowed' : 'wall_switch');
+  return trigger.type === 'timer'
+    ? { type: 'timer', name: trigger.name ?? trigger.timer ?? 'off', scheduled_at_ms: 800, due_at_ms: trigger.fired_at_ms ?? trigger.firedAtMs ?? 5_800, fired_at_ms: trigger.fired_at_ms ?? trigger.firedAtMs ?? 5_800, late_by_ms: 0, scheduled_logic_revision: m12Block(blockId)?.revision ?? '0' }
+    : { type: 'input', endpoint: inputEndpoint, dpt: { major: 1, subtype: 1 }, value: typed, previous: trigger.previous ?? null, changed: true, rising: typed.value === true, falling: false };
+}
+function m12Simulation(body, current) {
+  const blockId = body.block_id;
+  const trigger = m12Trigger(body, blockId);
+  const stateBefore = body.state ?? {};
+  const inputs = (body.inputs ?? []).map((input) => ({ ...input, dpt: input.dpt ?? { major: 1, subtype: 1 } }));
+  const emptyTransition = { state: stateBefore, effects: [], signalEffects: [], timers: [] };
+  if (/runtime[_ ]error/i.test(body.source)) {
+    return { block_id: blockId, source_fingerprint: m12Fingerprint(body.source), block_revision: current.revision, structural_revision: m12State.structuralRevision, logic_revision: current.revision, duration_us: 17, status: 'failed', trigger, inputs, state_before: stateBefore, state_after: stateBefore, transition: emptyTransition, effects: [], signalEffects: [], eligibleConsumers: [], timer_effects: [], pending_timers: body.pending_timers ?? [], time_context: timeContext, error: { category: 'runtime', message: 'attempt to call a nil value', line: 3 } };
+  }
+  if (blockId === 'lighting_policy') {
+    const effect = { endpoint: 'allowed', signal: 'lighting_allowed', dpt: { major: 1, subtype: 1 }, value: trigger.value ?? { kind: 'bool', value: true }, changed: true, producer: { blockId, endpoint: 'allowed' }, producingExecutionId: null, consumers: [{ blockId: 'hall_light', endpoint: 'allowed' }] };
+    const stateAfter = /state[_ ]change/i.test(body.source) ? { ...stateBefore, policy_seen: { kind: 'bool', value: true } } : stateBefore;
+    const transition = { state: stateAfter, effects: [], signalEffects: [effect], timers: [] };
+    return { block_id: blockId, source_fingerprint: m12Fingerprint(body.source), block_revision: current.revision, structural_revision: m12State.structuralRevision, logic_revision: current.revision, duration_us: 19, status: 'succeeded', trigger, inputs, state_before: stateBefore, state_after: stateAfter, transition, effects: [], signalEffects: [effect], eligibleConsumers: effect.consumers, timer_effects: [], pending_timers: body.pending_timers ?? [], time_context: timeContext, error: null };
+  }
+  if (blockId === 'hall_light') {
+    const output = { endpoint: 'actuator', destination: '1/2/4', dpt: { major: 1, subtype: 1 }, value: trigger.value ?? { kind: 'bool', value: true } };
+    const transition = { state: stateBefore, effects: [output], signalEffects: [], timers: [] };
+    return { block_id: blockId, source_fingerprint: m12Fingerprint(body.source), block_revision: current.revision, structural_revision: m12State.structuralRevision, logic_revision: current.revision, duration_us: 21, status: 'succeeded', trigger, inputs, state_before: stateBefore, state_after: stateBefore, transition, effects: [output], signalEffects: [], eligibleConsumers: [], timer_effects: [], pending_timers: body.pending_timers ?? [], time_context: timeContext, error: null };
+  }
+  const result = simulation({ ...body, block_id: blockId, state: stateBefore, pending_timers: body.pending_timers ?? [] });
+  return { ...result, block_id: blockId, source_fingerprint: m12Fingerprint(body.source), block_revision: current.revision, structural_revision: m12State.structuralRevision, logic_revision: current.revision };
+}
+function m12ValidationResponse(blockId, source) {
+  const errors = m12Validation(source);
+  return { status: errors.length ? 'invalid' : 'valid', block_id: blockId, source_fingerprint: typeof source === 'string' ? m12Fingerprint(source) : null, active_revision: m12Block(blockId)?.revision ?? null, structural_revision: m12State.structuralRevision, errors };
+}
+function m12ActivationResponse(blockId, body, current) {
+  const nextRevision = m12NextRevision(current);
+  const cancelledTimers = blockId === 'scheduled_light_test' ? pendingTimers.map((timer) => timer.name) : [];
+  current.revision = nextRevision;
+  current.source = body.source;
+  return { block_id: blockId, source_fingerprint: m12Fingerprint(body.source), active_revision: nextRevision, saved_revision: nextRevision, active_logic_revision: nextRevision, saved_logic_revision: nextRevision, active_structural_revision: m12State.structuralRevision, saved_structural_revision: m12State.structuralRevision, active_enabled: current.enabled, saved_enabled: current.enabled, restart_required: false, cancelled_timers: cancelledTimers };
+}
+function m12EnableResponse(blockId, body, current) {
+  const nextRevision = m12NextRevision(current);
+  const cancelledTimers = !body.enabled && blockId === 'scheduled_light_test' ? pendingTimers.map((timer) => timer.name) : [];
+  current.revision = nextRevision;
+  current.enabled = body.enabled;
+  return { block_id: blockId, enabled: body.enabled, active_enabled: body.enabled, saved_enabled: body.enabled, active_revision: nextRevision, saved_revision: nextRevision, active_structural_revision: m12State.structuralRevision, saved_structural_revision: m12State.structuralRevision, cancelled_timers: cancelledTimers, restart_required: false };
 }
 function externalInputs() {
   return {
@@ -223,7 +343,7 @@ function externalInputs() {
   };
 }
 function snapshot() {
-  return { revision: 4, captured_at_ms: 1_000, connection: { state: 'connected' }, site_time: siteTime, active_structural_revision: 1, saved_structural_revision: 1, active_logic_revision: 12, saved_logic_revision: 12, restart_required: false, signals: [{ name: 'house_occupied', dpt: '1.001', value: { kind: 'bool', value: true }, status: 'valid', observedAtMs: 1200, changedAtMs: 1200, producer: { blockId: 'occupancy_source', endpoint: 'occupied' }, producingExecutionId: 101, consumers: [{ blockId: 'lighting_policy', endpoint: 'occupied' }], recentChanges: [{ value: { kind: 'bool', value: true }, observedAtMs: 1200, changedAtMs: 1200, executionId: 101 }], structuralRevision: '1' }, { name: 'lighting_allowed', dpt: '1.001', value: { kind: 'bool', value: true }, status: 'valid', observedAtMs: 1210, changedAtMs: 1210, producer: { blockId: 'lighting_policy', endpoint: 'allowed' }, producingExecutionId: 102, consumers: [{ blockId: 'hall_light', endpoint: 'allowed' }], recentChanges: [{ value: { kind: 'bool', value: true }, observedAtMs: 1210, changedAtMs: 1210, executionId: 102 }], structuralRevision: '1' }, { name: 'night_mode', dpt: '1.001', value: null, status: 'unknown', observedAtMs: null, changedAtMs: null, producer: null, producingExecutionId: null, consumers: [], recentChanges: [], structuralRevision: '1' }, { name: 'fallback_mode', dpt: '1.001', value: { kind: 'bool', value: false }, status: 'producer_disabled', observedAtMs: 1200, changedAtMs: null, producer: { blockId: 'hall_light', endpoint: 'allowed' }, producingExecutionId: null, consumers: [], recentChanges: [], structuralRevision: '1' }], external_inputs: externalInputs(), blocks: blocks(), telegrams: [], logs: [] };
+  return { revision: 4, captured_at_ms: 1_000, connection: { state: 'connected' }, site_time: siteTime, active_structural_revision: m12State.structuralRevision, saved_structural_revision: m12State.structuralRevision, active_logic_revision: m12Block('scheduled_light_test')?.revision ?? '0', saved_logic_revision: m12Block('scheduled_light_test')?.revision ?? '0', restart_required: false, signals: [{ name: 'house_occupied', dpt: '1.001', value: { kind: 'bool', value: true }, status: 'valid', observedAtMs: 1200, changedAtMs: 1200, producer: { blockId: 'occupancy_source', endpoint: 'occupied' }, producingExecutionId: 101, consumers: [{ blockId: 'lighting_policy', endpoint: 'occupied' }], recentChanges: [{ value: { kind: 'bool', value: true }, observedAtMs: 1200, changedAtMs: 1200, executionId: 101 }], structuralRevision: m12State.structuralRevision }, { name: 'lighting_allowed', dpt: '1.001', value: { kind: 'bool', value: true }, status: 'valid', observedAtMs: 1210, changedAtMs: 1210, producer: { blockId: 'lighting_policy', endpoint: 'allowed' }, producingExecutionId: 102, consumers: [{ blockId: 'hall_light', endpoint: 'allowed' }], recentChanges: [{ value: { kind: 'bool', value: true }, observedAtMs: 1210, changedAtMs: 1210, executionId: 102 }], structuralRevision: m12State.structuralRevision }, { name: 'night_mode', dpt: '1.001', value: null, status: 'unknown', observedAtMs: null, changedAtMs: null, producer: null, producingExecutionId: null, consumers: [], recentChanges: [], structuralRevision: m12State.structuralRevision }, { name: 'fallback_mode', dpt: '1.001', value: { kind: 'bool', value: false }, status: 'producer_disabled', observedAtMs: 1200, changedAtMs: null, producer: { blockId: 'hall_light', endpoint: 'allowed' }, producingExecutionId: null, consumers: [], recentChanges: [], structuralRevision: m12State.structuralRevision }], external_inputs: externalInputs(), blocks: blocks(), telegrams: [], logs: [] };
 }
 function simulation(body) {
   if (body.block_id === 'occupancy_source' && body.trigger?.type === 'input') {
@@ -303,6 +423,48 @@ const server = createServer(async (request, response) => {
     const document = { signals: snapshot().signals.map((item) => ({ name: item.name, dpt: item.dpt })), http_polls: [{ name: 'berlin_today_forecast', url: 'https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41', every: '6h', timeout: '10s', stale_after: '12h', headers: [], values: [{ name: 'today_temperature_max', dpt: '9.001', json_pointer: '/daily/temperature_2m_max/0' }] }], webhook_inputs: [{ name: 'external_override', route: '/api/webhooks/external_override', dpt: '1.001', json_pointer: '/enabled', bearer_token: 'configured' }], blocks: blocks().map((item) => ({ id: item.id, enabled: item.active_enabled ?? item.activeEnabled ?? true, revision: 1, inputs: item.inputs.map((input) => ({ name: input.name, dpt: documentDpt(input.dpt) })), outputs: item.outputs.map((output) => ({ name: output.name, dpt: documentDpt(output.dpt) })), knx_bindings: item.knx_bindings ?? item.knxBindings ?? [], signal_bindings: item.signal_bindings ?? item.signalBindings ?? [], http_bindings: item.http_bindings ?? item.httpBindings ?? [], webhook_bindings: item.webhook_bindings ?? item.webhookBindings ?? [], source: item.source, schedules: item.schedules?.length ? scheduleDefinitions : [] })) };
     return sendJson(response, { document, revision: 12, active_logic_revision: 12, saved_logic_revision: 12, active_structural_revision: 1, saved_structural_revision: 1, restart_required: false, blocks: [{ id: 'scheduled_light_test', active_revision: '12', saved_revision: '12', active_logic_revision: 12, saved_logic_revision: 12, active_enabled: true, saved_enabled: true }] });
   }
+  if (request.url?.startsWith('/api/test/reset')) {
+    resetM12State();
+    return sendJson(response, { status: 'reset' });
+  }
+  const m12Route = request.url?.match(/^\/api\/blocks\/([^/?]+)\/(validate|simulate|source|enabled)(?:\?.*)?$/);
+  if (m12Route) {
+    const [, blockId, operation] = m12Route;
+    const current = m12Block(blockId);
+    if (!current) return sendJson(response, { error: 'unknown logic block' }, 404);
+    const body = await readJson(request);
+    if (operation === 'validate') {
+      const errors = m12BodyErrors(body, ['source', 'source_fingerprint', 'expected_revision'], ['expected_structural_revision']);
+      if (errors.length) return sendJson(response, { errors }, 422);
+      return sendJson(response, m12ValidationResponse(blockId, body.source));
+    }
+    if (operation === 'simulate') {
+      const errors = m12BodyErrors(body, ['block_id', 'source', 'source_fingerprint', 'expected_revision', 'expected_structural_revision', 'trigger', 'inputs'], ['state', 'pending_timers']);
+      if (errors.length) return sendJson(response, { errors }, 422);
+      const conflict = m12Conflict(body, current);
+      if (conflict) return sendJson(response, conflict, 409);
+      const sourceErrors = m12Validation(body.source);
+      if (sourceErrors.length) return sendJson(response, { errors: sourceErrors }, 422);
+      return sendJson(response, m12Simulation({ ...body, block_id: blockId }, current));
+    }
+    if (operation === 'source') {
+      const errors = m12BodyErrors(body, ['source', 'source_fingerprint', 'expected_revision', 'expected_structural_revision']);
+      if (errors.length) return sendJson(response, { errors }, 422);
+      const conflict = m12Conflict(body, current);
+      if (conflict) return sendJson(response, conflict, 409);
+      const sourceErrors = m12Validation(body.source);
+      if (sourceErrors.length) return sendJson(response, { errors: sourceErrors }, 422);
+      if (/persist[_ ]failure/i.test(body.source)) return sendJson(response, { error: { category: 'persistence', message: 'automation.toml could not be replaced atomically' } }, 500);
+      if (/activation[_ ]failure/i.test(body.source)) return sendJson(response, { error: { category: 'activation', message: 'runtime rejected the validated source' } }, 503);
+      return sendJson(response, m12ActivationResponse(blockId, body, current));
+    }
+    const errors = m12BodyErrors(body, ['enabled', 'expected_revision', 'expected_structural_revision']);
+    if (body && 'enabled' in body && typeof body.enabled !== 'boolean') errors.push({ path: 'enabled', message: 'must be a boolean' });
+    if (errors.length) return sendJson(response, { errors }, 422);
+    const conflict = m12Conflict(body, current);
+    if (conflict) return sendJson(response, conflict, 409);
+    return sendJson(response, m12EnableResponse(blockId, body, current));
+  }
   if (request.url?.startsWith('/api/schedules/preview')) {
     const body = await readJson(request); const errors = contractErrors(body, ['block_id', 'schedule'], ['after_utc_ms', 'count']);
     if (body && body.count !== undefined && (!Number.isInteger(body.count) || body.count < 1 || body.count > 10)) errors.push({ path: 'count', message: 'must be between 1 and 10' });
@@ -322,4 +484,4 @@ const server = createServer(async (request, response) => {
   const path = request.url === '/' ? '/index.html' : request.url;
   try { const data = await readFile(join(root, path)); const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' }; response.writeHead(200, { 'content-type': types[extname(path)] ?? 'application/octet-stream' }); response.end(data); } catch { sendJson(response, { error: 'not found' }, 404); }
 });
-server.listen(port, '127.0.0.1', () => console.log(`fixture listening on http://127.0.0.1:${port}`));
+server.listen(port, '127.0.0.1', () => console.log(`fixture listening on http://127.0.0.1:${server.address().port}`));

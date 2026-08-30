@@ -324,6 +324,40 @@
     }
 
     #[test]
+    fn runtime_supplied_source_simulation_does_not_change_live_block() {
+        let runtime = Runtime::new(RuntimeConfig::new(vec![block(
+            "draft",
+            "function handle(event) return { outputs = { light = false } } end",
+            true,
+        )]));
+        let before = runtime.snapshot();
+        let execution = runtime
+            .simulate_input_with_source(
+                &id("draft"),
+                "function handle(event) return { outputs = { light = true } } end",
+                SimulationScenario {
+                    trigger: SimulationTrigger {
+                        endpoint: endpoint_name("input"),
+                        value: TypedValue::bool(true),
+                        previous: None,
+                    },
+                    inputs: vec![SimulationInput {
+                        endpoint: endpoint_name("input"),
+                        value: Some(TypedValue::bool(true)),
+                        valid: true,
+                        age_ms: Some(0),
+                    }],
+                },
+                TransientState::new(),
+                Vec::new(),
+                MonotonicMs(4),
+            )
+            .unwrap();
+        assert!(execution.execution.outcome.is_ok());
+        assert_eq!(runtime.snapshot(), before);
+    }
+
+    #[test]
     fn equal_runtime_timestamps_are_valid_but_lower_timestamps_are_rejected() {
         let mut runtime = Runtime::new(RuntimeConfig::new(vec![
             block("alpha", "function handle() end", true),

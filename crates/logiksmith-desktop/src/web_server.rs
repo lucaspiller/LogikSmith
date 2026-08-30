@@ -1,10 +1,11 @@
 // Internal HTTP/SSE dashboard API and static asset server.
 
 use crate::{
-    ActivationRequest, AutomationBlockStatus, AutomationDocument, AutomationEnvelope, FieldError,
-    SimulationOutcome, SimulationPayload, SimulationRequest, WebConfig, build_automation,
-    diagnostics::{DiagnosticStore, DiagnosticUpdate, Replay, Snapshot},
-    load_automation, serialize_automation,
+    ActivationRequest, AutomationBlock, AutomationBlockStatus, AutomationDocument,
+    AutomationEnvelope, FieldError, SimulationOutcome, SimulationPayload, SimulationRequest,
+    WebConfig, build_automation,
+    diagnostics::{BlockSnapshot, DiagnosticStore, DiagnosticUpdate, Replay, Snapshot},
+    load_automation, serialize_automation, structural_revision,
     external::{self, ExternalInputMessage},
     AutomationRuntime, WebhookInputRuntime,
 };
@@ -17,7 +18,7 @@ use axum::{
         IntoResponse, Json, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use futures_util::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
@@ -244,6 +245,22 @@ async fn start_web_server_with_assets_and_activation(
         .route("/api/snapshot", get(snapshot))
         .route("/api/automation", get(get_automation).put(put_automation))
         .route("/api/simulate", post(simulate))
+        .route(
+            "/api/blocks/{block_id}/validate",
+            post(validate_block).layer(DefaultBodyLimit::max(crate::MAX_HTTP_BODY_BYTES)),
+        )
+        .route(
+            "/api/blocks/{block_id}/simulate",
+            post(simulate_block).layer(DefaultBodyLimit::max(crate::MAX_HTTP_BODY_BYTES)),
+        )
+        .route(
+            "/api/blocks/{block_id}/source",
+            put(activate_block_source).layer(DefaultBodyLimit::max(crate::MAX_HTTP_BODY_BYTES)),
+        )
+        .route(
+            "/api/blocks/{block_id}/enabled",
+            put(set_block_enabled).layer(DefaultBodyLimit::max(crate::MAX_HTTP_BODY_BYTES)),
+        )
         .route("/api/schedules/preview", post(preview_schedule))
         .route("/api/schedules/simulate", post(simulate_schedule))
         .route(

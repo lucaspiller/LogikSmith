@@ -79,13 +79,13 @@ pub const MAX_SIGNALS: usize = 256;
 pub const MAX_SIGNAL_BINDINGS: usize = 256;
 
 #[cfg(test)]
-mod milestone7_simulation_tests {
+mod simulation_contract_tests {
     use super::*;
     include!("simulation_tests.rs");
 }
 
 #[cfg(test)]
-mod milestone8_config_tests {
+mod configuration_validation_tests {
     use super::*;
     use crate::configuration::{RawConfig, parse_duration_seconds, schedule_rule};
     use std::{fs, path::Path};

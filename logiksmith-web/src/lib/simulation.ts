@@ -181,7 +181,7 @@ export function toSimulationScenario(draft: SimulationDraft, expectedLogicRevisi
   const inputs: SimulationInputRequest[] = prepared.inputs.map((input) => ({ endpoint: input.endpoint, value: input.valid ? typedValueForDpt(input.dpt, input.value) : null, valid: input.valid, ageMs: input.valid ? input.ageMs : null }));
   if (prepared.triggerType === 'timer') {
     if (prepared.timerFiredAtMs === null) return null;
-    return { blockId: prepared.blockId, expectedLogicRevision, trigger: { type: 'timer', name: prepared.triggerTimerName, firedAtMs: prepared.timerFiredAtMs }, inputs, state: { ...prepared.state }, pendingTimers: prepared.pendingTimers.map((timer) => ({ ...timer })) };
+    return { blockId: prepared.blockId, expectedLogicRevision, expectedStructuralRevision, trigger: { type: 'timer', name: prepared.triggerTimerName, firedAtMs: prepared.timerFiredAtMs }, inputs, state: { ...prepared.state }, pendingTimers: prepared.pendingTimers.map((timer) => ({ ...timer })) };
   }
   if (prepared.triggerType === 'schedule') {
     if (prepared.scheduleOccurrenceAtMs === null) return null;
@@ -193,6 +193,7 @@ export function toSimulationScenario(draft: SimulationDraft, expectedLogicRevisi
   return {
     blockId: prepared.blockId,
     expectedLogicRevision,
+    expectedStructuralRevision,
     trigger: { type: 'input', endpoint: prepared.triggerEndpoint, value: triggerValue, previous: typedValueForDpt(trigger.dpt, prepared.previousValue) },
     inputs,
     state: { ...prepared.state },

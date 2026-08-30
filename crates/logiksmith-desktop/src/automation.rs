@@ -33,7 +33,18 @@ pub struct CoreActivationResult {
 pub struct SimulationPayload {
     #[serde(alias = "blockId")]
     pub block_id: String,
-    #[serde(alias = "expectedLogicRevision")]
+    /// Optional draft source. The legacy `/api/simulate` route leaves this
+    /// absent and evaluates the active source; block-scoped M12 simulation
+    /// always supplies it.
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default, alias = "sourceFingerprint")]
+    pub source_fingerprint: Option<String>,
+    #[serde(
+        alias = "expectedRevision",
+        alias = "expected_revision",
+        alias = "expectedLogicRevision"
+    )]
     #[serde(deserialize_with = "wire_revision::deserialize")]
     pub expected_logic_revision: u64,
     #[serde(default, alias = "expectedStructuralRevision")]
@@ -122,6 +133,10 @@ pub enum SimulationOutcome {
     ScheduleNotFound,
     Conflict {
         current_revision: u64,
+    },
+    BlockConflict {
+        current_revision: u64,
+        current_structural_revision: u64,
     },
     /// Dedicated schedule simulation requests expose both revision tokens so
     /// callers can refresh the right part of their request after a conflict.
@@ -526,6 +541,17 @@ pub fn block_revision(document: &AutomationDocument, id: &str) -> u64 {
         .find(|block| block.id == id)
         .map(|block| block.revision.max(1))
         .unwrap_or(1)
+}
+
+/// Browser correlation fingerprint. It deliberately matches the tiny
+/// browser-side FNV-1a implementation and is not a security or CAS token.
+pub fn source_fingerprint(source: &str) -> String {
+    let mut hash = 2_166_136_261_u32;
+    for byte in source.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    format!("fnv1a-{hash:08x}")
 }
 
 #[derive(Debug, Clone, Serialize)]

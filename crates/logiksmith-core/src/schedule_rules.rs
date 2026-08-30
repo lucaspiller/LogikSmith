@@ -7,7 +7,7 @@ use jiff::{Span, Timestamp, Zoned};
 use mlua::{AnyUserData, IntoLua, UserData, UserDataFields, UserDataMethods, Value as LuaValue};
 
 use crate::noaa;
-use crate::{BlockId, EndpointNameError, LogicRevision, MonotonicMs, SimulationError};
+use crate::{BlockId, EndpointNameError, LogicError, LogicRevision, MonotonicMs, SimulationError};
 
 /// A UTC-unix-millisecond instant (milliseconds since the Unix epoch).
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -637,6 +637,7 @@ pub enum ScheduleSimulationError {
     UnknownSchedule,
     NotOccurrence,
     StaleStructuralRevision,
+    InvalidSource(LogicError),
     InvalidInput(SimulationError),
 }
 
@@ -650,6 +651,7 @@ impl fmt::Display for ScheduleSimulationError {
             Self::StaleStructuralRevision => formatter.write_str(
                 "the requested revisions do not match the current schedule/logic revision",
             ),
+            Self::InvalidSource(error) => write!(formatter, "invalid simulation source: {error}"),
             Self::InvalidInput(error) => error.fmt(formatter),
         }
     }
@@ -658,6 +660,7 @@ impl fmt::Display for ScheduleSimulationError {
 impl Error for ScheduleSimulationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::InvalidSource(error) => Some(error),
             Self::InvalidInput(error) => Some(error),
             _ => None,
         }

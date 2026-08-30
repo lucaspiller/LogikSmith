@@ -156,6 +156,9 @@ pub fn simulation_response(
             .first()
             .map(|block| block.id.to_string())
             .unwrap_or_default(),
+        source_fingerprint: None,
+        block_revision: None,
+        structural_revision: None,
         logic_revision,
         duration_us,
         status,
@@ -218,6 +221,9 @@ pub fn simulation_response_for_block(
     };
     SimulationResponse {
         block_id: tagged.block_id.to_string(),
+        source_fingerprint: None,
+        block_revision: None,
+        structural_revision: None,
         logic_revision,
         duration_us,
         status,

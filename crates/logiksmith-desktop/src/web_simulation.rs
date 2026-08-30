@@ -16,6 +16,15 @@ struct ScheduleSimulationConflictResponse {
     current_structural_revision: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct BlockSimulationConflictResponse {
+    error: String,
+    #[serde(serialize_with = "crate::wire_revision::serialize")]
+    current_revision: u64,
+    #[serde(serialize_with = "crate::wire_revision::serialize")]
+    current_structural_revision: u64,
+}
+
 /// Schedule previews have a dedicated request so the browser does not need
 /// to fabricate input values, pending timers, or an internal Lua source hash.
 #[derive(Debug, Deserialize)]
@@ -57,6 +66,8 @@ fn schedule_payload(
 ) -> SimulationPayload {
     SimulationPayload {
         block_id,
+        source: None,
+        source_fingerprint: None,
         expected_logic_revision: expected_revision,
         expected_structural_revision,
         preview_after_utc_ms,
@@ -243,6 +254,19 @@ async fn simulate_payload(state: AppState, payload: SimulationPayload) -> Respon
             StatusCode::CONFLICT,
             Json(ScheduleSimulationConflictResponse {
                 error: "active schedule or block revision changed; refresh and run the schedule simulation again"
+                    .to_owned(),
+                current_revision,
+                current_structural_revision,
+            }),
+        )
+            .into_response(),
+        SimulationOutcome::BlockConflict {
+            current_revision,
+            current_structural_revision,
+        } => (
+            StatusCode::CONFLICT,
+            Json(BlockSimulationConflictResponse {
+                error: "active block or structural revision changed; refresh and run the draft simulation again"
                     .to_owned(),
                 current_revision,
                 current_structural_revision,

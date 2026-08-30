@@ -48,15 +48,19 @@ test.describe('dashboard golden paths', () => {
     await expect(page.getByRole('article', { name: 'Signal house_occupied detail' })).toContainText('occupancy_source.occupied');
     await expect(page.getByRole('article', { name: 'Signal house_occupied detail' })).toContainText('lighting_policy.occupied');
 
-    await page.getByRole('button', { name: /lighting_policy/ }).click();
-    await expect(page.getByText('signal', { exact: true }).first()).toBeVisible();
+    await page.getByRole('region', { name: 'Logic blocks' }).getByRole('button', { name: /lighting_policy/ }).click();
+    await page.getByRole('tab', { name: 'Inspect' }).click();
+    await expect(page.locator('.inspect-view td').filter({ hasText: 'SIGNAL' }).first()).toBeVisible();
     await page.locator('.execution-history tbody tr').first().click();
-    await expect(page.getByRole('article', { name: /Signal execution details for 102/ })).toContainText('101');
-    await expect(page.getByRole('article', { name: /Signal execution details for 102/ })).toContainText('lighting_allowed');
+    const execution = page.locator('article.execution-detail');
+    await expect(execution).toContainText('Execution 102');
+    await expect(execution).toContainText('occupancy_source / 101');
+    await expect(execution).toContainText('lighting_allowed');
   });
 
   test('shows producer simulation signal effects as eligible-only proposals', async ({ page }) => {
-    await page.getByRole('button', { name: /occupancy_source/ }).click();
+    await page.getByRole('region', { name: 'Logic blocks' }).getByRole('button', { name: /occupancy_source/ }).click();
+    await page.getByRole('tab', { name: 'Test' }).click();
     await page.getByRole('radio', { name: 'input' }).check();
     await page.getByLabel('Simulation current trigger value').selectOption('true');
     await page.getByRole('button', { name: 'Run simulation' }).click();
@@ -65,7 +69,7 @@ test.describe('dashboard golden paths', () => {
     await expect(capture).toContainText('Proposed signal effects');
     await expect(capture).toContainText('house_occupied');
     await expect(capture).toContainText('Eligible consumers (not executed)');
-    await expect(capture).toContainText('does not propagate or execute them');
+    await expect(capture).toContainText('This draft does not propagate or execute them');
   });
 
   test('renders HTTP poll and webhook health, values, and consumers', async ({ page }) => {
@@ -91,16 +95,50 @@ test.describe('dashboard golden paths', () => {
 
   test('shows external bindings on the selected block', async ({ page }) => {
     await page.getByRole('button', { name: /scheduled_light_test/ }).click();
+    await page.getByRole('tab', { name: 'Inspect' }).click();
     const block = page.getByRole('region', { name: 'Selected block' });
     await expect(block).toContainText('today_temperature_max');
-    await expect(block).toContainText('HTTP');
+    await expect(block).toContainText('http');
     await expect(block).toContainText('external_override');
     await expect(block).toContainText('webhook');
     await expect(block).toContainText('21.75');
   });
 
+  test('toggles the Lua editor between standard and Vim modes', async ({ page }) => {
+    const editor = page.getByRole('region', { name: 'Selected block' }).getByRole('region', { name: 'Author view' });
+    const enableVim = editor.getByRole('button', { name: 'Enable Vim mode' });
+    await expect(enableVim).toBeVisible();
+    await expect(enableVim).toHaveAttribute('aria-pressed', 'false');
+
+    await enableVim.click();
+    const useStandard = editor.getByRole('button', { name: 'Use standard mode' });
+    await expect(useStandard).toHaveAttribute('aria-pressed', 'true');
+    await expect(editor.getByText('Editing mode: Vim')).toBeVisible();
+    await expect(editor.locator('.cm-scroller')).toHaveClass(/cm-vimMode/);
+
+    await editor.locator('.cm-content .cm-line').first().click({ position: { x: 1, y: 1 } });
+    await page.keyboard.press('i');
+    await page.keyboard.insertText('XY');
+    await expect(editor.locator('.cm-content')).toHaveText(/^XYfunction/);
+    await page.keyboard.press('Escape');
+
+    await useStandard.click();
+    await expect(editor.getByRole('button', { name: 'Enable Vim mode' })).toHaveAttribute('aria-pressed', 'false');
+    await expect(editor.getByText('Editing mode: Standard')).toBeVisible();
+    await expect(editor.locator('.cm-scroller')).not.toHaveClass(/cm-vimMode/);
+  });
+
+  test('keeps typed Lua edits in place while the draft state updates', async ({ page }) => {
+    const editor = page.getByRole('region', { name: 'Selected block' }).getByRole('region', { name: 'Author view' });
+    const content = editor.locator('.cm-content');
+    await content.locator('.cm-line').first().click({ position: { x: 1, y: 1 } });
+    await page.keyboard.insertText('XY');
+    await expect(content).toHaveText(/^XYfunction/);
+  });
+
   test('shows HTTP provenance for an external execution', async ({ page }) => {
     await page.getByRole('button', { name: /scheduled_light_test/ }).click();
+    await page.getByRole('tab', { name: 'Inspect' }).click();
     const row = page.locator('.execution-history tbody tr').filter({ hasText: 'input:today_temperature_max' });
     await expect(row).toHaveCount(1);
     await row.click();

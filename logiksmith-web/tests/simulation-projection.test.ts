@@ -35,7 +35,7 @@ function snapshot() {
   };
 }
 
-describe('Milestone 7 browser contract', () => {
+describe('Simulation projection contract', () => {
   it('decodes tagged state, pending timer projection, and timer execution facts', () => {
     const mapped = decodeSnapshot(snapshot(), 0);
     expect(mapped.state).toEqual(state);

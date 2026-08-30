@@ -12,6 +12,7 @@ LogikSmith is a lightweight KNX automation engine with a portable Rust core. It 
 - The lead agent owns architecture, integration, and the complete KNX event-to-actuator path.
 - Subagents may handle isolated tests, research, review, or leaf components when their interface and owner are explicit.
 - Automated tests must never access the physical KNX installation. Hardware verification is a deliberate manual acceptance step.
+- Name tests after the behavior they verify, never after milestone numbers. Vitest is appropriate for focused coverage, but the behavior it covers must also be exercised through an end-to-end test.
 - Use `mise`, `./scripts/bootstrap.sh`, and `./scripts/run-dev.sh` for the desktop POC. Keep `config/local.toml` ignored.
 - Before a manual KNX run, confirm the output is a harmless visible actuator, the input and output addresses differ, and the gateway uses plain KNXnet/IP tunnelling.
 - A successful manual POC run shows `KNX connected`, then an input `true`, an immediate output `true`, and an output `false` after the configured delay. Test retriggering and shutdown deliberately.

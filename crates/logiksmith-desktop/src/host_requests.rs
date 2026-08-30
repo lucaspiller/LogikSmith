@@ -1,4 +1,4 @@
-fn apply_activation(
+pub(crate) fn apply_activation(
     runtime: &mut CoreRuntime,
     store: &DiagnosticStore,
     config: &RuntimeConfig,
@@ -62,22 +62,25 @@ pub(crate) fn apply_simulation(
         let _ = reply.send(SimulationOutcome::NotFound);
         return;
     };
-    let Some(core_block) = runtime.block(&block_id) else {
-        let _ = reply.send(SimulationOutcome::NotFound);
-        return;
-    };
-    // The browser sends the persisted per-block revision. The core uses a
-    // separate source-derived hash for timer ownership and stale execution
-    // checks; never compare or expose that hash as the public revision.
+    // Public block revisions are persisted counters. Core source hashes are
+    // intentionally used only inside the runtime for timer ownership.
     let active_document_revision = store
         .active_block_revision(&payload.block_id)
         .unwrap_or(block.revision);
-    let active_core_revision = core_block.active_logic_revision();
-    let outcome = if payload.expected_logic_revision != active_document_revision {
+    let active_structural_revision = config.automation.structural_revision;
+    let conflict = payload.expected_logic_revision != active_document_revision
+        || (payload.source.is_some()
+            && payload.expected_structural_revision != Some(active_structural_revision));
+    let outcome = if conflict {
         if payload.trigger.schedule.is_some() {
             SimulationOutcome::ScheduleConflict {
                 current_revision: active_document_revision,
-                current_structural_revision: config.automation.structural_revision,
+                current_structural_revision: active_structural_revision,
+            }
+        } else if payload.source.is_some() {
+            SimulationOutcome::BlockConflict {
+                current_revision: active_document_revision,
+                current_structural_revision: active_structural_revision,
             }
         } else {
             SimulationOutcome::Conflict {
@@ -85,31 +88,74 @@ pub(crate) fn apply_simulation(
             }
         }
     } else {
+        // Supplied-source methods clone only the block engine. The live
+        // runtime remains the sole owner of observations, state, timers,
+        // signal values, and history.
+        let Some(core_block) = runtime.block(&block_id) else {
+            let _ = reply.send(SimulationOutcome::NotFound);
+            return;
+        };
+        let draft_source = payload.source.as_deref();
+        let active_core_revision = match draft_source {
+            Some(source) => match CoreRuntime::validate_source(source) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    let _ = reply.send(SimulationOutcome::Invalid(vec![FieldError {
+                        path: "source".to_owned(),
+                        message: error.to_string(),
+                    }]));
+                    return;
+                }
+            },
+            None => core_block.active_logic_revision(),
+        };
+        // Keep omitted scenario fields grounded in the live immutable
+        // snapshot, including when a supplied source is being tested.
+        let live_snapshot = runtime
+            .block(&block_id)
+            .map(|block| block.snapshot_at(store.now()))
+            .expect("validated block exists in live runtime");
         let started = Instant::now();
-        let snapshot = core_block.snapshot_at(store.now());
         if payload.trigger.trigger_type.as_deref() == Some("timer") {
             match simulation_timer_scenario(
                 &payload,
                 block,
                 active_document_revision,
                 active_core_revision,
-                Some(&snapshot.state),
+                Some(&live_snapshot.state),
             ) {
                 Err(errors) => SimulationOutcome::Invalid(errors),
-                Ok(scenario) => match runtime.simulate_timer(&block_id, scenario) {
+                Ok(scenario) => {
+                    let result = match draft_source {
+                        Some(source) => runtime.simulate_timer_with_source(
+                            &block_id,
+                            source.to_owned(),
+                            scenario,
+                        ),
+                        None => runtime.simulate_timer(&block_id, scenario),
+                    };
+                    match result {
                     Ok(execution) => {
-                        SimulationOutcome::Complete(diagnostics::simulation_response_for_block(
+                        let mut response = diagnostics::simulation_response_for_block(
                             &execution,
                             u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
                             active_document_revision,
                             &config.automation,
-                        ))
+                        );
+                        annotate_draft_response(
+                            &mut response,
+                            &payload,
+                            active_document_revision,
+                            active_structural_revision,
+                        );
+                        SimulationOutcome::Complete(response)
                     }
                     Err(RuntimeSimulationError::Block { error, .. }) => {
                         SimulationOutcome::Invalid(simulation_error_fields(&error, &payload))
                     }
                     Err(RuntimeSimulationError::UnknownBlock(_)) => SimulationOutcome::NotFound,
-                },
+                    }
+                }
             }
         } else if payload.trigger.schedule.is_some() {
             schedule_simulation_outcome(
@@ -120,35 +166,55 @@ pub(crate) fn apply_simulation(
                 &block_id,
                 active_document_revision,
                 active_core_revision,
+                draft_source,
             )
         } else {
             match simulation_scenario(payload.clone(), block) {
                 Err(errors) => SimulationOutcome::Invalid(errors),
-                Ok(scenario) => match simulation_state(&payload, Some(&snapshot.state)) {
+                Ok(scenario) => match simulation_state(&payload, Some(&live_snapshot.state)) {
                     Err(errors) => SimulationOutcome::Invalid(errors),
                     Ok(state) => match simulation_pending_timers(
                         &payload,
-                        Some(&snapshot.pending_timers),
+                        Some(&live_snapshot.pending_timers),
                         active_document_revision,
                         active_core_revision,
                     ) {
                         Err(errors) => SimulationOutcome::Invalid(errors),
-                        Ok(pending_timers) => match runtime.simulate_input_with_state(
-                            &block_id,
-                            scenario,
-                            state,
-                            pending_timers,
-                            store.now(),
-                        ) {
-                            Ok(execution) => SimulationOutcome::Complete(
-                                diagnostics::simulation_response_for_block(
+                        Ok(pending_timers) => {
+                            let result = match draft_source {
+                                Some(source) => runtime.simulate_input_with_source(
+                                &block_id,
+                                source.to_owned(),
+                                scenario,
+                                state,
+                                pending_timers,
+                                store.now(),
+                                ),
+                                None => runtime.simulate_input_with_state(
+                                &block_id,
+                                scenario,
+                                state,
+                                pending_timers,
+                                store.now(),
+                                ),
+                            };
+                            match result {
+                            Ok(execution) => {
+                                let mut response = diagnostics::simulation_response_for_block(
                                     &execution,
                                     u64::try_from(started.elapsed().as_micros())
                                         .unwrap_or(u64::MAX),
                                     active_document_revision,
                                     &config.automation,
-                                ),
-                            ),
+                                );
+                                annotate_draft_response(
+                                    &mut response,
+                                    &payload,
+                                    active_document_revision,
+                                    active_structural_revision,
+                                );
+                                SimulationOutcome::Complete(response)
+                            }
                             Err(RuntimeSimulationError::Block { error, .. }) => {
                                 SimulationOutcome::Invalid(simulation_error_fields(
                                     &error, &payload,
@@ -157,7 +223,8 @@ pub(crate) fn apply_simulation(
                             Err(RuntimeSimulationError::UnknownBlock(_)) => {
                                 SimulationOutcome::NotFound
                             }
-                        },
+                            }
+                        }
                     },
                 },
             }
@@ -178,6 +245,7 @@ fn schedule_simulation_outcome(
     block_id: &BlockId,
     active_document_revision: u64,
     active_core_revision: u64,
+    source: Option<&str>,
 ) -> SimulationOutcome {
     let Some(name) = payload.trigger.schedule.as_deref() else {
         return SimulationOutcome::Invalid(vec![FieldError {
@@ -260,13 +328,26 @@ fn schedule_simulation_outcome(
         schedule,
         occurrence_at_utc_ms: occurrence_at_ms,
     };
-    match runtime.simulate_schedule(request) {
-        Ok(execution) => SimulationOutcome::Complete(diagnostics::simulation_response_for_block(
-            &execution,
-            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-            active_document_revision,
-            &config.automation,
-        )),
+    let result = match source {
+        Some(source) => runtime.simulate_schedule_with_source(request, source),
+        None => runtime.simulate_schedule(request),
+    };
+    match result {
+        Ok(execution) => {
+            let mut response = diagnostics::simulation_response_for_block(
+                &execution,
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                active_document_revision,
+                &config.automation,
+            );
+            annotate_draft_response(
+                &mut response,
+                payload,
+                active_document_revision,
+                active_structural_revision,
+            );
+            SimulationOutcome::Complete(response)
+        }
         Err(ScheduleSimulationError::StaleStructuralRevision) => {
             SimulationOutcome::ScheduleConflict {
                 current_revision: active_document_revision,
@@ -283,5 +364,25 @@ fn schedule_simulation_outcome(
         Err(ScheduleSimulationError::InvalidInput(error)) => {
             SimulationOutcome::Invalid(simulation_error_fields(&error, payload))
         }
+        Err(ScheduleSimulationError::InvalidSource(error)) => {
+            SimulationOutcome::Invalid(vec![FieldError {
+                path: "source".to_owned(),
+                message: error.to_string(),
+            }])
+        }
     }
+}
+
+fn annotate_draft_response(
+    response: &mut diagnostics::SimulationResponse,
+    payload: &SimulationPayload,
+    block_revision: u64,
+    structural_revision: u64,
+) {
+    response.source_fingerprint = payload
+        .source
+        .as_deref()
+        .map(crate::source_fingerprint);
+    response.block_revision = Some(block_revision);
+    response.structural_revision = Some(structural_revision);
 }

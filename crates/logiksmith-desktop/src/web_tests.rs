@@ -264,6 +264,80 @@
     }
 
     #[tokio::test]
+    async fn block_validation_route_reports_fingerprint_and_revision_shape() {
+        let root = std::env::temp_dir().join(format!(
+            "logiksmith-block-validation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("index.html"), "dashboard").unwrap();
+        let store = store();
+        let structural_revision = store.snapshot().logic.active_structural_revision;
+        let server = start_web_server_with_assets(
+            store,
+            WebConfig {
+                listen_ip: "127.0.0.1".parse().unwrap(),
+                listen_port: 0,
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+        let source = "function handle(event, input) return nil end";
+        let (status, result) = raw_post_path(
+            server.address,
+            "/api/blocks/test/validate",
+            serde_json::json!({
+                "source": source,
+                "source_fingerprint": crate::source_fingerprint(source),
+                "expected_revision": "1",
+                "expected_structural_revision": structural_revision.to_string()
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(result["status"], "valid");
+        assert_eq!(result["block_revision"], "1");
+        assert_eq!(result["structural_revision"], structural_revision.to_string());
+        assert_eq!(result["source_fingerprint"], crate::source_fingerprint(source));
+
+        let (status, result) = raw_post_path(
+            server.address,
+            "/api/blocks/test/validate",
+            serde_json::json!({
+                "source": "function handle(",
+                "expected_revision": "1",
+                "expected_structural_revision": structural_revision.to_string()
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(result["status"], "invalid");
+        assert!(result["errors"].as_array().is_some_and(|errors| !errors.is_empty()));
+
+        let (status, result) = raw_post_path(
+            server.address,
+            "/api/blocks/test/validate",
+            serde_json::json!({
+                "source": source,
+                "expected_revision": "0",
+                "expected_structural_revision": structural_revision.to_string()
+            }),
+        )
+        .await;
+        assert_eq!(status, 409);
+        assert_eq!(result["current_revision"], "1");
+        assert_eq!(result["current_structural_revision"], structural_revision.to_string());
+
+        server.shutdown().await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn events_replay_and_resync_when_journal_is_too_old() {
         let root =
             std::env::temp_dir().join(format!("logiksmith-sse-assets-{}", std::process::id()));

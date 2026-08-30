@@ -30,7 +30,7 @@ function snapshot(blocks: Array<Record<string, unknown>> = [block('staircase', 3
   return { revision: 4, captured_at_ms: 1_000, connection: { state: 'connected' }, blocks, telegrams: [], logs: [], active_structural_revision: 8, saved_structural_revision: 8, restart_required: false };
 }
 
-describe('Milestone 8 block dashboard contract', () => {
+describe('Block dashboard contract', () => {
   it('decodes ordered block documents and rejects duplicate IDs or a malformed nested block', () => {
     const document = decodeAutomationDocument({ blocks: [{ id: 'staircase', enabled: true, source: 'return nil', inputs: [{ name: 'button', dpt: '1.001' }], outputs: [], knx_bindings: [{ endpoint: 'button', group_address: '1/2/3' }] }] });
     expect(document.blocks?.map((item) => item.id)).toEqual(['staircase']);

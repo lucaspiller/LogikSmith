@@ -68,7 +68,7 @@ function snapshot(overrides: Record<string, unknown> = {}) {
   };
 }
 
-describe('Milestone 11 external input diagnostics', () => {
+describe('External input diagnostics', () => {
   it('decodes source health, extracted values, consumers, and external endpoint bindings', () => {
     const decoded = decodeSnapshot(snapshot(), 10_500);
     expect(decoded.externalInputs.httpPolls[0]).toMatchObject({ name: 'berlin_today_forecast', url: 'https://api.open-meteo.com/v1/forecast', status: 'healthy', intervalMs: 21_600_000, nextAttemptAtMs: 1_756_521_600_000, staleAtMs: 43_200_000 });

@@ -36,7 +36,7 @@ pub const MAX_LOGIC_MEMORY_BYTES: usize = 1024 * 1024;
 const INSTRUCTION_LIMIT_MARKER: &str = "logiksmith instruction limit exceeded";
 
 #[cfg(test)]
-mod milestone7_tests {
+mod legacy_behavior_tests {
     use super::*;
     include!("legacy_tests.rs");
 }
@@ -60,6 +60,6 @@ mod signal_tests {
 }
 
 #[cfg(test)]
-mod milestone11_tests {
-    include!("milestone11_tests.rs");
+mod temperature_input_tests {
+    include!("temperature_input_tests.rs");
 }

@@ -111,6 +111,79 @@ use std::collections::BTreeMap;
     }
 
     #[test]
+    fn supplied_source_simulation_is_effect_free_and_validates_the_draft() {
+        let engine = Engine::new(config());
+        let before = engine.snapshot();
+        let draft = "function handle(event, input)\n  return { outputs = { test_light = false } }\nend";
+        let execution = engine
+            .simulate_input_with_source(
+                draft,
+                simulation_scenario(
+                    true,
+                    Some(false),
+                    vec![
+                        simulation_input(
+                            "wall_switch",
+                            Some(TypedValue::bool(true)),
+                            true,
+                            Some(0),
+                        ),
+                        simulation_input(
+                            "dimmer_level",
+                            Some(TypedValue::percent(42).unwrap()),
+                            true,
+                            Some(3),
+                        ),
+                        simulation_input("unused_input", None, false, None),
+                    ],
+                ),
+                TransientState::new(),
+                Vec::new(),
+                MonotonicMs(10),
+            )
+            .unwrap();
+        assert_eq!(
+            effects(&execution),
+            &vec![OutputEffect {
+                endpoint: name("test_light"),
+                value: TypedValue::bool(false),
+            }]
+        );
+        assert_eq!(engine.snapshot(), before);
+
+        let invalid = engine.simulate_input_with_source(
+            "function handle(",
+            simulation_scenario(
+                true,
+                Some(false),
+                vec![
+                    simulation_input(
+                        "wall_switch",
+                        Some(TypedValue::bool(true)),
+                        true,
+                        Some(0),
+                    ),
+                    simulation_input(
+                        "dimmer_level",
+                        Some(TypedValue::percent(42).unwrap()),
+                        true,
+                        Some(3),
+                    ),
+                    simulation_input("unused_input", None, false, None),
+                ],
+            ),
+            TransientState::new(),
+            Vec::new(),
+            MonotonicMs(10),
+        );
+        assert!(matches!(
+            invalid,
+            Err(SimulationError::InvalidSource(LogicError::Syntax { .. }))
+        ));
+        assert_eq!(engine.snapshot(), before);
+    }
+
+    #[test]
     fn observations_update_snapshot_without_execution() {
         let mut engine = Engine::new(config());
         engine

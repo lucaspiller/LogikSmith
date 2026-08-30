@@ -493,6 +493,7 @@ pub(crate) fn simulation_error_fields(
             .unwrap_or_else(|| "inputs".to_owned())
     };
     let path = match error {
+        SimulationError::InvalidSource(_) => "source".to_owned(),
         SimulationError::UnknownEndpoint(endpoint)
         | SimulationError::EndpointNotInput { endpoint, .. } => endpoint_path(endpoint),
         SimulationError::DuplicateInput(endpoint) | SimulationError::MissingInput(endpoint) => {

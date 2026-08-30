@@ -314,6 +314,10 @@ pub struct TimerSimulationScenario {
 /// [`Execution::outcome`], just as they are for live input events.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SimulationError {
+    /// The supplied draft source failed the same restricted load checks used
+    /// by live activation. It is kept separate from scenario validation so a
+    /// host can project a source diagnostic without changing live state.
+    InvalidSource(LogicError),
     UnknownEndpoint(EndpointName),
     EndpointNotInput {
         endpoint: EndpointName,
@@ -357,6 +361,7 @@ pub enum SimulationError {
 impl fmt::Display for SimulationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidSource(error) => write!(formatter, "invalid simulation source: {error}"),
             Self::UnknownEndpoint(endpoint) => {
                 write!(formatter, "unknown input endpoint {endpoint}")
             }

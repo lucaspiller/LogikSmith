@@ -94,7 +94,7 @@ function scheduleExecution(trigger: Record<string, unknown>, overrides: Record<s
   };
 }
 
-describe('Milestone 9 site time', () => {
+describe('Site time projection', () => {
   it('decodes the site-time card with zone, local time, offset, coordinates, solar events, and health', () => {
     const decoded = decodeSnapshot(snapshot([block('staircase')], {
       timezone: 'Europe/Vilnius',
@@ -145,7 +145,7 @@ describe('Milestone 9 site time', () => {
   });
 });
 
-describe('Milestone 9 per-block schedules', () => {
+describe('Per-block schedules', () => {
   it('decodes the schedule list with status, rule summary, occurrences, and outcome', () => {
     const decoded = decodeSnapshot(snapshot([block('staircase', [schedule('morning_on'), schedule('heartbeat', {
       name: 'heartbeat',
@@ -206,7 +206,7 @@ describe('Milestone 9 per-block schedules', () => {
   });
 });
 
-describe('Milestone 9 schedule countdown', () => {
+describe('Schedule countdown', () => {
   it('counts down from the captured server sample and freezes when the stream goes stale', () => {
     const mapped = decodeSnapshot(snapshot([block('staircase', [schedule('morning_on', { relative_ms: 4_800 })])], { timezone: 'Europe/Vilnius', astronomy: 'unavailable', clock_ok: true, scheduler_ok: true }), 1_000);
     let dashboard = reduceDashboardState(initialDashboardState, { type: 'snapshot_loaded', snapshot: mapped, nowMs: 1_000 });
@@ -226,7 +226,7 @@ describe('Milestone 9 schedule countdown', () => {
   });
 });
 
-describe('Milestone 9 schedule execution detail', () => {
+describe('Schedule execution detail', () => {
   it('decodes a schedule trigger with lateness, queue delay, coalescing, and the full captured ctx', () => {
     const decoded = decodeSnapshot(snapshot([block('staircase', [], scheduleExecution(scheduleTrigger))]), 1_000);
     const execution = decoded.blocks[0].executions[0];
@@ -253,7 +253,7 @@ describe('Milestone 9 schedule execution detail', () => {
   });
 });
 
-describe('Milestone 9 schedule simulation', () => {
+describe('Schedule simulation', () => {
   function simulationResponse(overrides: Record<string, unknown> = {}) {
     return { logic_revision: 12, duration_us: 24, status: 'succeeded', trigger: scheduleTrigger, inputs: [], state_before: {}, state_after: {}, effects: [], timer_effects: [], pending_timers: [], time_context: timeContext, error: null, ...overrides };
   }

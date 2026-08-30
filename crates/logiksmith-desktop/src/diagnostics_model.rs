@@ -641,6 +641,16 @@ pub struct LogicalTimerEffectRecord {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SimulationResponse {
     pub block_id: String,
+    /// Browser correlation key for the exact draft source evaluated. This is
+    /// not a revision and must never be used for CAS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "crate::wire_revision::serialize_option")]
+    pub block_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "crate::wire_revision::serialize_option")]
+    pub structural_revision: Option<u64>,
     #[serde(serialize_with = "crate::wire_revision::serialize")]
     pub logic_revision: u64,
     pub duration_us: u64,

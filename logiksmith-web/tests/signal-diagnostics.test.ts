@@ -12,7 +12,7 @@ function snapshot() {
   return { revision: 2, capturedAtMs: 1000, connection: { state: 'connected' }, activeStructuralRevision: '7', savedStructuralRevision: '7', restartRequired: false, signals: [signal('house_occupied', null, { consumers: [{ blockId: 'lighting_policy', endpoint: 'occupied' }] }), signal('lighting_allowed', typed(true), { producer: { blockId: 'lighting_policy', endpoint: 'allowed', executionId: 102 }, producingExecutionId: 102, recentChanges: [{ value: typed(true), observedAtMs: 1300, changedAtMs: 1300, executionId: 102 }] })], blocks: [block('occupancy_source', 'occupied', 'house_occupied', execution), block('lighting_policy', 'occupied', 'allowed', { ...execution, id: 102, causalProducerExecutionId: 101, signalEffects: [], transition: { state: {}, effects: [], signalEffects: [], timers: [] } })], telegrams: [], logs: [] };
 }
 
-describe('Milestone 10 internal signals', () => {
+describe('Internal signal diagnostics', () => {
   it('decodes unknown and known signals with producers, consumers, changes, and bindings', () => {
     const decoded = decodeSnapshot(snapshot());
     expect(decoded.signals[0]).toMatchObject({ name: 'house_occupied', value: null, status: 'unknown', observedAtMs: null, producer: null, consumers: [{ blockId: 'lighting_policy', endpoint: 'occupied' }] });

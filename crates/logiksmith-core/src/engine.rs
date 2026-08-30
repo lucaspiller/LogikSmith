@@ -116,6 +116,52 @@ impl Engine {
         Ok(program.revision)
     }
 
+    /// Simulates an input against a supplied source in a throwaway engine.
+    ///
+    /// The source is validated and installed only on a clone, so this method
+    /// cannot alter the active program, observations, state, or timers.
+    pub fn simulate_input_with_source(
+        &self,
+        source: impl Into<String>,
+        scenario: SimulationScenario,
+        state: TransientState,
+        pending_timers: Vec<PendingTimer>,
+        now: MonotonicMs,
+    ) -> Result<Execution, SimulationError> {
+        let mut candidate = self.clone();
+        candidate
+            .activate_source(source)
+            .map_err(SimulationError::InvalidSource)?;
+        candidate.simulate_input_with_state(scenario, state, pending_timers, now)
+    }
+
+    /// Simulates a timer against a supplied source in a throwaway engine.
+    pub fn simulate_timer_with_source(
+        &self,
+        source: impl Into<String>,
+        scenario: TimerSimulationScenario,
+    ) -> Result<Execution, SimulationError> {
+        let mut candidate = self.clone();
+        candidate
+            .activate_source(source)
+            .map_err(SimulationError::InvalidSource)?;
+        candidate.simulate_timer(scenario)
+    }
+
+    /// Simulates a schedule trigger against a supplied source in a throwaway
+    /// engine. The schedule trigger has already been validated by Runtime.
+    pub fn simulate_schedule_trigger_with_source(
+        &self,
+        source: impl Into<String>,
+        trigger: ScheduleTrigger,
+        site: &SiteTimeConfig,
+        utc_unix_ms: Option<i64>,
+    ) -> Result<Execution, LogicError> {
+        let mut candidate = self.clone();
+        candidate.activate_source(source)?;
+        Ok(candidate.simulate_schedule_trigger(trigger, site, utc_unix_ms))
+    }
+
     /// Validates and atomically activates a source for the next execution.
     pub fn replace_source(
         &mut self,
