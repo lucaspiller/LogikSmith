@@ -38,15 +38,18 @@ RUN groupadd --system --gid 10001 logiksmith \
     && useradd --system --uid 10001 --gid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin logiksmith \
     && mkdir -p /app/logiksmith-web/dist /config \
     && chown -R logiksmith:logiksmith /app /config
+
 WORKDIR /app
+
+COPY --chown=logiksmith:logiksmith bridges/xknx/ /app/bridges/xknx/
+RUN python -m pip install --no-cache-dir --requirement /app/bridges/xknx/requirements.txt \
+    && python -m pip install --no-cache-dir --no-deps /app/bridges/xknx/
 
 COPY --from=rust-build --chown=logiksmith:logiksmith /src/target/release/logiksmith-desktop /usr/local/bin/logiksmith
 COPY --from=rust-build --chown=logiksmith:logiksmith /src/logiksmith-web/dist/ /app/logiksmith-web/dist/
+
 COPY --chown=root:root docker/entrypoint.sh /usr/local/bin/logiksmith-entrypoint
-COPY --chown=logiksmith:logiksmith bridges/xknx/ /app/bridges/xknx/
-RUN python -m pip install --no-cache-dir --requirement /app/bridges/xknx/requirements.txt \
-    && python -m pip install --no-cache-dir --no-deps /app/bridges/xknx/ \
-    && chmod 0555 /usr/local/bin/logiksmith-entrypoint
+RUN chmod 0555 /usr/local/bin/logiksmith-entrypoint
 
 USER logiksmith:logiksmith
 VOLUME ["/config"]
