@@ -109,11 +109,7 @@ impl DiagnosticStore {
             logiksmith_core::RuntimeProfile::Desktop,
             logiksmith_core::Runtime::new(runtime.core_config.clone()).usage(),
         );
-        operations.block_health = blocks
-            .keys()
-            .cloned()
-            .map(|block_id| (block_id, BlockHealthSnapshot::default()))
-            .collect();
+        operations.block_health = initial_block_health(&blocks);
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 revision: 0,

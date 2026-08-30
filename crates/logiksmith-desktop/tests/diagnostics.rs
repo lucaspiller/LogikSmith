@@ -502,6 +502,10 @@ fn dashboard_json_exposes_ordered_blocks() {
     assert!(blocks[0].get("state").is_some());
     assert!(blocks[0].get("pending_timers").is_some());
     assert_eq!(value["operations"]["profile"], "desktop");
+    assert_eq!(
+        value["operations"]["block_health"]["test"]["status"],
+        "active"
+    );
     assert_eq!(value["operations"]["core"]["logic_blocks"]["used"], 1);
     assert_eq!(value["operations"]["core"]["logic_blocks"]["capacity"], 64);
 }

@@ -1,3 +1,24 @@
+fn initial_block_health(
+    blocks: &BTreeMap<String, BlockDiagnosticState>,
+) -> BTreeMap<String, BlockHealthSnapshot> {
+    blocks
+        .iter()
+        .map(|(block_id, block)| {
+            (
+                block_id.clone(),
+                BlockHealthSnapshot {
+                    status: if block.active_enabled {
+                        "active".to_owned()
+                    } else {
+                        "disabled".to_owned()
+                    },
+                    ..BlockHealthSnapshot::default()
+                },
+            )
+        })
+        .collect()
+}
+
 fn operations_snapshot(limits: crate::HostLimits) -> OperationsSnapshot {
     let queue = |capacity| QueueSnapshot {
         capacity,
