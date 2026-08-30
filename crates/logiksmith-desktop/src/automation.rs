@@ -1,8 +1,8 @@
 use crate::wire_revision;
 use crate::*;
 use logiksmith_core::{
-    BlockActivation as CoreBlockActivation, BlockSchedule as CoreBlockSchedule, Dpt, EndpointName,
-    EngineConfig, RuntimeConfig as CoreRuntimeConfig,
+    BlockActivation as CoreBlockActivation, BlockId, BlockSchedule as CoreBlockSchedule, Dpt,
+    EndpointName, EngineConfig, RuntimeConfig as CoreRuntimeConfig, SignalName,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt, io, path::PathBuf, str::FromStr};
@@ -237,9 +237,9 @@ pub struct AutomationRuntime {
     pub core_config: CoreRuntimeConfig,
     pub blocks: Vec<BlockRuntime>,
     pub address_to_inputs: HashMap<GroupAddress, Vec<BlockInputBinding>>,
-    pub output_to_address: HashMap<(String, EndpointName), GroupAddress>,
-    pub signal_to_inputs: HashMap<String, Vec<BlockSignalInputBinding>>,
-    pub output_to_signal: HashMap<(String, EndpointName), String>,
+    pub output_to_address: HashMap<(BlockId, EndpointName), GroupAddress>,
+    pub signal_to_inputs: HashMap<SignalName, Vec<BlockSignalInputBinding>>,
+    pub output_to_signal: HashMap<(BlockId, EndpointName), SignalName>,
     pub address_dpts: HashMap<GroupAddress, Dpt>,
     pub structural_revision: u64,
     pub document_revision: u64,
@@ -247,12 +247,12 @@ pub struct AutomationRuntime {
 
 #[derive(Debug, Clone)]
 pub struct BlockRuntime {
-    pub id: String,
+    pub id: BlockId,
     pub revision: u64,
     pub enabled: bool,
     pub engine_config: EngineConfig,
     pub endpoint_to_address: HashMap<EndpointName, GroupAddress>,
-    pub endpoint_to_signal: HashMap<EndpointName, String>,
+    pub endpoint_to_signal: HashMap<EndpointName, SignalName>,
     pub endpoint_dpts: HashMap<EndpointName, Dpt>,
     /// Validated schedule definitions owned by this block. The desktop keeps
     /// them beside the KNX maps for diagnostics and simulation routing; the
@@ -262,7 +262,7 @@ pub struct BlockRuntime {
 
 #[derive(Debug, Clone)]
 pub struct BlockInputBinding {
-    pub block_id: String,
+    pub block_id: BlockId,
     pub endpoint: EndpointName,
     pub dpt: Dpt,
     pub address: GroupAddress,
@@ -270,25 +270,25 @@ pub struct BlockInputBinding {
 
 #[derive(Debug, Clone)]
 pub struct SignalRuntime {
-    pub name: String,
+    pub name: SignalName,
     pub dpt: Dpt,
 }
 
 #[derive(Debug, Clone)]
 pub struct BlockSignalInputBinding {
-    pub block_id: String,
+    pub block_id: BlockId,
     pub endpoint: EndpointName,
     pub dpt: Dpt,
-    pub signal: String,
+    pub signal: SignalName,
 }
 
 impl AutomationRuntime {
-    pub fn block(&self, id: &str) -> Option<&BlockRuntime> {
-        self.blocks.iter().find(|block| block.id == id)
+    pub fn block(&self, id: &BlockId) -> Option<&BlockRuntime> {
+        self.blocks.iter().find(|block| block.id == *id)
     }
 
-    pub fn block_ids(&self) -> impl Iterator<Item = &str> {
-        self.blocks.iter().map(|block| block.id.as_str())
+    pub fn block_ids(&self) -> impl Iterator<Item = &BlockId> {
+        self.blocks.iter().map(|block| &block.id)
     }
 }
 

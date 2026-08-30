@@ -15,7 +15,7 @@ fn signal_effect_records(
         .map(|effect| LogicalSignalEffectRecord {
             endpoint: effect.producer.endpoint.to_string(),
             signal: effect.signal.to_string(),
-            dpt: DptMessage::from_core(effect.value.dpt),
+            dpt: DptMessage::from_core(effect.value.dpt()),
             value: ValueMessage::from_core(effect.value),
             changed: effect.changed,
             producer: Some(SignalProducerSnapshot {
@@ -43,7 +43,7 @@ fn signal_snapshots(runtime: &AutomationRuntime) -> Vec<SignalSnapshot> {
                 .iter()
                 .find(|(_, candidate)| candidate == &&signal.name)
                 .map(|((block_id, endpoint), _)| SignalProducerSnapshot {
-                    block_id: block_id.clone(),
+                    block_id: block_id.to_string(),
                     endpoint: endpoint.to_string(),
                     execution_id: None,
                 });
@@ -53,7 +53,7 @@ fn signal_snapshots(runtime: &AutomationRuntime) -> Vec<SignalSnapshot> {
                 .into_iter()
                 .flatten()
                 .map(|binding| SignalConsumerSnapshot {
-                    block_id: binding.block_id.clone(),
+                    block_id: binding.block_id.to_string(),
                     endpoint: binding.endpoint.to_string(),
                 })
                 .collect::<Vec<_>>();
@@ -63,7 +63,7 @@ fn signal_snapshots(runtime: &AutomationRuntime) -> Vec<SignalSnapshot> {
                     .then(left.endpoint.cmp(&right.endpoint))
             });
             SignalSnapshot {
-                name: signal.name.clone(),
+                name: signal.name.to_string(),
                 dpt: DptMessage::from_core(signal.dpt),
                 value: None,
                 status: "unknown".to_owned(),

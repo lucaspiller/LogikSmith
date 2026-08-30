@@ -1,7 +1,7 @@
 use crate::*;
 use logiksmith_core::TypedValue;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, ffi::OsString, net::IpAddr, path::PathBuf};
+use std::{collections::HashSet, ffi::OsString, net::IpAddr, ops::Deref, path::PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,7 +164,7 @@ impl KnxEvent {
             .map(|value| value.core(dpt, "value"))
             .transpose()
     }
-    fn validate(&self) -> Result<(), ProtocolError> {
+    fn validate(&self) -> Result<GroupAddress, ProtocolError> {
         let destination = GroupAddress::parse(&self.destination)
             .map_err(|error| ProtocolError::Field("destination", error.to_string()))?;
         if destination.to_string() != self.destination {
@@ -191,7 +191,34 @@ impl KnxEvent {
                 ));
             }
         }
-        Ok(())
+        Ok(destination)
+    }
+}
+
+/// A validated bridge event. The raw DTO remains available for exact wire
+/// serialization and diagnostics, while the host consumes the parsed address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedKnxEvent {
+    pub(crate) raw: KnxEvent,
+    destination: GroupAddress,
+}
+
+impl ValidatedKnxEvent {
+    fn new(raw: KnxEvent) -> Result<Self, ProtocolError> {
+        let destination = raw.validate()?;
+        Ok(Self { raw, destination })
+    }
+
+    pub(crate) fn destination_address(&self) -> GroupAddress {
+        self.destination
+    }
+}
+
+impl Deref for ValidatedKnxEvent {
+    type Target = KnxEvent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
     }
 }
 
@@ -288,7 +315,7 @@ pub enum Message {
     BridgeHello(BridgeHello),
     Configure(Configure),
     Ready(Ready),
-    KnxEvent(KnxEvent),
+    KnxEvent(ValidatedKnxEvent),
     KnxWrite(KnxWrite),
     CommandResult(CommandResult),
     Fatal(Fatal),
@@ -346,8 +373,7 @@ pub fn parse_message(line: &str) -> Result<Message, ProtocolError> {
         }
         "knx_event" => {
             let message: KnxEvent = decode(line)?;
-            message.validate()?;
-            Message::KnxEvent(message)
+            Message::KnxEvent(ValidatedKnxEvent::new(message)?)
         }
         "knx_write" => {
             let message: KnxWrite = decode(line)?;
@@ -374,12 +400,32 @@ pub fn encode_message(message: &Message) -> Result<String, ProtocolError> {
         Message::BridgeHello(message) => serde_json::to_string(message),
         Message::Configure(message) => serde_json::to_string(message),
         Message::Ready(message) => serde_json::to_string(message),
-        Message::KnxEvent(message) => serde_json::to_string(message),
+        Message::KnxEvent(message) => serde_json::to_string(&message.raw),
         Message::KnxWrite(message) => serde_json::to_string(message),
         Message::CommandResult(message) => serde_json::to_string(message),
         Message::Fatal(message) => serde_json::to_string(message),
         Message::Shutdown(message) => serde_json::to_string(message),
     }?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parsed_knx_event_retains_typed_destination_and_wire_shape() {
+        let line = r#"{"v":1,"type":"knx_event","source":"1.1.42","destination":"2/2/53","service":"group_value_write","dpt":{"major":1,"subtype":1},"value":{"kind":"bool","value":true}}"#;
+        let message = parse_message(line).unwrap();
+        let Message::KnxEvent(event) = &message else {
+            panic!("expected KNX event");
+        };
+        assert_eq!(
+            event.destination_address(),
+            GroupAddress::parse("2/2/53").unwrap()
+        );
+        assert_eq!(event.raw.destination, "2/2/53");
+        assert_eq!(encode_message(&message).unwrap(), line);
+    }
 }
 
 // ---------------------------------------------------------------------------

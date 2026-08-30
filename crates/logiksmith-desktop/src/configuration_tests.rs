@@ -232,7 +232,7 @@ group_address = "2/2/1"
             blocks: vec![producer],
         };
         let runtime = build_automation(document.clone()).expect("valid signal binding");
-        assert_eq!(runtime.signals[0].name, "house_occupied");
+        assert_eq!(runtime.signals[0].name.as_str(), "house_occupied");
         assert_eq!(runtime.output_to_signal.len(), 1);
         assert_eq!(runtime.signal_to_inputs.len(), 0);
 

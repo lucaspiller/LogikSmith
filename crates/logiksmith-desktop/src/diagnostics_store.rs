@@ -25,13 +25,14 @@ impl DiagnosticStore {
         let mut block_automation = BTreeMap::new();
         let mut block_schedules = BTreeMap::new();
         for block in &runtime.blocks {
+            let block_id = block.id.to_string();
             block_schedules.insert(
-                block.id.clone(),
+                block_id.clone(),
                 runtime
                     .document
                     .blocks
                     .iter()
-                    .find(|candidate| candidate.id == block.id)
+                    .find(|candidate| candidate.id == block.id.as_str())
                     .map(|candidate| {
                         candidate
                             .schedules
@@ -43,16 +44,17 @@ impl DiagnosticStore {
             );
         }
         for block in &runtime.blocks {
+            let block_id = block.id.to_string();
             let source = runtime
                 .document
                 .blocks
                 .iter()
-                .find(|candidate| candidate.id == block.id)
+                .find(|candidate| candidate.id == block.id.as_str())
                 .map(|candidate| candidate.source.clone())
                 .unwrap_or_default();
             let revision = block.revision;
             blocks.insert(
-                block.id.clone(),
+                block_id.clone(),
                 BlockDiagnosticState {
                     active_enabled: block.enabled,
                     saved_enabled: block.enabled,
@@ -65,7 +67,7 @@ impl DiagnosticStore {
                     last_result: None,
                 },
             );
-            block_automation.insert(block.id.clone(), block_automation_snapshot(runtime, block));
+            block_automation.insert(block_id.clone(), block_automation_snapshot(runtime, block));
             for endpoint in block.engine_config.endpoints.iter() {
                 let address = block.endpoint_to_address.get(&endpoint.name).copied();
                 if address.is_none() && !block.endpoint_to_signal.contains_key(&endpoint.name) {
@@ -83,7 +85,7 @@ impl DiagnosticStore {
                     requested: None,
                 };
                 block_endpoint_values.insert(
-                    (block.id.clone(), endpoint.name.clone()),
+                    (block_id.clone(), endpoint.name.clone()),
                     endpoint_state.clone(),
                 );
                 endpoint_values.insert(endpoint.name.clone(), endpoint_state);
@@ -136,7 +138,7 @@ impl DiagnosticStore {
                 block_order: runtime
                     .blocks
                     .iter()
-                    .map(|block| block.id.clone())
+                    .map(|block| block.id.to_string())
                     .collect(),
                 block_automation,
                 block_endpoint_values,
@@ -677,9 +679,7 @@ impl DiagnosticStore {
                 .find(|candidate| candidate.id == id)
                 .map(|candidate| candidate.revision.max(1))
                 .unwrap_or(block.active_logic_revision);
-            if let Ok(core_id) = id.parse::<logiksmith_core::BlockId>()
-                && let Some(core_block) = runtime.block(&core_id)
-            {
+            if let Some(core_block) = runtime.block(&result.block_id) {
                 block.source = core_block.logic_program().source().to_owned();
             } else if let Some(document_block) = automation
                 .document
@@ -773,7 +773,7 @@ impl DiagnosticStore {
         let block_id = automation
                 .blocks
                 .first()
-                .map(|block| block.id.clone())
+                .map(|block| block.id.to_string())
                 .unwrap_or_default();
         let causal_producer_execution_id = execution.causal_producer;
         let causal_producer_block_id = causal_producer_execution_id.and_then(|id| {
@@ -835,9 +835,8 @@ impl DiagnosticStore {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if telegram.endpoint.is_none()
-            && let Ok(address) = telegram.destination.parse::<GroupAddress>()
-        {
+        if telegram.endpoint.is_none() {
+            let address = telegram.address;
             telegram.endpoint = inner
                 .endpoint_values
                 .iter()
@@ -851,9 +850,8 @@ impl DiagnosticStore {
         {
             state.observed = Some(value.clone());
         }
-        if let Some(value) = telegram.value.as_ref()
-            && let Ok(address) = telegram.destination.parse::<GroupAddress>()
-        {
+        if let Some(value) = telegram.value.as_ref() {
+            let address = telegram.address;
             for state in inner.block_endpoint_values.values_mut() {
                 if state.address == Some(address) && state.direction == EndpointDirection::Input {
                     state.observed = Some(value.clone());

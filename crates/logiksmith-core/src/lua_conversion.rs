@@ -1,10 +1,7 @@
-fn typed_value_to_lua(value: TypedValue) -> Result<LuaValue, String> {
-    match (value.dpt, value.value) {
-        (dpt, Value::Bool(value)) if dpt.is_bool() => Ok(LuaValue::Boolean(value)),
-        (dpt, Value::Percent(value)) if dpt.is_percent() && value <= 100 => {
-            Ok(LuaValue::Integer(i64::from(value)))
-        }
-        _ => Err(format!("invalid typed value {value:?}")),
+fn typed_value_to_lua(value: TypedValue) -> LuaValue {
+    match value.value() {
+        Value::Bool(value) => LuaValue::Boolean(value),
+        Value::Percent(value) => LuaValue::Integer(i64::from(value)),
     }
 }
 

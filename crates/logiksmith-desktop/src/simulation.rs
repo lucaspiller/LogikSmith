@@ -18,8 +18,8 @@ pub struct DptMessage {
 impl DptMessage {
     pub(crate) fn from_core(dpt: Dpt) -> Self {
         Self {
-            major: dpt.major,
-            subtype: dpt.subtype,
+            major: dpt.major(),
+            subtype: dpt.subtype(),
         }
     }
     pub(crate) fn core(&self, field_name: &'static str) -> Result<Dpt, ProtocolError> {
@@ -58,7 +58,7 @@ pub enum ValueMessage {
 
 impl ValueMessage {
     pub(crate) fn from_core(value: TypedValue) -> Self {
-        match value.value {
+        match value.value() {
             Value::Bool(value) => Self::Bool(BoolValueMessage {
                 kind: "bool".to_owned(),
                 value,

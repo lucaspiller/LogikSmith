@@ -41,12 +41,11 @@ pub(crate) fn validate_simulation_value(
     endpoint: &Endpoint,
     value: TypedValue,
 ) -> Result<(), SimulationError> {
-    value.validate().map_err(SimulationError::InvalidValue)?;
-    if endpoint.dpt != value.dpt {
+    if endpoint.dpt != value.dpt() {
         return Err(SimulationError::DptMismatch {
             endpoint: endpoint.name.clone(),
             expected: endpoint.dpt,
-            actual: value.dpt,
+            actual: value.dpt(),
         });
     }
     Ok(())
@@ -63,11 +62,11 @@ pub(crate) fn input_trigger(
         previous,
         changed: previous.is_some_and(|previous| previous != value),
         rising: matches!(
-            (previous.map(|previous| previous.value), value.value),
+            (previous.map(TypedValue::value), value.value()),
             (Some(Value::Bool(false)), Value::Bool(true))
         ),
         falling: matches!(
-            (previous.map(|previous| previous.value), value.value),
+            (previous.map(TypedValue::value), value.value()),
             (Some(Value::Bool(true)), Value::Bool(false))
         ),
     }

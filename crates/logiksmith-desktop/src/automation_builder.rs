@@ -14,14 +14,17 @@ pub fn build_automation(
     }
     for (signal_index, signal) in document.signals.iter().enumerate() {
         let path = format!("signals[{signal_index}]");
-        let name = match endpoint_name(&format!("{path}.name"), &signal.name) {
+        let name = match SignalName::parse(&signal.name) {
             Ok(name) => name,
             Err(error) => {
-                errors.push(error);
+                errors.push(FieldError {
+                    path: format!("{path}.name"),
+                    message: error.to_string(),
+                });
                 continue;
             }
         };
-        if name.to_string() != signal.name {
+        if name.as_str() != signal.name {
             errors.push(FieldError {
                 path: format!("{path}.name"),
                 message: "must use canonical identifier form".to_owned(),
@@ -35,7 +38,7 @@ pub fn build_automation(
                 continue;
             }
         };
-        if signal_dpts.insert(signal.name.clone(), dpt).is_some() {
+        if signal_dpts.insert(name.clone(), dpt).is_some() {
             errors.push(FieldError {
                 path: format!("{path}.name"),
                 message: "must be unique".to_owned(),
@@ -43,7 +46,7 @@ pub fn build_automation(
             continue;
         }
         signals.push(SignalRuntime {
-            name: signal.name.clone(),
+            name,
             dpt,
         });
     }
@@ -62,16 +65,16 @@ pub fn build_automation(
     let mut blocks = Vec::new();
     let mut address_to_inputs: HashMap<GroupAddress, Vec<BlockInputBinding>> = HashMap::new();
     let mut output_to_address = HashMap::new();
-    let mut signal_to_inputs: HashMap<String, Vec<BlockSignalInputBinding>> = HashMap::new();
+    let mut signal_to_inputs: HashMap<SignalName, Vec<BlockSignalInputBinding>> = HashMap::new();
     let mut output_to_signal = HashMap::new();
     let mut address_dpts = HashMap::new();
-    let mut address_origins: HashMap<GroupAddress, (String, String)> = HashMap::new();
-    let mut signal_producers: HashMap<String, (String, String)> = HashMap::new();
+    let mut address_origins: HashMap<GroupAddress, (BlockId, EndpointName)> = HashMap::new();
+    let mut signal_producers: HashMap<SignalName, (BlockId, EndpointName)> = HashMap::new();
     let mut signal_binding_count = 0usize;
 
     for (block_index, block) in document.blocks.iter().enumerate() {
         let block_path = format!("blocks[{block_index}]");
-        let id = match block.id.parse::<logiksmith_core::BlockId>() {
+        let id = match block.id.parse::<BlockId>() {
             Ok(id) => id,
             Err(error) => {
                 errors.push(FieldError {
@@ -189,33 +192,33 @@ pub fn build_automation(
             if let Some(previous) = address_dpts.get(&address)
                 && previous != &dpt
             {
-                let (previous_block, previous_endpoint) = address_origins
+                let previous_origin = address_origins
                     .get(&address)
-                    .cloned()
-                    .unwrap_or_else(|| ("another block".to_owned(), "unknown".to_owned()));
+                    .map(|(block, endpoint)| format!("{block}.{endpoint}"))
+                    .unwrap_or_else(|| "another block.unknown".to_owned());
                 errors.push(FieldError {
                     path: format!("{path}.group_address"),
                     message: format!(
-                        "DPT conflicts with {previous_block}.{previous_endpoint} at {address}"
+                        "DPT conflicts with {previous_origin} at {address}"
                     ),
                 });
                 continue;
             }
             address_dpts.insert(address, dpt);
-            address_origins.insert(address, (block.id.clone(), name.to_string()));
+            address_origins.insert(address, (id.clone(), name.clone()));
             endpoint_to_address.insert(name.clone(), address);
             match endpoint_directions.get(&name) {
                 Some(EndpointDirection::Input) => address_to_inputs
                     .entry(address)
                     .or_default()
                     .push(BlockInputBinding {
-                        block_id: block.id.clone(),
+                        block_id: id.clone(),
                         endpoint: name,
                         dpt,
                         address,
                     }),
                 Some(EndpointDirection::Output) => {
-                    output_to_address.insert((block.id.clone(), name), address);
+                    output_to_address.insert((id.clone(), name), address);
                 }
                 None => unreachable!("endpoint DPT implies direction"),
             }
@@ -237,7 +240,17 @@ pub fn build_automation(
                 });
                 continue;
             };
-            let Some(&signal_dpt) = signal_dpts.get(&binding.signal) else {
+            let signal = match binding.signal.parse::<SignalName>() {
+                Ok(signal) => signal,
+                Err(_) => {
+                    errors.push(FieldError {
+                        path: format!("{path}.signal"),
+                        message: "must reference an existing signal".to_owned(),
+                    });
+                    continue;
+                }
+            };
+            let Some(&signal_dpt) = signal_dpts.get(&signal) else {
                 errors.push(FieldError {
                     path: format!("{path}.signal"),
                     message: "must reference an existing signal".to_owned(),
@@ -258,22 +271,22 @@ pub fn build_automation(
                 });
                 continue;
             }
-            endpoint_to_signal.insert(name.clone(), binding.signal.clone());
+            endpoint_to_signal.insert(name.clone(), signal.clone());
             if endpoint_directions.get(&name) == Some(&EndpointDirection::Input) {
                 signal_to_inputs
-                    .entry(binding.signal.clone())
+                    .entry(signal.clone())
                     .or_default()
                     .push(BlockSignalInputBinding {
-                        block_id: block.id.clone(),
+                        block_id: id.clone(),
                         endpoint: name,
                         dpt,
-                        signal: binding.signal.clone(),
+                        signal,
                     });
             } else if endpoint_directions.get(&name) == Some(&EndpointDirection::Output) {
                 if let Some((previous_block, previous_endpoint)) =
                     signal_producers.insert(
-                        binding.signal.clone(),
-                        (block.id.clone(), name.to_string()),
+                        signal.clone(),
+                        (id.clone(), name.clone()),
                     )
                 {
                     errors.push(FieldError {
@@ -283,7 +296,7 @@ pub fn build_automation(
                         ),
                     });
                 }
-                output_to_signal.insert((block.id.clone(), name), binding.signal.clone());
+                output_to_signal.insert((id.clone(), name), signal);
             }
         }
         for endpoint in &endpoints {
@@ -325,7 +338,7 @@ pub fn build_automation(
             });
         }
         blocks.push(BlockRuntime {
-            id: block.id.clone(),
+            id,
             revision: block.revision.max(1),
             enabled: block.enabled,
             engine_config,
@@ -348,7 +361,7 @@ pub fn build_automation(
         .iter()
         .map(|block| {
             let mut config = CoreBlockConfig::with_schedules(
-                block.id.parse::<BlockId>().expect("validated block ID"),
+                block.id.clone(),
                 block.enabled,
                 block.engine_config.endpoints.clone(),
                 block.engine_config.logic.source.clone(),
@@ -357,16 +370,26 @@ pub fn build_automation(
             config.signal_bindings = document
                 .blocks
                 .iter()
-                .find(|candidate| candidate.id == block.id)
+                .find(|candidate| candidate.id == block.id.to_string())
                 .map(|candidate| {
                     candidate
                         .signal_bindings
                         .iter()
                         .map(|binding| {
+                            let endpoint = block
+                                .engine_config
+                                .endpoints
+                                .iter()
+                                .find(|endpoint| endpoint.name.as_str() == binding.endpoint)
+                                .map(|endpoint| endpoint.name.clone())
+                                .expect("validated endpoint");
                             CoreSignalBinding::new(
-                                binding.endpoint.parse().expect("validated endpoint"),
-                                SignalName::new(binding.signal.clone())
-                                    .expect("validated signal"),
+                                endpoint.clone(),
+                                block
+                                    .endpoint_to_signal
+                                    .get(&endpoint)
+                                    .cloned()
+                                    .expect("validated signal binding"),
                             )
                         })
                         .collect()
@@ -379,7 +402,7 @@ pub fn build_automation(
         .iter()
         .map(|signal| {
             CoreSignalConfig::new(
-                SignalName::new(signal.name.clone()).expect("validated signal"),
+                signal.name.clone(),
                 signal.dpt,
             )
         })

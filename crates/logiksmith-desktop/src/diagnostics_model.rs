@@ -1,7 +1,8 @@
 // Bounded, read-only diagnostic state for the desktop dashboard.
 
 use crate::{
-    AutomationRuntime, BoolValueMessage, DptMessage, GroupAddress, KnxEvent, ValueMessage,
+    AutomationRuntime, BoolValueMessage, DptMessage, GroupAddress, ValueMessage,
+    ValidatedKnxEvent,
 };
 use logiksmith_core::{
     BlockExecution, ClockSample, Dpt, EndpointDirection, EndpointName, Execution, OutputEffect,
@@ -592,21 +593,24 @@ pub struct TelegramRecord {
     pub time_ms: u64,
     pub source: Option<String>,
     pub destination: String,
+    #[serde(skip)]
+    pub(crate) address: GroupAddress,
     pub endpoint: Option<String>,
     pub service: String,
     pub dpt: DptMessage,
     pub value: Option<ValueMessage>,
 }
 impl TelegramRecord {
-    pub fn from_event(event: &KnxEvent, endpoint: Option<&EndpointName>) -> Self {
+    pub fn from_event(event: &ValidatedKnxEvent, endpoint: Option<&EndpointName>) -> Self {
         Self {
             time_ms: 0,
-            source: event.source.clone(),
-            destination: event.destination.clone(),
+            source: event.raw.source.clone(),
+            destination: event.destination_address().to_string(),
+            address: event.destination_address(),
             endpoint: endpoint.map(ToString::to_string),
-            service: event.service.clone(),
-            dpt: event.dpt.clone(),
-            value: event.value.clone(),
+            service: event.raw.service.clone(),
+            dpt: event.raw.dpt.clone(),
+            value: event.raw.value.clone(),
         }
     }
 }
