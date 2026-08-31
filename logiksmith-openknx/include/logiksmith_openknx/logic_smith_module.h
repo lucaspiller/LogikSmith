@@ -21,9 +21,18 @@ class LogicSmithModule final : public OpenKNX::Module {
 
     void setup() override;
     void loop() override;
+    void processBeforeRestart() override;
 
     void set_runtime_processor(RuntimeProcessor* processor) {
+#if defined(LOGIKSMITH_REQUIRE_ABI_RUNTIME)
+        // A release image must never be switched back to the disabled
+        // processor through a test/configuration seam.
+        if (processor != nullptr && processor != &_disabled_processor) {
+            _processor = processor;
+        }
+#else
         _processor = processor == nullptr ? &_disabled_processor : processor;
+#endif
     }
     BindingTableError replace_bindings(const Binding* bindings, size_t count) {
         return _bindings.replace(bindings, count);
@@ -31,6 +40,10 @@ class LogicSmithModule final : public OpenKNX::Module {
     BindingTable& bindings() { return _bindings; }
     RawBindingRouter& router() { return _router; }
     bool raw_hook_registered() const { return _raw_hook_registered; }
+    bool runtime_processor_available() const {
+        return _processor == &_abi_processor && _abi_processor.started();
+    }
+    bool runtime_start_failed() const { return _runtime_start_failed; }
 
   private:
     static void on_raw_group(void* context,
@@ -50,6 +63,7 @@ class LogicSmithModule final : public OpenKNX::Module {
     DisabledRuntimeProcessor _disabled_processor;
     RuntimeProcessor* _processor = &_disabled_processor;
     bool _raw_hook_registered = false;
+    bool _runtime_start_failed = false;
 };
 
 extern LogicSmithModule logicSmithModule;

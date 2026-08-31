@@ -2,20 +2,26 @@
 
 #include <string.h>
 
-// The ABI functions are weak so the OpenKNX-only firmware remains linkable
-// while the current std/Lua core is being made portable to classic Xtensa.
-extern "C" uint32_t logiksmith_abi_version(void) __attribute__((weak));
+// Native host tests can exercise the boundary without a Rust archive, but a
+// release image must pull the archive and fail at link time if it is absent.
+#if defined(LOGIKSMITH_REQUIRE_ABI_RUNTIME)
+#define LOGIKSMITH_ABI_WEAK
+#else
+#define LOGIKSMITH_ABI_WEAK __attribute__((weak))
+#endif
+extern "C" uint32_t logiksmith_abi_version(void) LOGIKSMITH_ABI_WEAK;
 extern "C" int32_t logiksmith_runtime_create(
     const LogiksmithRuntimeConfig* config,
-    LogiksmithRuntime** out_runtime) __attribute__((weak));
+    LogiksmithRuntime** out_runtime) LOGIKSMITH_ABI_WEAK;
 extern "C" int32_t logiksmith_runtime_destroy(LogiksmithRuntime* runtime)
-    __attribute__((weak));
+    LOGIKSMITH_ABI_WEAK;
 extern "C" int32_t logiksmith_runtime_process_input(
     LogiksmithRuntime* runtime,
     const LogiksmithInputEvent* event,
     LogiksmithEffect* effects,
     size_t capacity,
-    size_t* written) __attribute__((weak));
+    size_t* written) LOGIKSMITH_ABI_WEAK;
+#undef LOGIKSMITH_ABI_WEAK
 
 namespace logiksmith {
 namespace openknx {
@@ -65,6 +71,10 @@ bool AbiRuntimeProcessor::start() {
     }
     _runtime = runtime;
     return true;
+}
+
+void AbiRuntimeProcessor::shutdown() {
+    stop();
 }
 
 void AbiRuntimeProcessor::stop() {

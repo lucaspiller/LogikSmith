@@ -12,19 +12,42 @@ Import("env")
 
 configured_project_dir = Path(env.subst("$PROJECT_DIR"))
 project_config = Path(env.subst("$PROJECT_CONFIG"))
-script_project_dir = project_config.parent
-project_dir = (
-    configured_project_dir
-    if (configured_project_dir / "patches" / "knx-raw-group-hooks.patch").is_file()
-    else script_project_dir
-)
-patch_path = script_project_dir / "patches" / "knx-raw-group-hooks.patch"
-libdeps_roots = [project_dir / ".pio" / "libdeps"]
-if script_project_dir / ".pio" / "libdeps" not in libdeps_roots:
-    libdeps_roots.append(script_project_dir / ".pio" / "libdeps")
+project_candidates = []
+for candidate in (configured_project_dir, project_config.parent):
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    candidate = candidate.resolve()
+    if candidate not in project_candidates:
+        project_candidates.append(candidate)
+# SCons normally supplies an absolute PROJECT_CONFIG, but the command
+# `pio run --project-dir ...` has also exposed a workspace-root PROJECT_DIR on
+# older PlatformIO releases. The script location is the final deterministic
+# fallback when both values are relative or otherwise misleading.
+script_file = globals().get("__file__")
+if script_file:
+    script_dir = Path(script_file).resolve().parent.parent
+    if script_dir not in project_candidates:
+        project_candidates.append(script_dir)
 
-if not patch_path.is_file():
-    raise RuntimeError("LogikSmith raw OpenKNX patch is missing")
+patch_project_dir = next(
+    (
+        candidate
+        for candidate in project_candidates
+        if (candidate / "patches" / "knx-raw-group-hooks.patch").is_file()
+    ),
+    None,
+)
+if patch_project_dir is None:
+    raise RuntimeError(
+        "LogikSmith raw OpenKNX patch is missing; checked: "
+        + ", ".join(str(candidate / "patches") for candidate in project_candidates)
+    )
+patch_path = patch_project_dir / "patches" / "knx-raw-group-hooks.patch"
+libdeps_roots = []
+for project_dir in project_candidates:
+    libdeps_root = project_dir / ".pio" / "libdeps"
+    if libdeps_root not in libdeps_roots:
+        libdeps_roots.append(libdeps_root)
 
 candidates = []
 for libdeps_root in libdeps_roots:
@@ -46,8 +69,16 @@ for libdeps_root in libdeps_roots:
         hardware_include = hardware_root / "include"
         if (hardware_include / "HardwareConfig.h").is_file():
             hardware_candidates.append(hardware_include)
-if len(hardware_candidates) == 1:
-    env.Append(CPPPATH=[str(hardware_candidates[0])])
+if len(hardware_candidates) != 1:
+    raise RuntimeError(
+        "expected one OGM-HardwareConfig include directory, found: "
+        + ", ".join(str(path) for path in hardware_candidates)
+    )
+# CPPPATH is sufficient for project sources, but PlatformIO creates a
+# separate environment for library sources. BUILD_FLAGS is inherited by both,
+# which keeps OGM-Common's hardware.h include resolvable too.
+hardware_flag = "-I" + str(hardware_candidates[0])
+env.Append(CPPPATH=[str(hardware_candidates[0])], BUILD_FLAGS=[hardware_flag])
 
 transport_header = knx_root / "src" / "knx" / "transport_layer.h"
 transport_source = knx_root / "src" / "knx" / "transport_layer.cpp"

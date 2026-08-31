@@ -22,6 +22,15 @@ pub const MAX_BLOCKS: usize = 64;
 pub const MAX_ENDPOINTS_PER_BLOCK: usize = 64;
 pub const MAX_EFFECTS: usize = 256;
 
+// The ESP32 Arduino linker does not pull Rust's panic runtime as a separate
+// crate when this library is embedded in a C++ image. The abort profile still
+// leaves a personality reference in Rust `.eh_frame` records, so provide the
+// required no-op symbol from the same archive. No unwinding is enabled for the
+// embedded build.
+#[cfg(target_arch = "xtensa")]
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_eh_personality() {}
+
 const INPUT: u8 = 0;
 const OUTPUT: u8 = 1;
 const VALUE_BOOL: u8 = 1;

@@ -6,5 +6,13 @@ edition = "2024"
 [lib]
 crate-type = ["rlib", "staticlib"]
 
+[features]
+default = ["desktop-lua"]
+desktop-lua = ["logiksmith-core/vendored-lua"]
+embedded-lua = ["logiksmith-core/vendored-lua"]
+
 [dependencies]
-logiksmith-core = { path = "../logiksmith-core" }
+# The embedded profile opts into the target-compatible Lua source build through
+# the `embedded-lua` feature; the desktop default keeps the normal developer
+# workflow unchanged.
+logiksmith-core = { path = "../logiksmith-core", default-features = false }

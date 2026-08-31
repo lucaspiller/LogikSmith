@@ -29,13 +29,36 @@ uint16_t LogicSmithModule::flashSize() {
 }
 
 void LogicSmithModule::setup() {
+    _runtime_start_failed = false;
     if (_abi_processor.start()) {
         _processor = &_abi_processor;
+        Serial.println("[LogicSmith] processor: embedded Rust ABI");
+    } else {
+#if defined(LOGIKSMITH_REQUIRE_ABI_RUNTIME)
+        // Release images fail closed. The post-link guard should catch this
+        // before flashing; this branch also keeps an unexpected ABI mismatch
+        // from silently running the disabled processor on a manually-built
+        // image.
+        _processor = nullptr;
+        _runtime_start_failed = true;
+        Serial.println("[LogicSmith] fatal: embedded runtime ABI is unavailable");
+#else
+        _processor = &_disabled_processor;
+#endif
     }
     _raw_hook_registered = register_raw_group_observer(this, &LogicSmithModule::on_raw_group);
 }
 
+void LogicSmithModule::processBeforeRestart() {
+    _abi_processor.shutdown();
+    _processor = nullptr;
+    _runtime_start_failed = true;
+}
+
 void LogicSmithModule::loop() {
+    if (_runtime_start_failed) {
+        return;
+    }
     // Keep the per-loop work bounded so a burst of raw KNX traffic cannot
     // starve other OpenKNX modules (for example a motion/switch application).
     if (_processor != nullptr) {

@@ -96,6 +96,14 @@ else
         echo "  firmware artifact: unavailable (run with --build)"
     fi
 
+    elf="$BUILD_DIR/firmware.elf"
+    if [ -f "$elf" ]; then
+        elf_bytes=$(wc -c <"$elf" | tr -d ' ')
+        echo "  linked ELF (intermediate): $elf ($elf_bytes bytes)"
+    else
+        echo "  linked ELF (intermediate): unavailable"
+    fi
+
     if [ "$SIZE" -eq 1 ]; then
         if ! command -v pio >/dev/null 2>&1; then
             echo "  PlatformIO size summary: unavailable (pio is not installed)"

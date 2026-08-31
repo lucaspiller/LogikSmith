@@ -22,22 +22,28 @@ creating ETS associations for LogikSmith endpoints.
 ## Host seam
 
 `RuntimeProcessor` is the explicit boundary between the OpenKNX loop and the
-portable Rust ABI. M14 includes a weak-linked `AbiRuntimeProcessor` for the
-default boolean block and selects it when the ABI symbols are present. The
-firmware otherwise selects an explicit `DisabledRuntimeProcessor` because the
-current core still depends on desktop `std`/vendored Lua and cannot yet be
-linked for classic ESP32 Xtensa. The raw KNX callback remains transport-only.
-Native tests exercise both the router and ABI processor without requiring
-OpenKNX or a device.
+portable Rust ABI. M14 includes an `AbiRuntimeProcessor` for the default
+boolean block; native tests use weak declarations so they can run without the
+archive. The release environment requires the embedded ABI
+symbols at post-link time and fails closed at startup if they are unavailable;
+it cannot silently run `DisabledRuntimeProcessor`. The raw KNX callback remains
+transport-only. Native tests exercise both the router and ABI processor without
+requiring OpenKNX or a device.
 
 ## Checks
 
 ```sh
 ./test/run_raw_binding_router_test.sh
 ./test/run_abi_runtime_processor_test.sh
+./test/run_runtime_link_guard_test.sh
 ```
 
 The full PlatformIO build requires PlatformIO, the Espressif Xtensa toolchain,
-and network access for the pinned OpenKNX dependencies. It builds this
-directory only; the external demo project is reference material and is never a
-build input.
+and network access for the pinned OpenKNX dependencies. Its pre-build Rust
+step compiles `../crates/logiksmith-embedded-abi` for
+`xtensa-esp32-espidf` with target `std` and Lua 5.4, checks the exported ABI
+symbols, and links that archive into the image. Release C++ uses strong ABI
+references and a post-link guard, so missing runtime code is a build failure
+rather than a disabled processor image. It builds this directory and the
+repository crate only; the external demo project is reference material and is
+never a build input.

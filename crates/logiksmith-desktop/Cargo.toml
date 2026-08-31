@@ -6,11 +6,12 @@ edition = "2024"
 [features]
 # The desktop release is the complete service. Embedded hosts can opt into
 # just the capabilities they actually provide.
-default = ["timezones", "astronomy", "http-inputs", "webhook-inputs"]
+default = ["timezones", "astronomy", "http-inputs", "webhook-inputs", "vendored-lua"]
 timezones = ["logiksmith-core/timezones"]
 astronomy = ["logiksmith-core/astronomy"]
 http-inputs = ["dep:reqwest", "logiksmith-core/http-inputs"]
 webhook-inputs = ["logiksmith-core/webhook-inputs"]
+vendored-lua = ["logiksmith-core/vendored-lua"]
 external-inputs = ["http-inputs", "webhook-inputs"]
 
 [dependencies]

@@ -9,16 +9,17 @@
 namespace logiksmith {
 namespace openknx {
 
-// A small default block keeps the M14 firmware executable when the Rust
-// static library is not linked. The weak ABI symbols turn that absence into a
-// clean fallback instead of a link error; a later portable-core build can
-// provide the same symbols without changing this host boundary.
+// The default block gives the M14 image a deterministic executable path. In
+// native tests the ABI symbols may be weak, while the release build promotes
+// them to strong references so an absent Rust archive cannot become a silent
+// disabled-runtime firmware image.
 class AbiRuntimeProcessor final : public RuntimeProcessor {
   public:
     AbiRuntimeProcessor() = default;
     ~AbiRuntimeProcessor() override;
 
     bool start();
+    void shutdown();
     bool started() const { return _runtime != nullptr; }
 
     void process_input(const InputEvent& event, RawBindingRouter& router) override;

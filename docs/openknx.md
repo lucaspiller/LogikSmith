@@ -21,6 +21,12 @@ The build uses this repository only. The older
 `/Users/luca/code/personal/openknx/OAM-LogicMachine/` project is a reference
 for the toolchain and is not a dependency or build input.
 
+The Rust portion needs the `esp` Rust toolchain from espup and PlatformIO's
+`toolchain-xtensa-esp-elf` package. The pre-build hook selects the exact
+ESP32 compiler from the PlatformIO package so the Rust archive and the
+Arduino/OpenKNX objects have the same little-endian ABI. If either toolchain
+is absent, the build stops before producing firmware.
+
 ## Build
 
 From the repository root, build the release image with:
@@ -129,17 +135,30 @@ create a feedback loop.
 
 ## Runtime selection
 
-At startup, `LogicSmithModule` tries to create `AbiRuntimeProcessor`. It does
-so only when the linked image provides the matching
-`logiksmith-embedded-abi` symbols and ABI version. When those symbols are not
-present, the module selects `DisabledRuntimeProcessor` and the raw transport
-and binding-router tests still remain usable.
+The release build first runs `scripts/build_rust.py`, which builds this
+repository's `logiksmith-embedded-abi` crate for
+`xtensa-esp32-espidf` with target `std` and Lua 5.4, verifies the four exported
+ABI symbols, and adds the resulting static archive to the PlatformIO link.
+The release C++ host uses strong ABI references and a post-link symbol guard,
+so a missing or incomplete archive fails the build instead of producing a
+firmware image that silently selects `DisabledRuntimeProcessor`. Native host
+tests retain weak declarations so the queue and adapter seam can be tested
+without Xtensa.
 
-The current portable core depends on desktop `std`, vendored Lua 5.4, and
-`jiff`, so it is not yet linkable as a complete classic ESP32 Xtensa runtime.
-As a result, a successful PlatformIO build proves the OpenKNX host, raw hook,
-and optional ABI seam compile and link. It does not prove Lua execution on the
-device.
+On the configured toolchain, a complete release build succeeds with the
+runtime linked:
+
+```text
+RAM:   17.6% (57,680 / 327,680 bytes)
+Flash: 56.5% (1,740,070 / 3,080,192 bytes)
+firmware.bin: logiksmith-openknx/.pio/build/release_LogikSmith_REG1_LAN_TP_Base/firmware.bin
+```
+
+The linked ELF contains `logiksmith_abi_version`,
+`logiksmith_runtime_create`, `logiksmith_runtime_destroy`, and
+`logiksmith_runtime_process_input`. The image has therefore passed the build
+proof for the real embedded runtime; physical behavior still requires the
+target board and KNX installation.
 
 ## Checks before hardware work
 
@@ -149,17 +168,19 @@ root:
 ```sh
 ./logiksmith-openknx/test/run_raw_binding_router_test.sh
 ./logiksmith-openknx/test/run_abi_runtime_processor_test.sh
+./logiksmith-openknx/test/run_runtime_link_guard_test.sh
 cargo test -p logiksmith-embedded-abi
 cargo test -p logiksmith-core --test openknx_host_contract
 ```
 
 Before a manual KNX test, use a harmless visible actuator, keep input and
 output group addresses different, and use plain KNXnet/IP tunnelling if a
-gateway is part of the test setup. For a fully linked runtime with the timer
-logic enabled, the acceptance sequence is a connected device, an input
-`true`, an immediate output `true`, and an output `false` after the configured
-delay. Retriggering and shutdown should be tested separately. The current M14
-OpenKNX image has no timer behavior until a portable Rust runtime is linked.
+gateway is part of the test setup. For the linked runtime, the acceptance
+sequence is a connected device, an input `true`, and an immediate output
+`true` on the distinct output address. The default M14 host block is
+intentionally the small boolean trigger/light proof; timer behavior and
+user-editable scripts are M15 configuration work. Retriggering and shutdown
+should be tested separately when the board is available.
 
 ## Troubleshooting
 
@@ -179,10 +200,13 @@ incomplete generated checkout cannot be used silently.
 
 ### The ABI processor is not started
 
-This is expected when the Rust ABI static library is not linked or its ABI
-version does not match. The module falls back to the disabled processor. Use
-the native ABI test to validate the adapter independently, and track full
-Xtensa portability as a follow-up milestone.
+The release build is expected to stop before producing a flashable image when
+the Rust ABI static library is unavailable or its symbols are not link-visible.
+The startup path also fails closed if the ABI version does not match, so it
+does not silently run the disabled processor. Use the native ABI test to
+validate the adapter independently. A successful release build should show
+`[LogicSmith] processor: embedded Rust ABI` on the serial monitor; if it does
+not, do not flash that image.
 
 ### Dependency downloads fail
 
