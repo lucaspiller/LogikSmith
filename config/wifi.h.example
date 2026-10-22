@@ -1,0 +1,6 @@
+#pragma once
+
+// Copy to config/wifi.h and fill in the local network credentials.
+#define LOGIKSMITH_WIFI_SSID ""
+#define LOGIKSMITH_WIFI_PASSWORD ""
+#define LOGIKSMITH_OTA_PASSWORD ""

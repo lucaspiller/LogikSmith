@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "OpenKNX/Module.h"
 
 #include "logiksmith_openknx/abi_runtime_processor.h"
@@ -20,7 +22,9 @@ class LogicSmithModule final : public OpenKNX::Module {
     const std::string version() override;
     uint16_t flashSize() override;
 
+    void setup(bool configured) override;
     void setup() override;
+    void loop(bool configured) override;
     void loop() override;
     void processBeforeRestart() override;
 
@@ -48,11 +52,23 @@ class LogicSmithModule final : public OpenKNX::Module {
     void set_management_server(ManagementServer* server) { _management_server = server; }
 
   private:
+    enum class RuntimeStartupStatus : uint8_t {
+        idle,
+        starting,
+        initialized,
+        active,
+        failed,
+    };
+
+    static void runtime_start_task(void* context);
     static void on_raw_group(void* context,
                              uint16_t source_address,
                              uint16_t destination_address,
                              const uint8_t* payload,
                              uint8_t payload_size);
+    void start_runtime();
+    void setup_wifi();
+    void process_wifi_ota();
     void ingest_raw_group(uint16_t source_address,
                           uint16_t destination_address,
                           const uint8_t* payload,
@@ -63,10 +79,16 @@ class LogicSmithModule final : public OpenKNX::Module {
     OpenKnxRawSender _sender;
     AbiRuntimeProcessor _abi_processor;
     DisabledRuntimeProcessor _disabled_processor;
+    std::atomic<RuntimeStartupStatus> _runtime_start_status{RuntimeStartupStatus::idle};
     RuntimeProcessor* _processor = &_disabled_processor;
     ManagementServer* _management_server = nullptr;
+    uint32_t _runtime_start_requested_at_ms = 0;
     bool _raw_hook_registered = false;
+    bool _runtime_start_pending = false;
     bool _runtime_start_failed = false;
+    bool _wifi_enabled = false;
+    bool _wifi_connected = false;
+    bool _ota_started = false;
 };
 
 extern LogicSmithModule logicSmithModule;

@@ -43,19 +43,45 @@ if patch_project_dir is None:
         + ", ".join(str(candidate / "patches") for candidate in project_candidates)
     )
 patch_path = patch_project_dir / "patches" / "knx-raw-group-hooks.patch"
-libdeps_roots = []
+all_libdeps_roots = []
 for project_dir in project_candidates:
     libdeps_root = project_dir / ".pio" / "libdeps"
-    if libdeps_root not in libdeps_roots:
-        libdeps_roots.append(libdeps_root)
+    if libdeps_root not in all_libdeps_roots:
+        all_libdeps_roots.append(libdeps_root)
 
-candidates = []
-for libdeps_root in libdeps_roots:
-    candidates.extend(
-        path
-        for path in libdeps_root.glob("*/knx")
-        if (path / "src" / "knx" / "transport_layer.h").is_file()
-    )
+active_environment = env.subst("$PIOENV")
+active_libdeps_dirs = [
+    libdeps_root / active_environment
+    for libdeps_root in all_libdeps_roots
+    if active_environment and (libdeps_root / active_environment).is_dir()
+]
+# PlatformIO gives each environment its own copy of git dependencies. Prefer
+# the active environment so building USB and OTA profiles in sequence does
+# not look like an ambiguous duplicate installation.
+if active_libdeps_dirs:
+    candidates = [
+        libdeps_dir / "knx"
+        for libdeps_dir in active_libdeps_dirs
+        if (libdeps_dir / "knx" / "src" / "knx" / "transport_layer.h").is_file()
+    ]
+    hardware_candidates = [
+        libdeps_dir / "OGM-HardwareConfig" / "include"
+        for libdeps_dir in active_libdeps_dirs
+        if (libdeps_dir / "OGM-HardwareConfig" / "include" / "HardwareConfig.h").is_file()
+    ]
+else:
+    candidates = []
+    hardware_candidates = []
+    for libdeps_root in all_libdeps_roots:
+        candidates.extend(
+            path
+            for path in libdeps_root.glob("*/knx")
+            if (path / "src" / "knx" / "transport_layer.h").is_file()
+        )
+        for hardware_root in libdeps_root.glob("*/OGM-HardwareConfig"):
+            hardware_include = hardware_root / "include"
+            if (hardware_include / "HardwareConfig.h").is_file():
+                hardware_candidates.append(hardware_include)
 if len(candidates) != 1:
     raise RuntimeError(
         "expected one pinned OpenKNX knx libdep, found: "
@@ -63,12 +89,6 @@ if len(candidates) != 1:
     )
 
 knx_root = candidates[0]
-hardware_candidates = []
-for libdeps_root in libdeps_roots:
-    for hardware_root in libdeps_root.glob("*/OGM-HardwareConfig"):
-        hardware_include = hardware_root / "include"
-        if (hardware_include / "HardwareConfig.h").is_file():
-            hardware_candidates.append(hardware_include)
 if len(hardware_candidates) != 1:
     raise RuntimeError(
         "expected one OGM-HardwareConfig include directory, found: "
