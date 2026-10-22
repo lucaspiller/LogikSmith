@@ -1,9 +1,17 @@
 #include "logiksmith_openknx/logic_smith_module.h"
 
+#include <ArduinoOTA.h>
 #include <Arduino.h>
+#include <WiFi.h>
 
 #include "logiksmith_openknx/default_bindings.h"
 #include "logiksmith_openknx/raw_transport.h"
+
+#if __has_include("../../config/wifi.h")
+#include "../../config/wifi.h"
+#else
+#include "../../config/wifi.h.example"
+#endif
 
 namespace logiksmith {
 namespace openknx {
@@ -48,6 +56,7 @@ void LogicSmithModule::setup() {
 #endif
     }
     _raw_hook_registered = register_raw_group_observer(this, &LogicSmithModule::on_raw_group);
+    setup_wifi();
 }
 
 void LogicSmithModule::processBeforeRestart() {
@@ -74,6 +83,60 @@ void LogicSmithModule::loop() {
     // timers, and output draining retain priority on every pass.
     if (_management_server != nullptr) {
         (void)_management_server->process_one();
+    }
+    process_wifi_ota();
+}
+
+void LogicSmithModule::setup_wifi() {
+    if (LOGIKSMITH_WIFI_SSID[0] == '\0') {
+        Serial.println("[LogikSmith] Wi-Fi disabled; set config/wifi.h");
+        return;
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(LOGIKSMITH_WIFI_SSID, LOGIKSMITH_WIFI_PASSWORD);
+    _wifi_enabled = true;
+    Serial.println("[LogikSmith] connecting to configured Wi-Fi");
+
+    if (LOGIKSMITH_OTA_PASSWORD[0] == '\0') {
+        Serial.println("[LogikSmith] OTA disabled; set LOGIKSMITH_OTA_PASSWORD in config/wifi.h");
+    }
+}
+
+void LogicSmithModule::process_wifi_ota() {
+    if (!_wifi_enabled) {
+        return;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        if (_wifi_connected) {
+            Serial.println("[LogikSmith] Wi-Fi disconnected");
+            _wifi_connected = false;
+        }
+        return;
+    }
+
+    if (!_wifi_connected) {
+        Serial.printf("[LogikSmith] Wi-Fi connected: %s\n", WiFi.localIP().toString().c_str());
+        _wifi_connected = true;
+    }
+
+    if (!_ota_started && LOGIKSMITH_OTA_PASSWORD[0] != '\0') {
+        ArduinoOTA.setHostname("logiksmith-openknx");
+        ArduinoOTA.setPassword(LOGIKSMITH_OTA_PASSWORD);
+        ArduinoOTA.onStart([]() { Serial.println("[LogikSmith] OTA update started"); });
+        ArduinoOTA.onEnd([]() { Serial.println("[LogikSmith] OTA update complete; rebooting"); });
+        ArduinoOTA.onError([](ota_error_t error) {
+            Serial.printf("[LogikSmith] OTA update failed, error %u\n", static_cast<unsigned>(error));
+        });
+        ArduinoOTA.begin();
+        _ota_started = true;
+        Serial.println("[LogikSmith] OTA ready on port 3232");
+    }
+
+    if (_ota_started) {
+        ArduinoOTA.handle();
     }
 }
 

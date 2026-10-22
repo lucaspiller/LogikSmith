@@ -53,6 +53,8 @@ class LogicSmithModule final : public OpenKNX::Module {
                              uint16_t destination_address,
                              const uint8_t* payload,
                              uint8_t payload_size);
+    void setup_wifi();
+    void process_wifi_ota();
     void ingest_raw_group(uint16_t source_address,
                           uint16_t destination_address,
                           const uint8_t* payload,
@@ -67,6 +69,9 @@ class LogicSmithModule final : public OpenKNX::Module {
     ManagementServer* _management_server = nullptr;
     bool _raw_hook_registered = false;
     bool _runtime_start_failed = false;
+    bool _wifi_enabled = false;
+    bool _wifi_connected = false;
+    bool _ota_started = false;
 };
 
 extern LogicSmithModule logicSmithModule;

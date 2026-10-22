@@ -63,7 +63,7 @@ PlatformIO result are the useful signals.
 ## Upload and monitor
 
 Connect the target board, check the port PlatformIO can see, then upload the
-same environment:
+default release environment over USB:
 
 ```sh
 pio device list
@@ -80,8 +80,34 @@ The monitor speed is 115200 baud. If more than one serial port is present,
 select the board explicitly with PlatformIO's `upload_port` and
 `monitor_port` options or the corresponding command-line options.
 
-M14 has not been verified on a physical REG1-LAN-TP-Base device. Treat upload
-as a preparation step until a device test is available.
+## Wi-Fi and OTA upload
+
+Wi-Fi is optional. Copy `config/wifi.h.example` to `config/wifi.h` in the
+repository root and set the SSID, Wi-Fi password, and OTA password there. The
+local header is ignored by Git. Keep each value as a C string literal.
+
+The device connects in station mode without waiting in the OpenKNX setup
+path. Serial reports the assigned IP and, when an OTA password is set, that
+the OTA listener is ready. KNX processing keeps its place in the module loop
+when Wi-Fi is disconnected.
+
+The `REG1-LAN-TP-Base` profile is Ethernet-focused. Wi-Fi will only associate
+if the controller PCB has a usable antenna connected to the ESP32 RF path.
+
+After the first USB upload, update firmware over Wi-Fi with the OTA
+environment and the IP printed on serial:
+
+```sh
+pio run \
+  --project-dir logiksmith-openknx \
+  --environment release_LogikSmith_REG1_LAN_TP_Base_ota \
+  --target upload \
+  --upload-port 192.168.1.42
+```
+
+The OTA environment uses PlatformIO's ESP32 OTA uploader and reads its
+authentication password from `config/wifi.h`. The default release environment
+continues to use USB, so the device can always be recovered over serial.
 
 ## Default group-address bindings
 
