@@ -13,6 +13,7 @@ export interface DisplayCapabilities {
   externalInputs: boolean;
   httpInputs: boolean;
   webhookInputs: boolean;
+  persistentState: boolean;
   [name: string]: boolean;
 }
 export interface DisplayHostMeta {
@@ -85,7 +86,8 @@ export interface DisplaySignalEffect { endpoint: string; signal: string; dpt: st
 export interface DisplayCausalLink { producerExecutionId: number; consumerExecutionId: number; signal: string | null; producerBlockId?: string | null; consumerBlockId?: string | null; }
 export type DisplayTimerEffectAction = 'scheduled' | 'replaced' | 'cancelled' | 'cancel_noop';
 export interface DisplayTimerEffect { name: string; action: DisplayTimerEffectAction; afterMs: number | null; dueAtMs: number | null; previousDueAtMs: number | null; }
-export interface DisplayTransition { state: DisplayState; effects: DisplayExecutionEffect[]; signalEffects: DisplaySignalEffect[]; timers: DisplayTimerEffect[]; }
+export interface DisplayPersistentEffects { set: DisplayState; delete: string[]; }
+export interface DisplayTransition { state: DisplayState; effects: DisplayExecutionEffect[]; signalEffects: DisplaySignalEffect[]; timers: DisplayTimerEffect[]; persistent: DisplayPersistentEffects; }
 
 export interface DisplaySignalProducer { blockId: string; endpoint: string; executionId: number | null; }
 export interface DisplaySignalConsumer { blockId: string; endpoint: string; }
@@ -279,6 +281,7 @@ export interface DisplayBlock {
   bindings: DisplayBinding[];
   signalBindings: DisplaySignalBinding[];
   state: DisplayState;
+  persistentState: DisplayState;
   pendingTimers: DisplayPendingTimer[];
   schedules: DisplayBlockSchedule[];
   executions: DisplayExecution[];
@@ -375,6 +378,13 @@ export interface DisplayOperations {
   fatal: string | null;
 }
 
+export type DisplayPersistentStoreStatus = 'healthy' | 'degraded' | 'disabled';
+export interface DisplayPersistentStore {
+  status: DisplayPersistentStoreStatus;
+  unsaved: boolean;
+  reason: string | null;
+}
+
 export interface DisplaySnapshot {
   revision: RevisionToken;
   connection: { state: ConnectionState };
@@ -406,6 +416,7 @@ export interface DisplaySnapshot {
   telegrams: DisplayTelegram[];
   logs: DisplayLog[];
   blocks: DisplayBlock[];
+  persistentStore: DisplayPersistentStore;
   operations?: DisplayOperations;
   meta?: DisplayHostMeta;
 }

@@ -28,6 +28,7 @@ impl Engine {
             logic_revision: self.active_logic_revision(),
             known_inputs: self.known_input_values(),
             state: self.state.clone(),
+            persistent_state: self.persistent_state.clone(),
             pending_timers: self.pending_timers(),
         }
     }
@@ -38,6 +39,30 @@ impl Engine {
 
     pub fn transient_state(&self) -> &TransientState {
         self.state()
+    }
+
+    pub fn persistent_state(&self) -> &PersistentState {
+        &self.persistent_state
+    }
+
+    pub fn persistent_state_enabled(&self) -> bool {
+        self.persistent_state_enabled
+    }
+
+    pub fn set_persistent_state_enabled(&mut self, enabled: bool) {
+        self.persistent_state_enabled = enabled;
+        if !enabled {
+            self.persistent_state.clear();
+        }
+    }
+
+    pub fn load_persistent_state(
+        &mut self,
+        persistent_state: PersistentState,
+    ) -> Result<(), StateError> {
+        validate_combined_state_with_limits(&self.state, &persistent_state, &self.limits)?;
+        self.persistent_state = persistent_state;
+        Ok(())
     }
 
     pub fn pending_timers(&self) -> Vec<PendingTimer> {

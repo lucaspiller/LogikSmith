@@ -18,6 +18,7 @@ pub struct CompiledCapabilities {
     pub astronomy: bool,
     pub http_inputs: bool,
     pub webhook_inputs: bool,
+    pub persistent_state: bool,
 }
 
 /// Capabilities compiled into this binary.
@@ -26,6 +27,7 @@ pub const COMPILED_CAPABILITIES: CompiledCapabilities = CompiledCapabilities {
     astronomy: logiksmith_core::compiled_features().astronomy,
     http_inputs: logiksmith_core::compiled_features().http_inputs,
     webhook_inputs: logiksmith_core::compiled_features().webhook_inputs,
+    persistent_state: true,
 };
 
 /// Returns the immutable capability record used by diagnostics and health
@@ -47,7 +49,8 @@ mod tests {
                 "timezones": cfg!(feature = "timezones"),
                 "astronomy": cfg!(feature = "astronomy"),
                 "http_inputs": cfg!(feature = "http-inputs"),
-                "webhook_inputs": cfg!(feature = "webhook-inputs")
+                "webhook_inputs": cfg!(feature = "webhook-inputs"),
+                "persistent_state": true
             })
         );
     }

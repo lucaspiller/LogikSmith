@@ -128,6 +128,15 @@ async fn record_and_dispatch_cascade_with_origin(
     schedule_handling: Option<ScheduleHandling>,
     origin: Option<diagnostics::ExecutionOrigin>,
 ) -> Result<(), HostError> {
+    let persistent_changed = executions.iter().any(|execution| {
+        matches!(
+            &execution.execution.outcome,
+            Ok(transition)
+                if !transition.persistent.set.is_empty()
+                    || !transition.persistent.delete.is_empty()
+        )
+    });
+    let mut dispatch_error = None;
     for execution in executions {
         store.record_block_execution_with_origin(
             &execution,
@@ -140,7 +149,7 @@ async fn record_and_dispatch_cascade_with_origin(
         if let Some((stdin, next_request_id, pending)) = bridge.as_mut()
             && let Ok(transition) = &execution.execution.outcome
         {
-            dispatch_effects(
+            if let Err(error) = dispatch_effects(
                 store,
                 stdin,
                 automation,
@@ -149,10 +158,20 @@ async fn record_and_dispatch_cascade_with_origin(
                 next_request_id,
                 pending,
             )
-            .await?;
+            .await
+            {
+                dispatch_error = Some(error);
+                break;
+            }
         }
     }
+    if persistent_changed && let Err(error) = store.persist_runtime_state(runtime) {
+        tracing::error!(target: "logiksmith", error = %error, "persistent state save failed; live state remains active");
+    }
     store.set_runtime_projection_from_runtime(runtime, now);
+    if let Some(error) = dispatch_error {
+        return Err(error);
+    }
     Ok(())
 }
 
