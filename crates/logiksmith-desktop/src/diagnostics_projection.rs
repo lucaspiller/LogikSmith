@@ -185,6 +185,7 @@ pub fn simulation_response(
             .map(|transition| transition.timers.clone())
             .unwrap_or_default(),
         error,
+        trace: trace_record(&execution.trace),
     }
 }
 
@@ -250,6 +251,90 @@ pub fn simulation_response_for_block(
             .map(|transition| transition.timers.clone())
             .unwrap_or_default(),
         error,
+        trace: trace_record(&execution.trace),
+    }
+}
+
+fn trace_record(trace: &logiksmith_core::ExecutionTrace) -> ExecutionTraceRecord {
+    ExecutionTraceRecord {
+        entries: trace
+            .entries
+            .iter()
+            .map(|entry| ExecutionTraceEntryRecord {
+                line: entry.line,
+                locals: entry
+                    .locals
+                    .iter()
+                    .map(|(name, value)| (name.clone(), trace_value_record(value)))
+                    .collect(),
+            })
+            .collect(),
+        truncated: trace.truncated,
+    }
+}
+
+fn trace_value_record(value: &logiksmith_core::TraceValue) -> TraceValueRecord {
+    match value {
+        logiksmith_core::TraceValue::Nil => TraceValueRecord {
+            kind: "nil".to_owned(),
+            value: None,
+            reason: None,
+            truncated: false,
+        },
+        logiksmith_core::TraceValue::Boolean(value) => TraceValueRecord {
+            kind: "boolean".to_owned(),
+            value: Some(JsonValue::Bool(*value)),
+            reason: None,
+            truncated: false,
+        },
+        logiksmith_core::TraceValue::Integer(value) => TraceValueRecord {
+            kind: "integer".to_owned(),
+            value: Some(if value.unsigned_abs() <= 9_007_199_254_740_991 {
+                JsonValue::Number((*value).into())
+            } else {
+                JsonValue::String(value.to_string())
+            }),
+            reason: None,
+            truncated: false,
+        },
+        logiksmith_core::TraceValue::Number(value) => TraceValueRecord {
+            kind: "number".to_owned(),
+            value: serde_json::Number::from_f64(*value).map(JsonValue::Number),
+            reason: None,
+            truncated: false,
+        },
+        logiksmith_core::TraceValue::String(value) => TraceValueRecord {
+            kind: "string".to_owned(),
+            value: Some(JsonValue::String(value.clone())),
+            reason: None,
+            truncated: false,
+        },
+        logiksmith_core::TraceValue::Table {
+            entries,
+            truncated,
+        } => TraceValueRecord {
+            kind: "table".to_owned(),
+            value: Some(JsonValue::Object(
+                entries
+                    .iter()
+                    .map(|(key, value)| (key.clone(), trace_value_record(value)))
+                    .map(|(key, value)| {
+                        (
+                            key,
+                            serde_json::to_value(value).unwrap_or(JsonValue::Null),
+                        )
+                    })
+                    .collect(),
+            )),
+            reason: None,
+            truncated: *truncated,
+        },
+        logiksmith_core::TraceValue::Unsupported { kind, reason } => TraceValueRecord {
+            kind: kind.clone(),
+            value: None,
+            reason: Some(reason.clone()),
+            truncated: false,
+        },
     }
 }
 

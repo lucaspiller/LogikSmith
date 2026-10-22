@@ -102,7 +102,7 @@ impl Engine {
                 let snapshots = self.input_snapshots(now);
                 let state_before = self.state.clone();
                 let persistent_state_before = self.persistent_state.clone();
-                let outcome = execute_logic(
+                let evaluated = execute_logic_with_trace(
                     &self.config.endpoints,
                     &self.config.logic,
                     &snapshots,
@@ -116,6 +116,8 @@ impl Engine {
                     &self.limits,
                     budget_probe,
                 );
+                let outcome = evaluated.outcome;
+                let trace = evaluated.trace;
                 let (state_after, persistent_state_after) = resulting_state_after_execution(
                     &state_before,
                     &persistent_state_before,
@@ -147,7 +149,7 @@ impl Engine {
                     outcome,
                     site,
                     utc_unix_ms,
-                )))
+                ).with_trace(trace)))
             }
         }
     }

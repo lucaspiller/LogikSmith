@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::lua::execute_logic;
+use crate::lua::execute_logic_with_trace;
 use crate::state::{
     apply_timer_effects, resulting_state_after_execution,
     validate_combined_state_with_limits, validate_pending_timer_map_with_limits,
@@ -351,7 +351,7 @@ impl Engine {
         let snapshots = self.input_snapshots(now);
         let state_before = self.state.clone();
         let persistent_state_before = self.persistent_state.clone();
-        let outcome = execute_logic(
+        let evaluated = execute_logic_with_trace(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
@@ -365,6 +365,8 @@ impl Engine {
             &self.limits,
             budget_probe,
         );
+        let outcome = evaluated.outcome;
+        let trace = evaluated.trace;
         let (state_after, persistent_state_after) = resulting_state_after_execution(
             &state_before,
             &persistent_state_before,
@@ -396,7 +398,7 @@ impl Engine {
             outcome,
             site,
             utc_unix_ms,
-        )))
+        ).with_trace(trace)))
     }
 
     pub fn process_due_timer(&mut self, now: MonotonicMs) -> Result<Option<Execution>, EventError> {
@@ -509,7 +511,7 @@ impl Engine {
         );
         let state_before = self.state.clone();
         let persistent_state_before = self.persistent_state.clone();
-        let outcome = execute_logic(
+        let evaluated = execute_logic_with_trace(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
@@ -523,6 +525,8 @@ impl Engine {
             &self.limits,
             None,
         );
+        let outcome = evaluated.outcome;
+        let trace = evaluated.trace;
         let (state_after, persistent_state_after) = resulting_state_after_execution(
             &state_before,
             &persistent_state_before,
@@ -556,7 +560,7 @@ impl Engine {
             outcome,
             &default_site(),
             None,
-        ))
+        ).with_trace(trace))
     }
 
     pub fn simulate_timer(
@@ -600,7 +604,7 @@ impl Engine {
         });
         let state_before = scenario.state;
         let persistent_state_before = self.persistent_state.clone();
-        let outcome = execute_logic(
+        let evaluated = execute_logic_with_trace(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
@@ -614,6 +618,8 @@ impl Engine {
             &self.limits,
             None,
         );
+        let outcome = evaluated.outcome;
+        let trace = evaluated.trace;
         let (state_after, persistent_state_after) = resulting_state_after_execution(
             &state_before,
             &persistent_state_before,
@@ -647,7 +653,7 @@ impl Engine {
             outcome,
             &default_site(),
             None,
-        ))
+        ).with_trace(trace))
     }
 
     /// Evaluates the active source against a delivered schedule trigger. The
@@ -678,7 +684,7 @@ impl Engine {
         let snapshots = self.input_snapshots(now);
         let state_before = self.state.clone();
         let persistent_state_before = self.persistent_state.clone();
-        let outcome = execute_logic(
+        let evaluated = execute_logic_with_trace(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
@@ -692,6 +698,8 @@ impl Engine {
             &self.limits,
             budget_probe,
         );
+        let outcome = evaluated.outcome;
+        let trace = evaluated.trace;
         let (state_after, persistent_state_after) = resulting_state_after_execution(
             &state_before,
             &persistent_state_before,
@@ -723,7 +731,7 @@ impl Engine {
             outcome,
             site,
             utc_unix_ms,
-        ))
+        ).with_trace(trace))
     }
 
     /// Simulates one delivered schedule trigger against the current input
@@ -738,7 +746,7 @@ impl Engine {
         let snapshots = self.input_snapshots(MonotonicMs(0));
         let state_before = self.state.clone();
         let persistent_state_before = self.persistent_state.clone();
-        let outcome = execute_logic(
+        let evaluated = execute_logic_with_trace(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
@@ -752,6 +760,8 @@ impl Engine {
             &self.limits,
             None,
         );
+        let outcome = evaluated.outcome;
+        let trace = evaluated.trace;
         let (state_after, persistent_state_after) = resulting_state_after_execution(
             &state_before,
             &persistent_state_before,
@@ -785,7 +795,7 @@ impl Engine {
             outcome,
             site,
             utc_unix_ms,
-        )
+        ).with_trace(trace)
     }
 
     pub(crate) fn validate_input(
@@ -923,7 +933,7 @@ impl Engine {
                 return Err(SimulationError::DuplicateTimer(timer_name));
             }
         }
-        let outcome = execute_logic(
+        let evaluated = execute_logic_with_trace(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
@@ -937,6 +947,8 @@ impl Engine {
             &self.limits,
             None,
         );
+        let outcome = evaluated.outcome;
+        let trace = evaluated.trace;
         let (state_after, persistent_state_after) = resulting_state_after_execution(
             &state_before,
             &persistent_state_before,
@@ -970,7 +982,7 @@ impl Engine {
             outcome,
             &default_site(),
             None,
-        ))
+        ).with_trace(trace))
     }
 }
 
