@@ -17,6 +17,7 @@ mod runtime;
 pub mod schedule;
 mod state;
 mod support;
+mod trace;
 mod values;
 
 pub use blocks::*;
@@ -29,6 +30,7 @@ pub use program::*;
 pub use runtime::*;
 pub use schedule::*;
 pub use state::*;
+pub use trace::*;
 pub use values::*;
 
 pub const MAX_LOGIC_SOURCE_BYTES: usize = 64 * 1024;

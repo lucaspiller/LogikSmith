@@ -272,6 +272,7 @@ pub struct Execution {
     /// The frozen wall-clock context this execution captured (unavailable
     /// sentinels when no wall-clock instant was supplied).
     pub time_context: TimeContext,
+    pub trace: ExecutionTrace,
 }
 
 impl Execution {
@@ -303,7 +304,13 @@ impl Execution {
             signal_effects: Vec::new(),
             eligible_consumers: Vec::new(),
             time_context: TimeContext::capture(site, utc_unix_ms),
+            trace: ExecutionTrace::default(),
         }
+    }
+
+    pub(crate) fn with_trace(mut self, trace: ExecutionTrace) -> Self {
+        self.trace = trace;
+        self
     }
 
     pub(crate) fn set_runtime_metadata(

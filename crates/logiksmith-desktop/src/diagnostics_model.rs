@@ -535,6 +535,34 @@ pub struct ExecutionRecord {
     pub origin: Option<ExecutionOrigin>,
     pub timer_effects: Vec<LogicalTimerEffectRecord>,
     pub error: Option<LogicErrorRecord>,
+    pub trace: ExecutionTraceRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ExecutionTraceRecord {
+    pub entries: Vec<ExecutionTraceEntryRecord>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ExecutionTraceEntryRecord {
+    pub line: u32,
+    pub locals: BTreeMap<String, TraceValueRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct TraceValueRecord {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub truncated: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -743,6 +771,7 @@ pub struct SimulationResponse {
     pub eligible_consumers: Vec<SignalConsumerSnapshot>,
     pub timer_effects: Vec<LogicalTimerEffectRecord>,
     pub error: Option<LogicErrorRecord>,
+    pub trace: ExecutionTraceRecord,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

@@ -801,6 +801,7 @@ impl DiagnosticStore {
             causal_links,
             origin,
             error: error.clone(),
+            trace: trace_record(&semantic.trace),
         };
         let max_history = inner.limits.execution_history_per_block;
         let (block_revision, block_state, block_pending, block_executions) = {

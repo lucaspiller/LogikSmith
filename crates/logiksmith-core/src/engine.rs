@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::lua::execute_logic;
+use crate::lua::execute_logic_with_trace;
 use crate::state::{
     apply_timer_effects, merge_state_with_limits, validate_pending_timer_map_with_limits,
     validate_pending_timers_with_limits, validate_state_map_with_limits,
@@ -345,7 +345,7 @@ impl Engine {
         let public_trigger = Trigger::Timer(trigger.clone());
         let snapshots = self.input_snapshots(now);
         let state_before = self.state.clone();
-        let outcome = execute_logic(
+        let evaluated = execute_logic_with_trace(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
@@ -357,6 +357,8 @@ impl Engine {
             &self.limits,
             budget_probe,
         );
+        let outcome = evaluated.outcome;
+        let trace = evaluated.trace;
         let mut state_after = state_before.clone();
         let mut pending_timers = self.pending_timers();
         if let Ok(transition) = &outcome {
@@ -382,7 +384,7 @@ impl Engine {
             outcome,
             site,
             utc_unix_ms,
-        )))
+        ).with_trace(trace)))
     }
 
     pub fn process_due_timer(&mut self, now: MonotonicMs) -> Result<Option<Execution>, EventError> {
@@ -494,7 +496,7 @@ impl Engine {
             scenario.trigger.previous,
         );
         let state_before = self.state.clone();
-        let outcome = execute_logic(
+        let evaluated = execute_logic_with_trace(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
@@ -506,6 +508,8 @@ impl Engine {
             &self.limits,
             None,
         );
+        let outcome = evaluated.outcome;
+        let trace = evaluated.trace;
         let state_after = outcome
             .as_ref()
             .ok()
@@ -538,7 +542,7 @@ impl Engine {
             outcome,
             &default_site(),
             None,
-        ))
+        ).with_trace(trace))
     }
 
     /// Simulates an input using explicit copied state, timers, and execution
@@ -597,7 +601,7 @@ impl Engine {
             scheduled_logic_revision: timer.scheduled_logic_revision,
         });
         let state_before = scenario.state;
-        let outcome = execute_logic(
+        let evaluated = execute_logic_with_trace(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
@@ -609,6 +613,8 @@ impl Engine {
             &self.limits,
             None,
         );
+        let outcome = evaluated.outcome;
+        let trace = evaluated.trace;
         let state_after = outcome
             .as_ref()
             .ok()
@@ -641,7 +647,7 @@ impl Engine {
             outcome,
             &default_site(),
             None,
-        ))
+        ).with_trace(trace))
     }
 
     /// Evaluates the active source against a delivered schedule trigger. The
@@ -671,7 +677,7 @@ impl Engine {
         let public_trigger = Trigger::Schedule(trigger);
         let snapshots = self.input_snapshots(now);
         let state_before = self.state.clone();
-        let outcome = execute_logic(
+        let evaluated = execute_logic_with_trace(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
@@ -683,6 +689,8 @@ impl Engine {
             &self.limits,
             budget_probe,
         );
+        let outcome = evaluated.outcome;
+        let trace = evaluated.trace;
         let mut state_after = state_before.clone();
         let mut pending_timers = self.pending_timers();
         if let Ok(transition) = &outcome {
@@ -708,7 +716,7 @@ impl Engine {
             outcome,
             site,
             utc_unix_ms,
-        ))
+        ).with_trace(trace))
     }
 
     /// Simulates one delivered schedule trigger against the current input
@@ -722,7 +730,7 @@ impl Engine {
     ) -> Execution {
         let snapshots = self.input_snapshots(MonotonicMs(0));
         let state_before = self.state.clone();
-        let outcome = execute_logic(
+        let evaluated = execute_logic_with_trace(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
@@ -734,6 +742,8 @@ impl Engine {
             &self.limits,
             None,
         );
+        let outcome = evaluated.outcome;
+        let trace = evaluated.trace;
         let state_after = outcome
             .as_ref()
             .ok()
@@ -766,7 +776,7 @@ impl Engine {
             outcome,
             site,
             utc_unix_ms,
-        )
+        ).with_trace(trace)
     }
 
     pub(crate) fn validate_input(
@@ -903,7 +913,7 @@ impl Engine {
                 return Err(SimulationError::DuplicateTimer(timer_name));
             }
         }
-        let outcome = execute_logic(
+        let evaluated = execute_logic_with_trace(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
@@ -915,6 +925,8 @@ impl Engine {
             &self.limits,
             None,
         );
+        let outcome = evaluated.outcome;
+        let trace = evaluated.trace;
         let state_after = outcome
             .as_ref()
             .ok()
@@ -947,7 +959,7 @@ impl Engine {
             outcome,
             &default_site(),
             None,
-        ))
+        ).with_trace(trace))
     }
 }
 

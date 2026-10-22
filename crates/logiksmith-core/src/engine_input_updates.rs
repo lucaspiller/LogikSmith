@@ -101,7 +101,7 @@ impl Engine {
                 let trigger = input_trigger(endpoint, value, previous);
                 let snapshots = self.input_snapshots(now);
                 let state_before = self.state.clone();
-                let outcome = execute_logic(
+                let evaluated = execute_logic_with_trace(
                     &self.config.endpoints,
                     &self.config.logic,
                     &snapshots,
@@ -113,6 +113,8 @@ impl Engine {
                     &self.limits,
                     budget_probe,
                 );
+                let outcome = evaluated.outcome;
+                let trace = evaluated.trace;
                 let mut state_after = state_before.clone();
                 let mut pending_timers = self.pending_timers();
                 if let Ok(transition) = &outcome {
@@ -138,7 +140,7 @@ impl Engine {
                     outcome,
                     site,
                     utc_unix_ms,
-                )))
+                ).with_trace(trace)))
             }
         }
     }

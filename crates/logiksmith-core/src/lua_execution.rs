@@ -3,7 +3,12 @@
 /// and no coordinates. Combined with `None` as the wall-clock instant this
 /// yields the unavailable time-context sentinel.
 
-pub(crate) fn execute_logic(
+pub(crate) struct LuaExecution {
+    pub(crate) outcome: Result<Transition, LogicError>,
+    pub(crate) trace: ExecutionTrace,
+}
+
+pub(crate) fn execute_logic_with_trace(
     endpoints: &[Endpoint],
     program: &LogicProgram,
     snapshots: &[InputSnapshot],
@@ -14,6 +19,39 @@ pub(crate) fn execute_logic(
     time_context: &TimeContext,
     limits: &RuntimeLimits,
     budget_probe: Option<std::sync::Arc<dyn BudgetProbe>>,
+) -> LuaExecution {
+    let trace = TraceCapture::new(limits);
+    let outcome = execute_logic_inner(
+        endpoints,
+        program,
+        snapshots,
+        trigger,
+        state,
+        pending_timers,
+        now,
+        time_context,
+        limits,
+        budget_probe,
+        trace.clone(),
+    );
+    LuaExecution {
+        outcome,
+        trace: trace.finish(),
+    }
+}
+
+fn execute_logic_inner(
+    endpoints: &[Endpoint],
+    program: &LogicProgram,
+    snapshots: &[InputSnapshot],
+    trigger: &Trigger,
+    state: &TransientState,
+    pending_timers: &BTreeMap<TimerName, PendingTimer>,
+    now: MonotonicMs,
+    time_context: &TimeContext,
+    limits: &RuntimeLimits,
+    budget_probe: Option<std::sync::Arc<dyn BudgetProbe>>,
+    trace: TraceCapture,
 ) -> Result<Transition, LogicError> {
     // Validate size even though an active program was previously checked. It
     // keeps this boundary correct if a LogicProgram is constructed directly.
@@ -21,7 +59,7 @@ pub(crate) fn execute_logic(
     let lua = new_lua(limits).map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
     let environment =
         restricted_environment(&lua).map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
-    install_instruction_hook(&lua, limits, budget_probe);
+    install_instruction_hook(&lua, limits, budget_probe, Some(trace.clone()));
 
     let chunk = lua
         .load(program.source.as_str())
@@ -32,6 +70,7 @@ pub(crate) fn execute_logic(
     chunk
         .call::<()>(())
         .map_err(|error| map_lua_error(error, LuaPhase::Load))?;
+    trace.clear();
     let handle = match environment
         .get::<LuaValue>("handle")
         .map_err(|error| map_lua_error(error, LuaPhase::Load))?

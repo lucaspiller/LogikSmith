@@ -557,11 +557,11 @@ async fn run_session(
                     Message::KnxEvent(event) => {
                         let destination = event.destination_address();
                         let logical_endpoint = config.automation.address_to_inputs.get(&destination).and_then(|bindings| bindings.first()).map(|binding| binding.endpoint.clone());
-                        store.record_telegram(TelegramRecord::from_event(&event, logical_endpoint.as_ref()));
-                        let Some(bindings) = config.automation.address_to_inputs.get(&destination) else { continue };
-                        if event.value.is_none() { continue; }
                         let sample = clock_sample(store);
                         let now = sample.monotonic_ms;
+                        store.record_telegram_at(TelegramRecord::from_event(&event, logical_endpoint.as_ref()), now);
+                        let Some(bindings) = config.automation.address_to_inputs.get(&destination) else { continue };
+                        if event.value.is_none() { continue; }
                         if event.service == "group_value_write" {
                             let input_value = match event.typed_value()? {
                                 Some(value) => value,

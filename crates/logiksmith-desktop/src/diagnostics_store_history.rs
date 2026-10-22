@@ -96,6 +96,7 @@ impl DiagnosticStore {
             causal_links,
             origin: None,
             error,
+            trace: trace_record(&execution.trace),
         });
         inner.state = state_record(&execution.state_after);
         inner.pending_timers = execution

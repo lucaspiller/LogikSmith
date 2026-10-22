@@ -1,4 +1,4 @@
-import type { DashboardState, DisplayDateTimeValue, DisplayExecutionTrigger, DisplaySnapshot, DisplayStateValue } from './dashboard-types';
+import type { DashboardState, DisplayDateTimeValue, DisplayExecutionTrigger, DisplaySnapshot, DisplayStateValue, DisplayTimeContext } from './dashboard-types';
 import type { RevisionToken } from './revision';
 
 export function formatCountdown(milliseconds: number | null): string { if (milliseconds === null || !Number.isFinite(milliseconds)) return '—'; const value = Math.max(0, milliseconds); if (value >= 60_000) return `${Math.floor(value / 60_000)}:${Math.floor((value % 60_000) / 1_000).toString().padStart(2, '0')}`; return `${(value / 1_000).toFixed(1)} s`; }
@@ -38,6 +38,14 @@ export function formatDateTimeValue(value: DisplayDateTimeValue | null): string 
   if (!value || !value.available) return '—';
   const fields = `${String(value.year)}-${padTwo(value.month)}-${padTwo(value.day)} ${padTwo(value.hour)}:${padTwo(value.minute)}:${padTwo(value.second)}`;
   return value.weekday ? `${fields} (${value.weekday})` : fields;
+}
+/** Uses the captured site-local time when available, with monotonic runtime time as a fallback. */
+export function formatExecutionTime(timeMs: number, context: DisplayTimeContext | null): string {
+  const value = context?.now;
+  if (value?.available && value.hour !== null && value.minute !== null && value.second !== null) {
+    return `${padTwo(value.hour)}:${padTwo(value.minute)}:${padTwo(value.second)}`;
+  }
+  return `${timeMs} ms`;
 }
 /** Renders a UTC epoch instant as "2026-08-29 05:30:00 UTC". */
 export function formatUtcDateTime(utcMs: number): string {
