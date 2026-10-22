@@ -30,6 +30,12 @@ pub struct RuntimeLimits {
     pub max_combined_effects_per_execution: usize,
     pub max_cascade_executions: usize,
     pub max_live_executions_per_block_per_second: usize,
+    pub max_trace_entries_per_execution: usize,
+    pub max_trace_locals_per_entry: usize,
+    pub max_trace_value_depth: usize,
+    pub max_trace_table_entries: usize,
+    pub max_trace_string_bytes: usize,
+    pub max_trace_bytes: usize,
 }
 
 impl RuntimeLimits {
@@ -89,6 +95,12 @@ impl RuntimeProfile {
                 max_combined_effects_per_execution: 128,
                 max_cascade_executions: 256,
                 max_live_executions_per_block_per_second: 128,
+                max_trace_entries_per_execution: 128,
+                max_trace_locals_per_entry: 32,
+                max_trace_value_depth: 3,
+                max_trace_table_entries: 32,
+                max_trace_string_bytes: 1024,
+                max_trace_bytes: 32 * 1024,
             },
             Self::EmbeddedBaseline => RuntimeLimits {
                 max_logic_blocks: 32,
@@ -114,6 +126,12 @@ impl RuntimeProfile {
                 max_combined_effects_per_execution: 32,
                 max_cascade_executions: 64,
                 max_live_executions_per_block_per_second: 32,
+                max_trace_entries_per_execution: 32,
+                max_trace_locals_per_entry: 16,
+                max_trace_value_depth: 2,
+                max_trace_table_entries: 8,
+                max_trace_string_bytes: 256,
+                max_trace_bytes: 4 * 1024,
             },
         }
     }

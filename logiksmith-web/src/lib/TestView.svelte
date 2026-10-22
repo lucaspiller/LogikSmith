@@ -3,9 +3,10 @@
   import { fetchScheduleOccurrences, simulateScenario, SimulationApiError } from './api';
   import { simulateBlockDraft, BlockApiError } from './block-api';
   import { applySimulationResult, forceTriggerInput, schedulePreviewDefault, toSimulationScenario, validateSimulationDraft, type SimulationDraft, type SimulationValue } from './simulation';
-  import type { DisplayBlock, DisplaySimulation } from './dashboard-types';
+  import type { DisplayBlock, DisplaySimulation, DisplayStateValue } from './dashboard-types';
   import type { RevisionToken } from './revision';
   import { formatValue, formatDuration, formatStateEntry, triggerSummary } from './format';
+  import ExecutionTraceView from './ExecutionTraceView.svelte';
 
   export let block: DisplayBlock;
   export let source: string;
@@ -22,7 +23,9 @@
   let previewLoading = false;
   let previewError: string | null = null;
   let previewKey = '';
+  let newStateKey = '';
   $: draftErrors = validateSimulationDraft(simulationDraft);
+  $: stateEntries = Object.entries(simulationDraft.state).sort(([left], [right]) => left.localeCompare(right));
   $: revision = block.activeRevision ?? block.activeLogicRevision;
   $: canRun = revision !== null && !stale && !running && draftErrors.length === 0;
   $: triggerInput = simulationDraft.triggerType === 'input' ? simulationDraft.inputs.find((input) => input.endpoint === simulationDraft.triggerEndpoint) ?? null : null;
@@ -35,6 +38,35 @@
   }
   function inputValue(event: Event): string { return (event.currentTarget as HTMLInputElement).value; }
   function selectValue(event: Event): string { return (event.currentTarget as HTMLSelectElement).value; }
+  function stateKind(event: Event): DisplayStateValue['kind'] { return selectValue(event) as DisplayStateValue['kind']; }
+  function stateValueAs(value: DisplayStateValue, kind: DisplayStateValue['kind']): DisplayStateValue {
+    if (value.kind === kind) return value;
+    if (kind === 'bool') return { kind, value: value.kind === 'string' ? value.value.toLowerCase() === 'true' : value.value !== 0 };
+    if (kind === 'string') return { kind, value: String(value.value) };
+    const numeric = Number(value.value);
+    if (kind === 'integer') return { kind, value: Number.isSafeInteger(numeric) ? numeric : Number.isSafeInteger(Math.trunc(numeric)) ? Math.trunc(numeric) : 0 };
+    return { kind, value: Number.isFinite(numeric) ? numeric : 0 };
+  }
+  function updateStateEntry(key: string, value: DisplayStateValue): void { update({ state: { ...simulationDraft.state, [key]: value } }); }
+  function updateStateNumber(key: string, kind: 'integer' | 'number', event: Event): void {
+    const raw = inputValue(event).trim();
+    if (!raw) return;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || (kind === 'integer' && !Number.isSafeInteger(value))) return;
+    updateStateEntry(key, { kind, value });
+  }
+  function hasStateKey(key: string): boolean { return Object.prototype.hasOwnProperty.call(simulationDraft.state, key); }
+  function addStateEntry(): void {
+    const key = newStateKey.trim();
+    if (!key || hasStateKey(key)) return;
+    update({ state: { ...simulationDraft.state, [key]: { kind: 'bool', value: false } } });
+    newStateKey = '';
+  }
+  function removeStateEntry(key: string): void {
+    const state = { ...simulationDraft.state };
+    delete state[key];
+    update({ state });
+  }
   function booleanValue(event: Event): SimulationValue { const value = selectValue(event); return value === '' ? null : value === 'true'; }
   function numericValue(event: Event): SimulationValue { const raw = inputValue(event).trim(); if (!raw) return null; const value = Number(raw); return Number.isFinite(value) ? value : null; }
   function ageValue(event: Event): number | null { const value = numericValue(event); return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null; }
@@ -70,8 +102,8 @@
   }
 </script>
 
-<section class="panel workbench-view simulation-panel" aria-label="Test view">
-  <div class="section-heading"><div><p class="eyebrow">Test</p><h2>Draft simulation — {block.id}</h2><p class="subtle">Runs this exact source in a throwaway restricted program. No live outputs, state, timers, signals, or history are changed.</p></div><span class="revision-badge">Base {revision ?? '—'}</span></div>
+<section class="panel workbench-view simulation-panel" aria-label="Simulation view">
+  <div class="section-heading"><div><p class="eyebrow">Simulate</p><h2>Draft simulation — {block.id}</h2><p class="subtle">Runs this exact source in a throwaway restricted program. No live outputs, state, timers, signals, or history are changed.</p></div><span class="revision-badge">Base {revision ?? '—'}</span></div>
   {#if stale}<div class="restart-notice" role="status">The live stream is stale. Scenario editing remains available; run is paused until a fresh snapshot.</div>{/if}
   <div class="simulation-kind" role="group" aria-label="Simulation trigger type"><span>Trigger type</span>{#each ['input', 'timer', 'schedule'] as kind}<label><input type="radio" name={`simulation-trigger-${block.id}`} checked={simulationDraft.triggerType === kind} on:change={() => setTriggerType(kind as SimulationDraft['triggerType'])} /> {kind}</label>{/each}</div>
   {#if simulationDraft.triggerType === 'input'}
@@ -81,9 +113,36 @@
   {:else}
     <div class="simulation-trigger-fields"><label>Schedule<select aria-label="Simulation schedule" value={simulationDraft.triggerScheduleName} on:change={(event) => setSchedule(selectValue(event))}><option value="">Choose schedule</option>{#each block.schedules as schedule}<option value={schedule.name}>{schedule.name} — {schedule.ruleSummary}</option>{/each}</select></label><label>Occurrence<select aria-label="Simulation occurrence" value={simulationDraft.scheduleOccurrenceAtMs === null ? '' : String(simulationDraft.scheduleOccurrenceAtMs)} on:change={(event) => { const value = Number(selectValue(event)); update({ scheduleOccurrenceAtMs: Number.isInteger(value) && value >= 0 ? value : null }); }}>{#if !simulationDraft.schedulePreviews.length}<option value="">{simulationDraft.scheduleOccurrenceAtMs === null ? 'Choose occurrence' : 'Next occurrence'}</option>{:else}{#each simulationDraft.schedulePreviews as occurrence, index}<option value={occurrence.utcMs}>{occurrence.local ?? String(occurrence.utcMs)}{index === 0 ? ' — next' : ''}</option>{/each}{/if}</select></label>{#if previewLoading}<span class="subtle">Loading occurrence previews…</span>{/if}{#if previewError}<span class="alert" role="alert">{previewError}</span>{/if}</div>
   {/if}
+  <div class="section-heading simulation-state-heading"><div><h3>State seed</h3><p class="subtle">Starting state for this run. Changes stay inside the simulation.</p></div><span>{stateEntries.length} keys</span></div>
+  {#if stateEntries.length}
+    <div class="table-wrap"><table class="simulation-table"><thead><tr><th>Key</th><th>Type</th><th>Value</th><th></th></tr></thead><tbody>
+      {#each stateEntries as [key, value]}
+        <tr>
+          <td><code>{key}</code></td>
+          <td><select aria-label={`Simulation state ${key} type`} value={value.kind} on:change={(event) => updateStateEntry(key, stateValueAs(value, stateKind(event)))}><option value="bool">boolean</option><option value="integer">integer</option><option value="number">number</option><option value="string">string</option></select></td>
+          <td>
+            {#if value.kind === 'bool'}
+              <select aria-label={`Simulation state ${key} value`} value={String(value.value)} on:change={(event) => updateStateEntry(key, { kind: 'bool', value: selectValue(event) === 'true' })}><option value="false">false</option><option value="true">true</option></select>
+            {:else if value.kind === 'integer' || value.kind === 'number'}
+              <input aria-label={`Simulation state ${key} value`} type="number" step={value.kind === 'integer' ? '1' : 'any'} value={value.value} on:change={(event) => updateStateNumber(key, value.kind, event)} />
+            {:else}
+              <input aria-label={`Simulation state ${key} value`} type="text" value={value.value} on:input={(event) => updateStateEntry(key, { kind: 'string', value: inputValue(event) })} />
+            {/if}
+          </td>
+          <td><button type="button" class="small-button" aria-label={`Remove state ${key}`} on:click={() => removeStateEntry(key)}>Remove</button></td>
+        </tr>
+      {/each}
+    </tbody></table></div>
+  {:else}
+    <p class="empty">No state keys in this seed.</p>
+  {/if}
+  <form class="simulation-add-state" on:submit|preventDefault={addStateEntry}>
+    <label>New state key<input aria-label="New simulation state key" bind:value={newStateKey} placeholder="key name" /></label>
+    <button type="submit" class="small-button" disabled={!newStateKey.trim() || hasStateKey(newStateKey.trim())}>Add state key</button>
+  </form>
   <h3>Input snapshot</h3><div class="table-wrap"><table class="simulation-table"><thead><tr><th>Input</th><th>DPT</th><th>Value</th><th>Valid</th><th>Age</th></tr></thead><tbody>{#each simulationDraft.inputs as input, index}{@const trigger = simulationDraft.triggerType === 'input' && simulationDraft.triggerEndpoint === input.endpoint}<tr class:simulation-trigger-row={trigger}><td><code>{input.endpoint}</code></td><td>{input.dpt}</td><td>{#if input.dpt === '1.001'}<select aria-label={`Simulation ${input.endpoint} value`} disabled={!input.valid || trigger} value={input.value === null ? '' : String(input.value)} on:change={(event) => update({ inputs: simulationDraft.inputs.map((item, current) => current === index ? { ...item, value: booleanValue(event) } : item) })}><option value="">Choose value</option><option value="false">false</option><option value="true">true</option></select>{:else}<input aria-label={`Simulation ${input.endpoint} value`} disabled={!input.valid || trigger} type="number" value={input.value ?? ''} on:input={(event) => update({ inputs: simulationDraft.inputs.map((item, current) => current === index ? { ...item, value: numericValue(event) } : item) })} />{/if}</td><td><input aria-label={`Simulation ${input.endpoint} validity`} type="checkbox" checked={input.valid} disabled={trigger} on:change={(event) => update({ inputs: simulationDraft.inputs.map((item, current) => current === index ? { ...item, valid: (event.currentTarget as HTMLInputElement).checked } : item) })} /></td><td><input aria-label={`Simulation ${input.endpoint} age`} disabled={!input.valid || trigger} type="number" min="0" value={input.ageMs ?? ''} on:input={(event) => update({ inputs: simulationDraft.inputs.map((item, current) => current === index ? { ...item, ageMs: ageValue(event) } : item) })} /></td></tr>{/each}</tbody></table></div>
   {#if draftErrors.length}<div class="validation-summary" role="alert"><ul>{#each draftErrors as item}<li>{item}</li>{/each}</ul></div>{/if}
   {#if error}<div class="logic-error simulation-error" role="alert">{error}{#if fieldErrors.length}<ul>{#each fieldErrors as item}<li>{item}</li>{/each}</ul>{/if}</div>{/if}
   <div class="editor-actions"><button type="button" class="save-button" disabled={!canRun} on:click={run}>{running ? 'Running…' : 'Run simulation'}</button><span class="subtle">A successful simulation is advisory; it never enters live history.</span></div>
-  {#if result}<article class:simulation-failed={result.status === 'failed'} class="simulation-result" aria-label="Simulation result"><div class="section-heading"><h3>Simulation {result.status}</h3><span class="revision-badge">Source {sourceKey}</span></div>{#if result.error}<div class="logic-error" role="alert"><strong>{result.error.category}</strong>{#if result.error.line !== null} line {result.error.line}:{/if} {result.error.message}</div>{:else}<p>{triggerSummary(result.trigger)} · {formatDuration(result.durationUs)}</p><section aria-label="Simulation capture"><div class="result-grid"><div><h4>State after</h4>{#if Object.keys(result.stateAfter).length}<ul>{#each Object.entries(result.stateAfter) as [key, value]}<li><code>{key}</code> = {formatStateEntry(value)}</li>{/each}</ul>{:else}<p class="empty">No state keys.</p>{/if}</div><div><h4>Proposed outputs</h4>{#if result.effects.length}<ul>{#each result.effects as effect}<li><code>{effect.endpoint}</code> = {formatValue(effect.value)} → <code>{effect.destination}</code></li>{/each}</ul>{:else}<p class="empty">No KNX outputs.</p>{/if}</div><div><h4>Proposed signal effects</h4>{#if result.signalEffects.length}<ul>{#each result.signalEffects as effect}<li><code>{effect.signal}</code> = {formatValue(effect.value)}</li>{/each}</ul>{:else}<p class="empty">No signal outputs.</p>{/if}{#if result.eligibleConsumers.length}<p><strong>Eligible consumers (not executed)</strong>: {result.eligibleConsumers.map((item) => `${item.blockId}.${item.endpoint}`).join(', ')}</p>{/if}<p class="subtle">This draft does not propagate or execute them.</p></div><div><h4>Proposed timers</h4>{#if result.timerEffects.length}<ul>{#each result.timerEffects as effect}<li><code>{effect.name}</code>: {effect.action}</li>{/each}</ul>{:else}<p class="empty">No timer operations.</p>{/if}</div></div></section>{/if}<p class="subtle no-write-note">No KNX write sent. Simulation result is labelled with its source fingerprint and base revision.</p></article>{/if}
+  {#if result}<article class:simulation-failed={result.status === 'failed'} class="simulation-result" aria-label="Simulation result"><div class="section-heading"><h3>Simulation {result.status}</h3><span class="revision-badge">Source {sourceKey}</span></div>{#if result.error}<div class="logic-error" role="alert"><strong>{result.error.category}</strong>{#if result.error.line !== null} line {result.error.line}:{/if} {result.error.message}</div>{:else}<p>{triggerSummary(result.trigger)} · {formatDuration(result.durationUs)}</p><section aria-label="Simulation capture"><div class="result-grid"><div><h4>State after</h4>{#if Object.keys(result.stateAfter).length}<ul>{#each Object.entries(result.stateAfter) as [key, value]}<li><code>{key}</code> = {formatStateEntry(value)}</li>{/each}</ul>{:else}<p class="empty">No state keys.</p>{/if}</div><div><h4>Proposed outputs</h4>{#if result.effects.length}<ul>{#each result.effects as effect}<li><code>{effect.endpoint}</code> = {formatValue(effect.value)} → <code>{effect.destination}</code></li>{/each}</ul>{:else}<p class="empty">No KNX outputs.</p>{/if}</div><div><h4>Proposed signal effects</h4>{#if result.signalEffects.length}<ul>{#each result.signalEffects as effect}<li><code>{effect.signal}</code> = {formatValue(effect.value)}</li>{/each}</ul>{:else}<p class="empty">No signal outputs.</p>{/if}{#if result.eligibleConsumers.length}<p><strong>Eligible consumers (not executed)</strong>: {result.eligibleConsumers.map((item) => `${item.blockId}.${item.endpoint}`).join(', ')}</p>{/if}<p class="subtle">This draft does not propagate or execute them.</p></div><div><h4>Proposed timers</h4>{#if result.timerEffects.length}<ul>{#each result.timerEffects as effect}<li><code>{effect.name}</code>: {effect.action}</li>{/each}</ul>{:else}<p class="empty">No timer operations.</p>{/if}</div></div></section>{/if}<p class="subtle no-write-note">No KNX write sent. Simulation result is labelled with its source fingerprint and base revision.</p></article><ExecutionTraceView source={source} trace={result.trace} title="Simulation trace" />{/if}
 </section>

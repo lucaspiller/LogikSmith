@@ -7,9 +7,13 @@ function compareRevision(left: RevisionToken, right: RevisionToken): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 function staleState(state: DashboardState, error: string | null = state.error): DashboardState { return { ...state, streamStatus: 'stale', stale: true, staleAtMs: state.staleAtMs ?? state.nowMs, error }; }
+function executionsForBlock(snapshot: DisplaySnapshot, blockId: string | null | undefined) {
+  const local = snapshot.blocks.find((item) => item.id === blockId)?.executions ?? [];
+  return local.length ? local : blockId ? snapshot.executions.filter((execution) => execution.blockId === blockId) : snapshot.executions;
+}
 function reconcileSelection(state: DashboardState, snapshot: DisplaySnapshot): Pick<DashboardState, 'selectedExecutionId' | 'selectionPinned' | 'selectionNotice'> {
   const block = snapshot.blocks.find((item) => item.id === state.selectedBlockId) ?? snapshot.blocks[0];
-  const executions = block?.executions ?? snapshot.executions;
+  const executions = executionsForBlock(snapshot, block?.id);
   const newest = executions[0]?.executionId ?? null;
   if (!state.selectionPinned) return { selectedExecutionId: newest, selectionPinned: false, selectionNotice: null };
   if (state.selectedExecutionId !== null && executions.some((execution) => execution.executionId === state.selectedExecutionId)) return { selectedExecutionId: state.selectedExecutionId, selectionPinned: true, selectionNotice: null };
@@ -33,12 +37,14 @@ export function reduceDashboardState(state: DashboardState, action: DashboardAct
     }
     case 'select_execution': {
       if (!state.snapshot) return state;
-      const owner = state.snapshot.blocks.find((blockValue) => blockValue.executions.some((item) => item.executionId === action.executionId));
-      const execution = owner?.executions.find((item) => item.executionId === action.executionId) ?? state.snapshot.executions.find((item) => item.executionId === action.executionId);
+      const execution = state.snapshot.executions.find((item) => item.executionId === action.executionId)
+        ?? state.snapshot.blocks.flatMap((blockValue) => blockValue.executions).find((item) => item.executionId === action.executionId);
       if (!execution) return state;
-      const newest = owner?.executions[0]?.executionId ?? state.snapshot.executions[0]?.executionId; return { ...state, selectedBlockId: owner?.id ?? state.selectedBlockId, selectedExecutionId: execution.executionId, selectionPinned: execution.executionId !== newest, selectionNotice: null };
+      const owner = state.snapshot.blocks.find((blockValue) => blockValue.executions.some((item) => item.executionId === action.executionId))
+        ?? (execution.blockId ? state.snapshot.blocks.find((blockValue) => blockValue.id === execution.blockId) : undefined);
+      const newest = executionsForBlock(state.snapshot, owner?.id ?? state.selectedBlockId)[0]?.executionId; return { ...state, selectedBlockId: owner?.id ?? state.selectedBlockId, selectedExecutionId: execution.executionId, selectionPinned: execution.executionId !== newest, selectionNotice: null };
     }
-    case 'select_block': { if (!state.snapshot?.blocks.some((item) => item.id === action.blockId)) return state; const selected = state.snapshot.blocks.find((item) => item.id === action.blockId); return { ...state, selectedBlockId: action.blockId, selectedExecutionId: selected?.executions[0]?.executionId ?? null, selectionPinned: false, selectionNotice: null }; }
+    case 'select_block': { if (!state.snapshot?.blocks.some((item) => item.id === action.blockId)) return state; const newest = executionsForBlock(state.snapshot, action.blockId)[0]?.executionId ?? null; return { ...state, selectedBlockId: action.blockId, selectedExecutionId: newest, selectionPinned: false, selectionNotice: null }; }
     case 'tick': return { ...state, nowMs: action.nowMs };
   }
 }

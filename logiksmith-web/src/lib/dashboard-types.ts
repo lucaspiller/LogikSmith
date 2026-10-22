@@ -80,6 +80,14 @@ export interface DisplayScheduleExecutionTrigger {
 export type DisplayExecutionTrigger = DisplayInputExecutionTrigger | DisplayTimerExecutionTrigger | DisplayScheduleExecutionTrigger;
 
 export interface DisplayExecutionInput { endpoint: string; dpt: string; value: boolean | number | null; valid: boolean; ageMs: number | null; }
+export interface DisplayTraceValue {
+  kind: string;
+  value?: boolean | number | string | Record<string, DisplayTraceValue>;
+  reason?: string;
+  truncated?: boolean;
+}
+export interface DisplayTraceEntry { line: number; locals: Record<string, DisplayTraceValue>; }
+export interface DisplayExecutionTrace { entries: DisplayTraceEntry[]; truncated: boolean; }
 export interface DisplayExecutionEffect { endpoint: string; destination: string; dpt: string; value: boolean | number; }
 export interface DisplaySignalEffect { endpoint: string; signal: string; dpt: string; value: boolean | number; changed?: boolean; producer?: DisplaySignalProducer | null; producingExecutionId?: number | null; consumers?: DisplaySignalConsumer[]; }
 export interface DisplayCausalLink { producerExecutionId: number; consumerExecutionId: number; signal: string | null; producerBlockId?: string | null; consumerBlockId?: string | null; }
@@ -259,6 +267,8 @@ export interface DisplayExecution {
   timerEffects: DisplayTimerEffect[];
   /** Captured time context; null only for legacy records without one. */
   timeContext: DisplayTimeContext | null;
+  /** Bounded line and local-variable capture; empty for older hosts. */
+  trace: DisplayExecutionTrace;
   error: DisplayLogicError | null;
 }
 
@@ -316,10 +326,11 @@ export interface DisplaySimulation {
   timerEffects: DisplayTimerEffect[];
   pendingTimers: DisplayPendingTimer[];
   timeContext: DisplayTimeContext | null;
+  trace: DisplayExecutionTrace;
   error: DisplayLogicError | null;
 }
 
-export interface DisplayTelegram { time: string; source: string | null; destination: string; service: string; dpt: string; value: boolean | number | null; }
+export interface DisplayTelegram { time: string; timeMs: number | null; source: string | null; destination: string; endpoint: string | null; service: string; dpt: string; value: boolean | number | null; }
 export interface DisplayLog { time: string; level: string; target: string; message: string; fields: Record<string, string | number | boolean | null>; }
 /** Legacy single-timer projection retained only for old desktop snapshots. */
 export interface DisplayTimer { state: TimerState; deadlineMs: number | null; remainingMs: number | null; sampledAtMs: number; }
