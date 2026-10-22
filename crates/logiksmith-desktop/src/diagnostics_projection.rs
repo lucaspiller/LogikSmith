@@ -338,6 +338,7 @@ fn transition_record(
     else {
         return LogicalTransitionRecord {
             state: state_record(&transition.state),
+            persistent: persistent_effects_record(&transition.persistent),
             effects: Vec::new(),
             signal_effects: Vec::new(),
             timers: transition_timer_records(transition),
@@ -353,6 +354,7 @@ fn transition_record_for_block(
 ) -> LogicalTransitionRecord {
     LogicalTransitionRecord {
         state: state_record(&transition.state),
+        persistent: persistent_effects_record(&transition.persistent),
         effects: transition
             .outputs
             .iter()
@@ -360,6 +362,15 @@ fn transition_record_for_block(
             .collect(),
         signal_effects: Vec::new(),
         timers: transition_timer_records(transition),
+    }
+}
+
+fn persistent_effects_record(
+    effects: &logiksmith_core::PersistentPatch,
+) -> PersistentEffectsRecord {
+    PersistentEffectsRecord {
+        set: state_record(&effects.set),
+        delete: effects.delete.iter().cloned().collect(),
     }
 }
 

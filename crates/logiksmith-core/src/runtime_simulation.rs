@@ -61,6 +61,8 @@ impl Runtime {
             &self.site,
             Some(request.occurrence_at_utc_ms),
         );
+        self.validate_simulated_total_state(&request.block_id, &execution)
+            .map_err(ScheduleSimulationError::InvalidInput)?;
         self.annotate_simulation(&request.block_id, &mut execution);
         Ok(BlockExecution {
             block_id: request.block_id,
@@ -82,6 +84,11 @@ impl Runtime {
                 error,
             }
         })?;
+        self.validate_simulated_total_state(block_id, &execution)
+            .map_err(|error| RuntimeSimulationError::Block {
+                block_id: block_id.clone(),
+                error,
+            })?;
         self.annotate_simulation(block_id, &mut execution);
         Ok(BlockExecution {
             block_id: block_id.clone(),
@@ -103,6 +110,11 @@ impl Runtime {
         let mut execution = block
             .engine
             .simulate_input_with_state(scenario, state, pending_timers, now)
+            .map_err(|error| RuntimeSimulationError::Block {
+                block_id: block_id.clone(),
+                error,
+            })?;
+        self.validate_simulated_total_state(block_id, &execution)
             .map_err(|error| RuntimeSimulationError::Block {
                 block_id: block_id.clone(),
                 error,
@@ -135,6 +147,11 @@ impl Runtime {
                 block_id: block_id.clone(),
                 error,
             })?;
+        self.validate_simulated_total_state(block_id, &execution)
+            .map_err(|error| RuntimeSimulationError::Block {
+                block_id: block_id.clone(),
+                error,
+            })?;
         self.annotate_simulation(block_id, &mut execution);
         Ok(BlockExecution {
             block_id: block_id.clone(),
@@ -156,6 +173,11 @@ impl Runtime {
                 error,
             }
         })?;
+        self.validate_simulated_total_state(block_id, &execution)
+            .map_err(|error| RuntimeSimulationError::Block {
+                block_id: block_id.clone(),
+                error,
+            })?;
         self.annotate_simulation(block_id, &mut execution);
         Ok(BlockExecution {
             block_id: block_id.clone(),
@@ -176,6 +198,11 @@ impl Runtime {
         let mut execution = block
             .engine
             .simulate_timer_with_source(source, scenario)
+            .map_err(|error| RuntimeSimulationError::Block {
+                block_id: block_id.clone(),
+                error,
+            })?;
+        self.validate_simulated_total_state(block_id, &execution)
             .map_err(|error| RuntimeSimulationError::Block {
                 block_id: block_id.clone(),
                 error,
@@ -249,10 +276,41 @@ impl Runtime {
                 Some(request.occurrence_at_utc_ms),
             )
             .map_err(ScheduleSimulationError::InvalidSource)?;
+        self.validate_simulated_total_state(&request.block_id, &execution)
+            .map_err(ScheduleSimulationError::InvalidInput)?;
         self.annotate_simulation(&request.block_id, &mut execution);
         Ok(BlockExecution {
             block_id: request.block_id,
             execution,
         })
+    }
+
+    fn validate_simulated_total_state(
+        &self,
+        block_id: &BlockId,
+        execution: &Execution,
+    ) -> Result<(), SimulationError> {
+        if execution.outcome.is_err() {
+            return Ok(());
+        }
+        let Some(block) = self.block(block_id) else {
+            return Ok(());
+        };
+        let current_block_bytes = state_bytes(block.engine.state())
+            .saturating_add(state_bytes(block.engine.persistent_state()));
+        let projected_block_bytes = state_bytes(&execution.state_after)
+            .saturating_add(state_bytes(&execution.persistent_state_after));
+        let actual = self
+            .usage()
+            .state_bytes
+            .saturating_sub(current_block_bytes)
+            .saturating_add(projected_block_bytes);
+        if actual > self.limits.max_state_bytes_total {
+            return Err(SimulationError::InvalidState(StateError::TotalTooLarge {
+                actual,
+                maximum: self.limits.max_state_bytes_total,
+            }));
+        }
+        Ok(())
     }
 }

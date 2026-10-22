@@ -211,6 +211,7 @@ _Static_assert(sizeof(LogiksmithEffect) == 144, "unexpected LogiksmithEffect ABI
 typedef struct LogiksmithRuntime LogiksmithRuntime;
 
 uint32_t logiksmith_abi_version(void);
+uint8_t logiksmith_persistent_state_supported(void);
 
 int32_t logiksmith_runtime_create_from_document(
     const LogiksmithRuntimeDocument *document,

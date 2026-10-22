@@ -7,6 +7,7 @@ pub mod diagnostics;
 mod external;
 mod host;
 mod host_limits;
+mod persistent_store;
 mod protocol;
 mod simulation;
 pub mod web;

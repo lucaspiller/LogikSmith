@@ -146,6 +146,7 @@ pub struct OutcomeProjection {
     pub state: BTreeMap<String, StateMessage>,
     pub outputs: Vec<OutputProjection>,
     pub timers: Vec<TimerEffectProjection>,
+    pub persistent: PersistentEffectProjection,
     pub error: Option<SourceErrorProjection>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -158,6 +159,11 @@ pub struct TimerEffectProjection {
     pub name: String,
     pub action: String,
     pub due_at_ms: Option<u64>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PersistentEffectProjection {
+    pub set: BTreeMap<String, StateMessage>,
+    pub delete: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SourceErrorProjection {
@@ -175,6 +181,7 @@ pub struct BlockProjection {
     pub logic_revision: Revision,
     pub inputs: Vec<InputProjection>,
     pub state: BTreeMap<String, StateMessage>,
+    pub persistent_state: BTreeMap<String, StateMessage>,
     pub pending_timers: Vec<TimerMessage>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -245,6 +252,7 @@ pub struct RuntimeApi {
     pub(crate) structural_revision: u64,
     pub(crate) document_revision: u64,
     pub(crate) block_revisions: BTreeMap<String, u64>,
+    capabilities: crate::Capabilities,
 }
 
 impl RuntimeApi {
@@ -262,9 +270,8 @@ impl RuntimeApi {
         };
         let automation = build_automation_with_capabilities(document.clone(), profile, caps)
             .map_err(|errors| OperationError::Invalid { errors })?;
-        let runtime =
-            CoreRuntime::try_new_with_limits(automation.core_config.clone(), profile.limits())
-                .map_err(|e| OperationError::Runtime(e.to_string()))?;
+        let runtime = CoreRuntime::try_new_with_profile(automation.core_config.clone(), profile)
+            .map_err(|e| OperationError::Runtime(e.to_string()))?;
         let block_revisions = automation
             .document
             .blocks
@@ -278,7 +285,11 @@ impl RuntimeApi {
             structural_revision: automation.structural_revision,
             document_revision: 0,
             block_revisions,
+            capabilities: caps,
         })
+    }
+    pub fn capabilities(&self) -> crate::Capabilities {
+        self.capabilities
     }
     pub fn runtime(&self) -> &CoreRuntime {
         &self.runtime
@@ -645,6 +656,7 @@ impl RuntimeApi {
                     logic_revision: b.logic_revision.into(),
                     inputs: b.inputs.into_iter().map(input_projection).collect(),
                     state: state_projection(&b.state),
+                    persistent_state: state_projection(&b.persistent_state),
                     pending_timers: b.pending_timers.into_iter().map(timer_projection).collect(),
                 })
                 .collect(),
@@ -838,6 +850,14 @@ fn state_projection(state: &logiksmith_core::TransientState) -> BTreeMap<String,
         })
         .collect()
 }
+fn persistent_projection(
+    patch: &logiksmith_core::PersistentPatch,
+) -> PersistentEffectProjection {
+    PersistentEffectProjection {
+        set: state_projection(&patch.set),
+        delete: patch.delete.iter().cloned().collect(),
+    }
+}
 fn input_projection(input: InputSnapshot) -> InputProjection {
     InputProjection {
         endpoint: input.endpoint.to_string(),
@@ -901,6 +921,7 @@ fn execution_projection(execution: &Execution) -> ExecutionProjection {
                     },
                 })
                 .collect(),
+            persistent: persistent_projection(&t.persistent),
             error: None,
         },
         Err(e) => OutcomeProjection {
@@ -908,6 +929,10 @@ fn execution_projection(execution: &Execution) -> ExecutionProjection {
             state: BTreeMap::new(),
             outputs: Vec::new(),
             timers: Vec::new(),
+            persistent: PersistentEffectProjection {
+                set: BTreeMap::new(),
+                delete: Vec::new(),
+            },
             error: Some(SourceErrorProjection {
                 category: e.category().into(),
                 message: e.message().into(),

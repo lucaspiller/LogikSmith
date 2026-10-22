@@ -75,6 +75,15 @@ impl Eq for StateValue {}
 
 pub type TransientState = BTreeMap<String, StateValue>;
 pub type StatePatch = BTreeMap<String, StateValue>;
+/// Durable scalar values owned by a host and exposed to Lua as `persistent`.
+pub type PersistentState = BTreeMap<String, StateValue>;
+
+/// Atomic set/delete operations returned by one Lua execution.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PersistentPatch {
+    pub set: StatePatch,
+    pub delete: std::collections::BTreeSet<String>,
+}
 
 impl StateValue {
     pub fn validate(&self, key: &str) -> Result<(), StateError> {
@@ -154,6 +163,34 @@ impl fmt::Display for StateError {
 
 impl Error for StateError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PersistentStateError {
+    Disabled,
+    UnknownBlock(BlockId),
+    InvalidBlockState { block_id: BlockId, error: StateError },
+    RuntimeStateTooLarge { actual: usize, maximum: usize },
+}
+
+impl fmt::Display for PersistentStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disabled => formatter.write_str("persistent state is disabled for this runtime"),
+            Self::UnknownBlock(block_id) => {
+                write!(formatter, "persistent state refers to unknown block {block_id}")
+            }
+            Self::InvalidBlockState { block_id, error } => {
+                write!(formatter, "invalid persistent state for block {block_id}: {error}")
+            }
+            Self::RuntimeStateTooLarge { actual, maximum } => write!(
+                formatter,
+                "runtime state uses {actual} bytes; maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for PersistentStateError {}
+
 /// An operation committed against one named timer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TimerAction {
@@ -182,6 +219,7 @@ pub struct TimerEffect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Transition {
     pub state: StatePatch,
+    pub persistent: PersistentPatch,
     pub outputs: Vec<OutputEffect>,
     pub timers: Vec<TimerEffect>,
 }
@@ -190,6 +228,7 @@ impl Default for Transition {
     fn default() -> Self {
         Self {
             state: BTreeMap::new(),
+            persistent: PersistentPatch::default(),
             outputs: Vec::new(),
             timers: Vec::new(),
         }
@@ -261,6 +300,8 @@ pub struct Execution {
     pub inputs: Vec<InputSnapshot>,
     pub state_before: TransientState,
     pub state_after: TransientState,
+    pub persistent_state_before: PersistentState,
+    pub persistent_state_after: PersistentState,
     pub pending_timers: Vec<PendingTimer>,
     pub outcome: Result<Transition, LogicError>,
     /// Signal values proposed by this execution. Live runtimes populate this
@@ -285,6 +326,8 @@ impl Execution {
         inputs: Vec<InputSnapshot>,
         state_before: TransientState,
         state_after: TransientState,
+        persistent_state_before: PersistentState,
+        persistent_state_after: PersistentState,
         pending_timers: Vec<PendingTimer>,
         outcome: Result<Transition, LogicError>,
         site: &SiteTimeConfig,
@@ -298,6 +341,8 @@ impl Execution {
             inputs,
             state_before,
             state_after,
+            persistent_state_before,
+            persistent_state_after,
             pending_timers,
             outcome,
             signal_effects: Vec::new(),
@@ -326,17 +371,7 @@ impl Execution {
 }
 
 pub(crate) fn validate_state_entry(key: &str, value: &StateValue) -> Result<(), StateError> {
-    if key.is_empty() {
-        return Err(StateError::EmptyKey);
-    }
-    let key_bytes = key.len();
-    if key_bytes > MAX_STATE_KEY_BYTES {
-        return Err(StateError::KeyTooLarge {
-            key: key.to_owned(),
-            actual: key_bytes,
-            maximum: MAX_STATE_KEY_BYTES,
-        });
-    }
+    validate_state_key(key)?;
     match value {
         StateValue::String(value) if value.len() > MAX_STATE_STRING_BYTES => {
             return Err(StateError::StringTooLarge {
@@ -351,6 +386,21 @@ pub(crate) fn validate_state_entry(key: &str, value: &StateValue) -> Result<(), 
             });
         }
         _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_state_key(key: &str) -> Result<(), StateError> {
+    if key.is_empty() {
+        return Err(StateError::EmptyKey);
+    }
+    let key_bytes = key.len();
+    if key_bytes > MAX_STATE_KEY_BYTES {
+        return Err(StateError::KeyTooLarge {
+            key: key.to_owned(),
+            actual: key_bytes,
+            maximum: MAX_STATE_KEY_BYTES,
+        });
     }
     Ok(())
 }
@@ -384,6 +434,48 @@ pub(crate) fn validate_state_map_with_limits(
         });
     }
     Ok(())
+}
+
+pub(crate) fn validate_combined_state_with_limits(
+    state: &TransientState,
+    persistent: &PersistentState,
+    limits: &RuntimeLimits,
+) -> Result<(), StateError> {
+    let entries = state.len().saturating_add(persistent.len());
+    if entries > limits.max_state_entries_per_block {
+        return Err(StateError::TooManyEntries {
+            actual: entries,
+            maximum: limits.max_state_entries_per_block,
+        });
+    }
+    validate_state_map_contents(state)?;
+    validate_state_map_contents(persistent)?;
+    let bytes = state_bytes(state).saturating_add(state_bytes(persistent));
+    if bytes > limits.max_state_bytes_per_block {
+        return Err(StateError::TotalTooLarge {
+            actual: bytes,
+            maximum: limits.max_state_bytes_per_block,
+        });
+    }
+    Ok(())
+}
+
+fn validate_state_map_contents(state: &TransientState) -> Result<(), StateError> {
+    for (key, value) in state {
+        validate_state_entry(key, value)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn state_bytes(state: &TransientState) -> usize {
+    state
+        .iter()
+        .fold(0usize, |total, (key, value)| {
+            total.saturating_add(key.len()).saturating_add(match value {
+                StateValue::String(value) => value.len(),
+                _ => 0,
+            })
+        })
 }
 
 pub(crate) fn validate_pending_timers_with_limits(
@@ -434,6 +526,50 @@ pub(crate) fn merge_state_with_limits(
     }
     validate_state_map_with_limits(&merged, limits)?;
     Ok(merged)
+}
+
+pub(crate) fn apply_persistent_patch(
+    current: &PersistentState,
+    patch: &PersistentPatch,
+) -> PersistentState {
+    let mut merged = current.clone();
+    for key in &patch.delete {
+        merged.remove(key);
+    }
+    merged.extend(patch.set.clone());
+    merged
+}
+
+pub(crate) fn merge_combined_state_with_limits(
+    state: &TransientState,
+    state_patch: &StatePatch,
+    persistent: &PersistentState,
+    persistent_patch: &PersistentPatch,
+    limits: &RuntimeLimits,
+) -> Result<(TransientState, PersistentState), StateError> {
+    let next_state = merge_state_with_limits(state, state_patch, limits)?;
+    let next_persistent = apply_persistent_patch(persistent, persistent_patch);
+    validate_combined_state_with_limits(&next_state, &next_persistent, limits)?;
+    Ok((next_state, next_persistent))
+}
+
+pub(crate) fn resulting_state_after_execution(
+    state: &TransientState,
+    persistent: &PersistentState,
+    outcome: &Result<Transition, LogicError>,
+    limits: &RuntimeLimits,
+) -> (TransientState, PersistentState) {
+    match outcome {
+        Ok(transition) => merge_combined_state_with_limits(
+            state,
+            &transition.state,
+            persistent,
+            &transition.persistent,
+            limits,
+        )
+        .expect("validated transition state must merge"),
+        Err(_) => (state.clone(), persistent.clone()),
+    }
 }
 
 pub(crate) fn apply_timer_effects(

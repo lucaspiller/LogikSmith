@@ -47,6 +47,8 @@ pub enum HostError {
     PendingWriteCapacity { capacity: usize, depth: usize },
     #[error("invalid runtime profile: {0}")]
     InvalidRuntimeProfile(String),
+    #[error("persistent state startup failed: {0}")]
+    PersistentStore(String),
     #[error("fatal host condition: {0}")]
     FatalHost(String),
     #[error("bridge I/O error: {0}")]
@@ -83,9 +85,13 @@ pub async fn run_simulation_only(config: RuntimeConfig) -> Result<(), HostError>
     init_logging(config.logging, store.clone());
     store.set_connection(ConnectionState::Disconnected);
     let mut runtime =
-        CoreRuntime::try_new_with_limits(config.automation.core_config.clone(), limits.profile.limits()).map_err(|error| {
+        CoreRuntime::try_new_with_profile(config.automation.core_config.clone(), limits.profile).map_err(|error| {
             HostError::Protocol(ProtocolError::Field("automation", error.to_string()))
         })?;
+    store
+        .load_persistent_state(&mut runtime)
+        .map_err(HostError::PersistentStore)?;
+    store.set_runtime_projection_from_runtime(&runtime, store.now());
     let (activation_sender, activation_receiver) = mpsc::channel(limits.activation_queue);
     let (simulation_sender, simulation_receiver) = mpsc::channel(limits.simulation_queue);
     let (external_sender, external_receiver) = mpsc::channel(limits.external_input_queue);
@@ -133,9 +139,13 @@ pub async fn run_with_bridge(
     store.set_host_limits(limits);
     init_logging(config.logging, store.clone());
     let mut runtime =
-        CoreRuntime::try_new_with_limits(config.automation.core_config.clone(), limits.profile.limits()).map_err(|error| {
+        CoreRuntime::try_new_with_profile(config.automation.core_config.clone(), limits.profile).map_err(|error| {
             HostError::Protocol(ProtocolError::Field("automation", error.to_string()))
         })?;
+    store
+        .load_persistent_state(&mut runtime)
+        .map_err(HostError::PersistentStore)?;
+    store.set_runtime_projection_from_runtime(&runtime, store.now());
     let (activation_sender, activation_receiver) = mpsc::channel(limits.activation_queue);
     let (simulation_sender, simulation_receiver) = mpsc::channel(limits.simulation_queue);
     let (external_sender, external_receiver) = mpsc::channel(limits.external_input_queue);

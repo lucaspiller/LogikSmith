@@ -742,6 +742,7 @@ use std::collections::BTreeMap;
             success.outcome,
             Ok(Transition {
                 state: BTreeMap::new(),
+                persistent: PersistentPatch::default(),
                 outputs: Vec::new(),
                 timers: Vec::new(),
             })

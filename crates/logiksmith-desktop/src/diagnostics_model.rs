@@ -68,6 +68,14 @@ pub struct Snapshot {
     /// Host capacity, queue pressure, and fatal-state projection used by the
     /// Operations view and container health tooling.
     pub operations: OperationsSnapshot,
+    pub persistent_store: PersistentStoreSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PersistentStoreSnapshot {
+    pub status: String,
+    pub unsaved: bool,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -365,6 +373,7 @@ pub struct BlockSnapshot {
     pub webhook_bindings: Vec<ExternalBindingSnapshot>,
     pub values: ValuesSnapshot,
     pub state: BTreeMap<String, StateValueRecord>,
+    pub persistent_state: BTreeMap<String, StateValueRecord>,
     pub pending_timers: Vec<PendingTimerRecord>,
     pub executions: Vec<ExecutionRecord>,
     pub schedules: Vec<ScheduleSnapshot>,
@@ -692,10 +701,17 @@ pub struct CausalLinkSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LogicalTransitionRecord {
     pub state: BTreeMap<String, StateValueRecord>,
+    pub persistent: PersistentEffectsRecord,
     pub effects: Vec<LogicalEffectRecord>,
     #[serde(rename = "signalEffects")]
     pub signal_effects: Vec<LogicalSignalEffectRecord>,
     pub timers: Vec<LogicalTimerEffectRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PersistentEffectsRecord {
+    pub set: BTreeMap<String, StateValueRecord>,
+    pub delete: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -816,6 +832,8 @@ pub struct EventSubscription {
 pub struct DiagnosticStore {
     inner: Arc<Mutex<Inner>>,
     events: broadcast::Sender<DiagnosticUpdate>,
+    state_store: Arc<crate::persistent_store::PersistentStateStore>,
+    persisted_state: Arc<Mutex<Option<BTreeMap<logiksmith_core::BlockId, logiksmith_core::PersistentState>>>>,
     origin: Instant,
 }
 struct Inner {
@@ -861,6 +879,7 @@ struct Inner {
     operations: OperationsSnapshot,
     block_health_runtime: BTreeMap<String, BlockHealthRuntime>,
     limits: crate::HostLimits,
+    persistent_store: PersistentStoreSnapshot,
 }
 
 /// Internal rolling counters used to project block health without retaining
@@ -898,6 +917,7 @@ struct BlockDiagnosticState {
     saved_logic_revision: u64,
     source: String,
     state: BTreeMap<String, StateValueRecord>,
+    persistent_state: BTreeMap<String, StateValueRecord>,
     pending_timers: Vec<PendingTimerRecord>,
     executions: VecDeque<ExecutionRecord>,
     last_result: Option<LastResultSnapshot>,

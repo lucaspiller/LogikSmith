@@ -16,6 +16,7 @@ impl LogicBlock {
     fn try_new(
         config: BlockConfig,
         limits: &RuntimeLimits,
+        persistent_state_enabled: bool,
     ) -> Result<Self, RuntimeConfigError> {
         let id = config.id.clone();
         config
@@ -26,11 +27,12 @@ impl LogicBlock {
             })?;
         let engine_config =
             EngineConfig::with_program(config.endpoints.clone(), config.logic.clone());
-        let engine =
+        let mut engine =
             Engine::try_new_with_limits(engine_config, *limits).map_err(|error| RuntimeConfigError::InvalidBlock {
                 block_id: config.id.clone(),
                 error: BlockConfigError::Engine(error),
             })?;
+        engine.set_persistent_state_enabled(persistent_state_enabled);
         let health = if config.enabled {
             BlockHealth::Active
         } else {
@@ -100,6 +102,7 @@ impl LogicBlock {
             inputs: self.engine.input_snapshots(now),
             known_inputs: snapshot.known_inputs,
             state: snapshot.state,
+            persistent_state: snapshot.persistent_state,
             pending_timers: snapshot.pending_timers,
         }
     }
@@ -186,6 +189,7 @@ impl LogicBlock {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Runtime {
     pub(crate) limits: RuntimeLimits,
+    persistent_state_enabled: bool,
     blocks: Vec<LogicBlock>,
     signals: Vec<SignalState>,
     signal_indexes: BTreeMap<SignalName, usize>,
