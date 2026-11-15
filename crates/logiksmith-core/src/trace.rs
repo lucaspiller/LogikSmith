@@ -141,10 +141,25 @@ impl TraceCapture {
             self.inner.borrow_mut().trace.truncated = true;
             return;
         }
-        let mut frame = unsafe { std::mem::zeroed::<ffi::lua_Debug>() };
-        if unsafe { ffi::lua_getstack(state, 0, &mut frame) } == 0 {
-            return;
-        }
+        let mut stack_level = 0;
+        let frame = loop {
+            let mut frame = unsafe { std::mem::zeroed::<ffi::lua_Debug>() };
+            if unsafe { ffi::lua_getstack(state, stack_level, &mut frame) } == 0
+                || unsafe {
+                    ffi::lua_getinfo(state, b"Sl\0".as_ptr().cast(), &mut frame)
+                } == 0
+            {
+                return;
+            }
+            let source_matches = !frame.source.is_null()
+                && unsafe { CStr::from_ptr(frame.source) }
+                    .to_bytes()
+                    .ends_with(b"logic.source");
+            if source_matches && frame.currentline == line as c_int {
+                break frame;
+            }
+            stack_level += 1;
+        };
 
         let base = unsafe { ffi::lua_gettop(state) };
         let mut locals = BTreeMap::new();

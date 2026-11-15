@@ -356,6 +356,51 @@ use std::collections::BTreeMap;
     }
 
     #[test]
+    fn simulation_captures_source_trace_entries() {
+        let engine = Engine::new(EngineConfig::new(
+            vec![
+                endpoint("wall_switch", EndpointDirection::Input, Dpt::BOOL),
+                endpoint("test_light", EndpointDirection::Output, Dpt::BOOL),
+            ],
+            "function handle(event, input)\n  local current = input.wall_switch\n  return { outputs = { test_light = current }, state = { last_seen = current } }\nend",
+        ));
+        let execution = engine
+            .simulate_input(simulation_scenario(
+                true,
+                Some(false),
+                vec![simulation_input(
+                    "wall_switch",
+                    Some(TypedValue::bool(true)),
+                    true,
+                    Some(0),
+                )],
+            ))
+            .unwrap();
+
+        assert_eq!(execution.outcome.unwrap().outputs.len(), 1);
+        assert!(
+            !execution.trace.entries.is_empty(),
+            "expected source lines to have captured locals"
+        );
+        assert!(
+            execution
+                .trace
+                .entries
+                .iter()
+                .all(|entry| entry.line <= 4),
+            "trace should include only lines from the user's source"
+        );
+        assert!(
+            execution
+                .trace
+                .entries
+                .iter()
+                .any(|entry| entry.locals.contains_key("current")),
+            "expected the handler's local variable to be captured"
+        );
+    }
+
+    #[test]
     fn simulation_rejects_incomplete_duplicate_unknown_and_malformed_inputs() {
         let engine = Engine::new(config());
         let valid_wall =
