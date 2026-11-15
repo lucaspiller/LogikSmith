@@ -11,19 +11,31 @@ impl Runtime {
         config: RuntimeConfig,
         profile: RuntimeProfile,
     ) -> Result<Self, RuntimeConfigError> {
-        Self::try_new_with_limits(config, profile.limits())
+        Self::try_new_with_limits_and_persistence(
+            config,
+            profile.limits(),
+            profile == RuntimeProfile::Desktop,
+        )
     }
 
     pub fn try_new_with_limits(
         config: RuntimeConfig,
         limits: RuntimeLimits,
     ) -> Result<Self, RuntimeConfigError> {
+        Self::try_new_with_limits_and_persistence(config, limits, true)
+    }
+
+    pub fn try_new_with_limits_and_persistence(
+        config: RuntimeConfig,
+        limits: RuntimeLimits,
+        persistent_state_enabled: bool,
+    ) -> Result<Self, RuntimeConfigError> {
         config.validate_with_limits(&limits)?;
         let site = config.site.clone();
         let blocks = config
             .blocks
             .into_iter()
-            .map(|block| LogicBlock::try_new(block, &limits))
+            .map(|block| LogicBlock::try_new(block, &limits, persistent_state_enabled))
             .collect::<Result<Vec<_>, _>>()?;
         let mut signal_indexes = BTreeMap::new();
         let mut signals = config
@@ -64,6 +76,7 @@ impl Runtime {
         }
         Ok(Self {
             limits,
+            persistent_state_enabled,
             blocks,
             signals,
             signal_indexes,
@@ -90,27 +103,15 @@ impl Runtime {
                 .iter()
                 .map(|block| block.config.logic.source.len())
                 .sum(),
-            state_entries: self
-                .blocks
-                .iter()
-                .map(|block| block.engine.state().len())
-                .sum(),
+            state_entries: self.blocks.iter().map(|block| {
+                block.engine.state().len() + block.engine.persistent_state().len()
+            }).sum(),
             state_bytes: self
                 .blocks
                 .iter()
                 .map(|block| {
-                    block
-                        .engine
-                        .state()
-                        .iter()
-                        .map(|(key, value)| {
-                            key.len()
-                                + match value {
-                                    StateValue::String(value) => value.len(),
-                                    _ => 0,
-                                }
-                        })
-                        .sum::<usize>()
+                    state_bytes(block.engine.state())
+                        .saturating_add(state_bytes(block.engine.persistent_state()))
                 })
                 .sum(),
             pending_timers: self

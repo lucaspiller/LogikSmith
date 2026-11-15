@@ -66,6 +66,7 @@ fn snapshot_locked(inner: &Inner, now: logiksmith_core::MonotonicMs) -> Snapshot
                         .collect(),
                 },
                 state: state.state.clone(),
+                persistent_state: state.persistent_state.clone(),
                 pending_timers: state.pending_timers.clone(),
                 executions: state.executions.iter().rev().cloned().collect(),
                 schedules: block_schedule_snapshots(inner, id, state),
@@ -120,5 +121,6 @@ fn snapshot_locked(inner: &Inner, now: logiksmith_core::MonotonicMs) -> Snapshot
         signals: inner.signals.clone(),
         external_inputs,
         operations: inner.operations.clone(),
+        persistent_store: inner.persistent_store.clone(),
     }
 }

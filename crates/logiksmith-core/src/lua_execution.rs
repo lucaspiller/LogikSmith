@@ -9,6 +9,8 @@ pub(crate) fn execute_logic(
     snapshots: &[InputSnapshot],
     trigger: &Trigger,
     state: &TransientState,
+    persistent_state: &PersistentState,
+    persistent_state_enabled: bool,
     pending_timers: &BTreeMap<TimerName, PendingTimer>,
     now: MonotonicMs,
     time_context: &TimeContext,
@@ -182,6 +184,20 @@ pub(crate) fn execute_logic(
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
     let state_table = readonly_proxy(&lua, state_backing)
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    let persistent_backing = lua
+        .create_table()
+        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    for (key, value) in persistent_state {
+        persistent_backing
+            .set(
+                key.as_str(),
+                state_value_to_lua(&lua, value)
+                    .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?,
+            )
+            .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
+    }
+    let persistent_table = readonly_proxy(&lua, persistent_backing)
+        .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
     let ctx_backing = lua
         .create_table()
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
@@ -246,7 +262,7 @@ pub(crate) fn execute_logic(
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
 
     let returned: MultiValue = handle
-        .call((event_table, input_table, meta_table, state_table, ctx_table))
+        .call((event_table, input_table, meta_table, state_table, ctx_table, persistent_table))
         .map_err(|error| map_lua_error(error, LuaPhase::Runtime))?;
     let mut returned = returned.into_iter();
     let result = returned.next().unwrap_or(LuaValue::Nil);
@@ -256,5 +272,14 @@ pub(crate) fn execute_logic(
             line: None,
         });
     }
-    convert_result(endpoints, result, state, pending_timers, now, limits)
+    convert_result(
+        endpoints,
+        result,
+        state,
+        persistent_state,
+        persistent_state_enabled,
+        pending_timers,
+        now,
+        limits,
+    )
 }

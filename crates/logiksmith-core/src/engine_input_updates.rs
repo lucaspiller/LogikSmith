@@ -101,23 +101,29 @@ impl Engine {
                 let trigger = input_trigger(endpoint, value, previous);
                 let snapshots = self.input_snapshots(now);
                 let state_before = self.state.clone();
+                let persistent_state_before = self.persistent_state.clone();
                 let outcome = execute_logic(
                     &self.config.endpoints,
                     &self.config.logic,
                     &snapshots,
                     &Trigger::Input(trigger.clone()),
                     &state_before,
+                    &self.persistent_state,
+                    self.persistent_state_enabled,
                     &self.pending_timers,
                     now,
                     &TimeContext::capture(site, utc_unix_ms),
                     &self.limits,
                     budget_probe,
                 );
-                let mut state_after = state_before.clone();
+                let (state_after, persistent_state_after) = resulting_state_after_execution(
+                    &state_before,
+                    &persistent_state_before,
+                    &outcome,
+                    &self.limits,
+                );
                 let mut pending_timers = self.pending_timers();
                 if let Ok(transition) = &outcome {
-                    state_after = merge_state_with_limits(&state_before, &transition.state, &self.limits)
-                        .expect("validated transition state must merge");
                     let candidate = apply_timer_effects(
                         &self.pending_timers,
                         &transition.timers,
@@ -126,6 +132,7 @@ impl Engine {
                     );
                     pending_timers = candidate.values().cloned().collect();
                     self.state = state_after.clone();
+                    self.persistent_state = persistent_state_after.clone();
                     self.pending_timers = candidate;
                 }
                 Ok(Some(Execution::with_now(
@@ -134,6 +141,8 @@ impl Engine {
                     snapshots,
                     state_before,
                     state_after,
+                    persistent_state_before,
+                    persistent_state_after,
                     pending_timers,
                     outcome,
                     site,

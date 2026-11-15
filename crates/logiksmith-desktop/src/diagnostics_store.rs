@@ -21,6 +21,7 @@ include!("diagnostics_store_operations.rs");
 impl DiagnosticStore {
     pub fn new(runtime: &AutomationRuntime, automation_path: PathBuf, revision: u64) -> Self {
         let (events, _) = broadcast::channel(JOURNAL_CAPACITY);
+        let state_store = Arc::new(crate::persistent_store::PersistentStateStore::new(&automation_path));
         let mut endpoint_values = BTreeMap::new();
         let mut block_endpoint_values = BTreeMap::new();
         let mut blocks = BTreeMap::new();
@@ -64,6 +65,7 @@ impl DiagnosticStore {
                     saved_logic_revision: revision,
                     source,
                     state: BTreeMap::new(),
+                    persistent_state: BTreeMap::new(),
                     pending_timers: Vec::new(),
                     executions: VecDeque::new(),
                     last_result: None,
@@ -168,11 +170,19 @@ impl DiagnosticStore {
                 operations,
                 block_health_runtime,
                 limits: crate::HostLimits::desktop(),
+                persistent_store: PersistentStoreSnapshot {
+                    status: "healthy".to_owned(),
+                    unsaved: false,
+                    reason: None,
+                },
             })),
             events,
+            state_store,
+            persisted_state: Arc::new(Mutex::new(None)),
             origin: Instant::now(),
         }
     }
+
     /// Selects the host profile shown in Operations and establishes its
     /// bounded queue capacities before the session starts admitting work.
     pub fn set_host_limits(&self, limits: crate::HostLimits) {
@@ -202,6 +212,13 @@ impl DiagnosticStore {
         next.pending_write_timeouts = previous.pending_write_timeouts;
         inner.operations = next;
         inner.limits = limits;
+        if limits.profile == logiksmith_core::RuntimeProfile::EmbeddedBaseline {
+            inner.persistent_store = PersistentStoreSnapshot {
+                status: "disabled".to_owned(),
+                unsaved: false,
+                reason: None,
+            };
+        }
         while inner.telegrams.len() > limits.recent_telegrams {
             inner.telegrams.pop_front();
         }
@@ -217,29 +234,6 @@ impl DiagnosticStore {
             }
         }
         self.publish_locked(&mut inner);
-    }
-
-    pub fn record_queue_admitted(&self, lane: &str, depth: usize) {
-        self.update_operations(|operations| {
-            if let Some(queue) = operations.queues.get_mut(lane) {
-                queue.depth = depth;
-                queue.high_water = queue.high_water.max(depth);
-                queue.accepted = queue.accepted.saturating_add(1);
-            }
-        });
-    }
-
-    pub fn record_queue_rejected(&self, lane: &str, depth: usize, fatal: bool) {
-        self.update_operations(|operations| {
-            if let Some(queue) = operations.queues.get_mut(lane) {
-                queue.depth = depth;
-                queue.high_water = queue.high_water.max(depth);
-                queue.rejected = queue.rejected.saturating_add(1);
-            }
-            if fatal {
-                operations.status = "overloaded".to_owned();
-            }
-        });
     }
 
     pub fn set_pending_knx_writes(&self, depth: usize) {
@@ -591,12 +585,14 @@ impl DiagnosticStore {
                     saved_logic_revision: revision,
                     source: String::new(),
                     state: BTreeMap::new(),
+                    persistent_state: BTreeMap::new(),
                     pending_timers: Vec::new(),
                     executions: VecDeque::new(),
                     last_result: None,
                 });
             entry.active_enabled = block.enabled;
             entry.state = state_record(&block.state);
+            entry.persistent_state = state_record(&block.persistent_state);
             entry.pending_timers = block
                 .pending_timers
                 .iter()
@@ -815,12 +811,14 @@ impl DiagnosticStore {
                         saved_logic_revision: revision,
                         source: String::new(),
                         state: BTreeMap::new(),
+                        persistent_state: BTreeMap::new(),
                         pending_timers: Vec::new(),
                         executions: VecDeque::new(),
                         last_result: None,
                     });
             block.active_logic_revision = revision;
             block.state = record.state_after.clone();
+            block.persistent_state = state_record(&semantic.persistent_state_after);
             block.pending_timers = semantic
                 .pending_timers
                 .iter()

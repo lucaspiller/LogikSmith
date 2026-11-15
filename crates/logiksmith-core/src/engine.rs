@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::lua::execute_logic;
 use crate::state::{
-    apply_timer_effects, merge_state_with_limits, validate_pending_timer_map_with_limits,
-    validate_pending_timers_with_limits, validate_state_map_with_limits,
+    apply_timer_effects, resulting_state_after_execution,
+    validate_combined_state_with_limits, validate_pending_timer_map_with_limits,
+    validate_pending_timers_with_limits,
 };
 use crate::support::{
     default_site, input_trigger, unavailable_time_context, validate_simulation_input,
@@ -18,6 +19,8 @@ pub struct Engine {
     pub(crate) limits: RuntimeLimits,
     inputs: Vec<InputState>,
     state: TransientState,
+    persistent_state: PersistentState,
+    persistent_state_enabled: bool,
     pub(crate) pending_timers: BTreeMap<TimerName, PendingTimer>,
     last_accepted_at: Option<MonotonicMs>,
 }
@@ -50,6 +53,8 @@ impl Engine {
             limits,
             inputs,
             state: BTreeMap::new(),
+            persistent_state: BTreeMap::new(),
+            persistent_state_enabled: true,
             pending_timers: BTreeMap::new(),
             last_accepted_at: None,
         })
@@ -345,23 +350,29 @@ impl Engine {
         let public_trigger = Trigger::Timer(trigger.clone());
         let snapshots = self.input_snapshots(now);
         let state_before = self.state.clone();
+        let persistent_state_before = self.persistent_state.clone();
         let outcome = execute_logic(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
             &public_trigger,
             &state_before,
+            &self.persistent_state,
+            self.persistent_state_enabled,
             &self.pending_timers,
             now,
             &TimeContext::capture(site, utc_unix_ms),
             &self.limits,
             budget_probe,
         );
-        let mut state_after = state_before.clone();
+        let (state_after, persistent_state_after) = resulting_state_after_execution(
+            &state_before,
+            &persistent_state_before,
+            &outcome,
+            &self.limits,
+        );
         let mut pending_timers = self.pending_timers();
         if let Ok(transition) = &outcome {
-            state_after = merge_state_with_limits(&state_before, &transition.state, &self.limits)
-                .expect("validated transition state must merge");
             let candidate = apply_timer_effects(
                 &self.pending_timers,
                 &transition.timers,
@@ -370,6 +381,7 @@ impl Engine {
             );
             pending_timers = candidate.values().cloned().collect();
             self.state = state_after.clone();
+            self.persistent_state = persistent_state_after.clone();
             self.pending_timers = candidate;
         }
         Ok(Some(Execution::with_now(
@@ -378,6 +390,8 @@ impl Engine {
             snapshots,
             state_before,
             state_after,
+            persistent_state_before,
+            persistent_state_after,
             pending_timers,
             outcome,
             site,
@@ -494,25 +508,27 @@ impl Engine {
             scenario.trigger.previous,
         );
         let state_before = self.state.clone();
+        let persistent_state_before = self.persistent_state.clone();
         let outcome = execute_logic(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
             &Trigger::Input(trigger.clone()),
             &state_before,
+            &self.persistent_state,
+            self.persistent_state_enabled,
             &self.pending_timers,
             MonotonicMs(0),
             &unavailable_time_context(),
             &self.limits,
             None,
         );
-        let state_after = outcome
-            .as_ref()
-            .ok()
-            .and_then(|transition| {
-                merge_state_with_limits(&state_before, &transition.state, &self.limits).ok()
-            })
-            .unwrap_or_else(|| state_before.clone());
+        let (state_after, persistent_state_after) = resulting_state_after_execution(
+            &state_before,
+            &persistent_state_before,
+            &outcome,
+            &self.limits,
+        );
         let pending_timers = outcome
             .as_ref()
             .ok()
@@ -534,6 +550,8 @@ impl Engine {
             snapshots,
             state_before,
             state_after,
+            persistent_state_before,
+            persistent_state_after,
             pending_timers,
             outcome,
             &default_site(),
@@ -541,31 +559,15 @@ impl Engine {
         ))
     }
 
-    /// Simulates an input using explicit copied state, timers, and execution
-    /// time. This is the extension point used by the desktop simulation form.
-    pub fn simulate_input_with_state(
-        &self,
-        scenario: SimulationScenario,
-        state: TransientState,
-        pending_timers: Vec<PendingTimer>,
-        now: MonotonicMs,
-    ) -> Result<Execution, SimulationError> {
-        validate_state_map_with_limits(&state, &self.limits)
-            .map_err(SimulationError::InvalidState)?;
-        validate_pending_timers_with_limits(
-            &pending_timers,
-            self.active_logic_revision(),
-            &self.limits,
-        )?;
-        let execution = self.simulate_input_against(scenario, state, pending_timers, now)?;
-        Ok(execution)
-    }
-
     pub fn simulate_timer(
         &self,
         scenario: TimerSimulationScenario,
     ) -> Result<Execution, SimulationError> {
-        validate_state_map_with_limits(&scenario.state, &self.limits)
+        validate_combined_state_with_limits(
+            &scenario.state,
+            &self.persistent_state,
+            &self.limits,
+        )
             .map_err(SimulationError::InvalidState)?;
         let mut supplied = BTreeMap::new();
         for timer in scenario.pending_timers {
@@ -597,25 +599,27 @@ impl Engine {
             scheduled_logic_revision: timer.scheduled_logic_revision,
         });
         let state_before = scenario.state;
+        let persistent_state_before = self.persistent_state.clone();
         let outcome = execute_logic(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
             &trigger,
             &state_before,
+            &self.persistent_state,
+            self.persistent_state_enabled,
             &supplied,
             scenario.fired_at,
             &unavailable_time_context(),
             &self.limits,
             None,
         );
-        let state_after = outcome
-            .as_ref()
-            .ok()
-            .and_then(|transition| {
-                merge_state_with_limits(&state_before, &transition.state, &self.limits).ok()
-            })
-            .unwrap_or_else(|| state_before.clone());
+        let (state_after, persistent_state_after) = resulting_state_after_execution(
+            &state_before,
+            &persistent_state_before,
+            &outcome,
+            &self.limits,
+        );
         let pending_timers = outcome
             .as_ref()
             .ok()
@@ -637,6 +641,8 @@ impl Engine {
             snapshots,
             state_before,
             state_after,
+            persistent_state_before,
+            persistent_state_after,
             pending_timers,
             outcome,
             &default_site(),
@@ -671,23 +677,29 @@ impl Engine {
         let public_trigger = Trigger::Schedule(trigger);
         let snapshots = self.input_snapshots(now);
         let state_before = self.state.clone();
+        let persistent_state_before = self.persistent_state.clone();
         let outcome = execute_logic(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
             &public_trigger,
             &state_before,
+            &self.persistent_state,
+            self.persistent_state_enabled,
             &self.pending_timers,
             now,
             &TimeContext::capture(site, utc_unix_ms),
             &self.limits,
             budget_probe,
         );
-        let mut state_after = state_before.clone();
+        let (state_after, persistent_state_after) = resulting_state_after_execution(
+            &state_before,
+            &persistent_state_before,
+            &outcome,
+            &self.limits,
+        );
         let mut pending_timers = self.pending_timers();
         if let Ok(transition) = &outcome {
-            state_after = merge_state_with_limits(&state_before, &transition.state, &self.limits)
-                .expect("validated transition state must merge");
             let candidate = apply_timer_effects(
                 &self.pending_timers,
                 &transition.timers,
@@ -696,6 +708,7 @@ impl Engine {
             );
             pending_timers = candidate.values().cloned().collect();
             self.state = state_after.clone();
+            self.persistent_state = persistent_state_after.clone();
             self.pending_timers = candidate;
         }
         Ok(Execution::with_now(
@@ -704,6 +717,8 @@ impl Engine {
             snapshots,
             state_before,
             state_after,
+            persistent_state_before,
+            persistent_state_after,
             pending_timers,
             outcome,
             site,
@@ -722,25 +737,27 @@ impl Engine {
     ) -> Execution {
         let snapshots = self.input_snapshots(MonotonicMs(0));
         let state_before = self.state.clone();
+        let persistent_state_before = self.persistent_state.clone();
         let outcome = execute_logic(
             &self.config.endpoints,
             &self.config.logic,
             &snapshots,
             &Trigger::Schedule(trigger.clone()),
             &state_before,
+            &self.persistent_state,
+            self.persistent_state_enabled,
             &self.pending_timers,
             MonotonicMs(0),
             &TimeContext::capture(site, utc_unix_ms),
             &self.limits,
             None,
         );
-        let state_after = outcome
-            .as_ref()
-            .ok()
-            .and_then(|transition| {
-                merge_state_with_limits(&state_before, &transition.state, &self.limits).ok()
-            })
-            .unwrap_or_else(|| state_before.clone());
+        let (state_after, persistent_state_after) = resulting_state_after_execution(
+            &state_before,
+            &persistent_state_before,
+            &outcome,
+            &self.limits,
+        );
         let pending_timers = outcome
             .as_ref()
             .ok()
@@ -762,6 +779,8 @@ impl Engine {
             snapshots,
             state_before,
             state_after,
+            persistent_state_before,
+            persistent_state_after,
             pending_timers,
             outcome,
             site,
@@ -896,6 +915,7 @@ impl Engine {
         );
         let trigger_kind = Trigger::Input(trigger.clone());
         let state_before = state;
+        let persistent_state_before = self.persistent_state.clone();
         let mut timer_map = BTreeMap::new();
         for timer in pending_timers {
             let timer_name = timer.name.clone();
@@ -909,19 +929,20 @@ impl Engine {
             &snapshots,
             &trigger_kind,
             &state_before,
+            &self.persistent_state,
+            self.persistent_state_enabled,
             &timer_map,
             now,
             &unavailable_time_context(),
             &self.limits,
             None,
         );
-        let state_after = outcome
-            .as_ref()
-            .ok()
-            .and_then(|transition| {
-                merge_state_with_limits(&state_before, &transition.state, &self.limits).ok()
-            })
-            .unwrap_or_else(|| state_before.clone());
+        let (state_after, persistent_state_after) = resulting_state_after_execution(
+            &state_before,
+            &persistent_state_before,
+            &outcome,
+            &self.limits,
+        );
         let pending_timers = outcome
             .as_ref()
             .ok()
@@ -943,6 +964,8 @@ impl Engine {
             snapshots,
             state_before,
             state_after,
+            persistent_state_before,
+            persistent_state_after,
             pending_timers,
             outcome,
             &default_site(),

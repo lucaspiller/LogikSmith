@@ -1,4 +1,23 @@
 impl Engine {
+    /// Simulates an input using explicit copied state, timers, and execution
+    /// time. This is the extension point used by the desktop simulation form.
+    pub fn simulate_input_with_state(
+        &self,
+        scenario: SimulationScenario,
+        state: TransientState,
+        pending_timers: Vec<PendingTimer>,
+        now: MonotonicMs,
+    ) -> Result<Execution, SimulationError> {
+        validate_combined_state_with_limits(&state, &self.persistent_state, &self.limits)
+            .map_err(SimulationError::InvalidState)?;
+        validate_pending_timers_with_limits(
+            &pending_timers,
+            self.active_logic_revision(),
+            &self.limits,
+        )?;
+        self.simulate_input_against(scenario, state, pending_timers, now)
+    }
+
     fn validate_and_build_snapshots(
     &self,
     inputs: &[SimulationInput],

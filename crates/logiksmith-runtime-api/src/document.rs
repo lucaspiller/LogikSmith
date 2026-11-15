@@ -30,6 +30,7 @@ pub struct Capabilities {
     pub http_inputs: bool,
     pub webhook_inputs: bool,
     pub schedules: bool,
+    pub persistent_state: bool,
 }
 impl Default for Capabilities {
     fn default() -> Self {
@@ -44,6 +45,7 @@ impl Capabilities {
             http_inputs: cfg!(feature = "http-inputs"),
             webhook_inputs: cfg!(feature = "webhook-inputs"),
             schedules: true,
+            persistent_state: true,
         }
     }
     pub const fn embedded() -> Self {
@@ -53,6 +55,7 @@ impl Capabilities {
             http_inputs: false,
             webhook_inputs: false,
             schedules: false,
+            persistent_state: false,
         }
     }
 }

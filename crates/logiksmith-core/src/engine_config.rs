@@ -72,5 +72,6 @@ pub struct EngineSnapshot {
     /// absent, rather than being represented as `false` or `0`.
     pub known_inputs: Vec<(EndpointName, TypedValue)>,
     pub state: TransientState,
+    pub persistent_state: PersistentState,
     pub pending_timers: Vec<PendingTimer>,
 }

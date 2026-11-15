@@ -52,10 +52,155 @@ fn convert_state_value(key: &str, value: LuaValue) -> Result<StateValue, LogicEr
     Ok(state_value)
 }
 
+fn convert_state_map(table: Option<Table>, field: &str) -> Result<StatePatch, LogicError> {
+    let mut values = BTreeMap::new();
+    let Some(table) = table else {
+        return Ok(values);
+    };
+    for pair in table.pairs::<LuaValue, LuaValue>() {
+        let (key, value) = pair.map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?;
+        let key = match key {
+            LuaValue::String(key) => key
+                .to_str()
+                .map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?
+                .to_owned(),
+            value => {
+                return Err(LogicError::InvalidResult {
+                    message: format!("{field} key must be a string, got {}", value.type_name()),
+                    line: None,
+                });
+            }
+        };
+        let value = convert_state_value(&key, value)?;
+        if values.insert(key.clone(), value).is_some() {
+            return Err(LogicError::InvalidResult {
+                message: format!("{field} key {key:?} was returned more than once"),
+                line: None,
+            });
+        }
+    }
+    Ok(values)
+}
+
+fn convert_persistent_delete(table: Option<Table>) -> Result<std::collections::BTreeSet<String>, LogicError> {
+    let mut entries = BTreeMap::new();
+    let Some(table) = table else {
+        return Ok(std::collections::BTreeSet::new());
+    };
+    for pair in table.pairs::<LuaValue, LuaValue>() {
+        let (index, value) = pair.map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?;
+        let index = match index {
+            LuaValue::Integer(index) if index > 0 => index,
+            value => {
+                return Err(LogicError::InvalidResult {
+                    message: format!("persistent.delete must be an array, got index {}", value.type_name()),
+                    line: None,
+                });
+            }
+        };
+        let key = match value {
+            LuaValue::String(key) => key
+                .to_str()
+                .map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?
+                .to_owned(),
+            value => {
+                return Err(LogicError::InvalidResult {
+                    message: format!("persistent.delete entries must be strings, got {}", value.type_name()),
+                    line: None,
+                });
+            }
+        };
+        if entries.insert(index, key).is_some() {
+            return Err(LogicError::InvalidResult {
+                message: "persistent.delete contains a duplicate array index".to_owned(),
+                line: None,
+            });
+        }
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for (offset, (index, key)) in entries.into_iter().enumerate() {
+        if index != i64::try_from(offset + 1).unwrap_or(i64::MAX) {
+            return Err(LogicError::InvalidResult {
+                message: "persistent.delete must be a dense array".to_owned(),
+                line: None,
+            });
+        }
+        validate_state_key(&key).map_err(|error| LogicError::InvalidResult {
+            message: error.to_string(),
+            line: None,
+        })?;
+        if !keys.insert(key.clone()) {
+            return Err(LogicError::InvalidResult {
+                message: format!("persistent.delete key {key:?} was returned more than once"),
+                line: None,
+            });
+        }
+    }
+    Ok(keys)
+}
+
+fn convert_persistent_patch(table: Option<Table>) -> Result<PersistentPatch, LogicError> {
+    let mut set = None;
+    let mut delete = None;
+    if let Some(table) = table {
+        for pair in table.pairs::<LuaValue, LuaValue>() {
+            let (key, value) = pair.map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?;
+            let key = match key {
+                LuaValue::String(key) => key
+                    .to_str()
+                    .map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?
+                    .to_owned(),
+                value => {
+                    return Err(LogicError::InvalidResult {
+                        message: format!("persistent patch field must be a string, got {}", value.type_name()),
+                        line: None,
+                    });
+                }
+            };
+            let target = match key.as_str() {
+                "set" => &mut set,
+                "delete" => &mut delete,
+                _ => {
+                    return Err(LogicError::InvalidResult {
+                        message: format!("unsupported persistent patch field {key:?}; only set and delete are allowed"),
+                        line: None,
+                    });
+                }
+            };
+            match value {
+                LuaValue::Table(table) if target.is_none() => *target = Some(table),
+                LuaValue::Table(_) => {
+                    return Err(LogicError::InvalidResult {
+                        message: format!("persistent patch contains duplicate {key} fields"),
+                        line: None,
+                    });
+                }
+                value => {
+                    return Err(LogicError::InvalidResult {
+                        message: format!("persistent.{key} must be a table, got {}", value.type_name()),
+                        line: None,
+                    });
+                }
+            }
+        }
+    }
+    let set = convert_state_map(set, "persistent.set")?;
+    let delete = convert_persistent_delete(delete)?;
+    if let Some(key) = set.keys().find(|key| delete.contains(*key)) {
+        return Err(LogicError::InvalidResult {
+            message: format!("persistent key {key:?} cannot be both set and deleted"),
+            line: None,
+        });
+    }
+    Ok(PersistentPatch { set, delete })
+}
+
 fn convert_result(
     endpoints: &[Endpoint],
     result: LuaValue,
     current_state: &TransientState,
+    current_persistent_state: &PersistentState,
+    persistent_state_enabled: bool,
     pending_timers: &BTreeMap<TimerName, PendingTimer>,
     now: MonotonicMs,
     limits: &RuntimeLimits,
@@ -64,6 +209,7 @@ fn convert_result(
         LuaValue::Nil => {
             return Ok(Transition {
                 state: BTreeMap::new(),
+                persistent: PersistentPatch::default(),
                 outputs: Vec::new(),
                 timers: Vec::new(),
             });
@@ -83,6 +229,7 @@ fn convert_result(
     let mut state: Option<Table> = None;
     let mut outputs: Option<Table> = None;
     let mut timers: Option<Table> = None;
+    let mut persistent: Option<Table> = None;
     for pair in result_table.pairs::<LuaValue, LuaValue>() {
         let (key, value) = pair.map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?;
         let key = match key {
@@ -97,10 +244,10 @@ fn convert_result(
                 });
             }
         };
-        if !matches!(key.as_str(), "state" | "outputs" | "timers") {
+        if !matches!(key.as_str(), "state" | "outputs" | "timers" | "persistent") {
             return Err(LogicError::InvalidResult {
                 message: format!(
-                    "unsupported result field {key:?}; only state, outputs, and timers are allowed"
+                    "unsupported result field {key:?}; only state, outputs, timers, and persistent are allowed"
                 ),
                 line: None,
             });
@@ -111,6 +258,9 @@ fn convert_result(
                 outputs = Some(table)
             }
             LuaValue::Table(table) if key == "timers" && timers.is_none() => timers = Some(table),
+            LuaValue::Table(table) if key == "persistent" && persistent.is_none() => {
+                persistent = Some(table)
+            }
             LuaValue::Table(_) => {
                 return Err(LogicError::InvalidResult {
                     message: format!("result contains duplicate {key} fields"),
@@ -125,52 +275,44 @@ fn convert_result(
             }
         }
     }
-    let mut state_patch = BTreeMap::new();
-    if let Some(state_table) = state {
-        for pair in state_table.pairs::<LuaValue, LuaValue>() {
-            let (key, value) =
-                pair.map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?;
-            let key = match key {
-                LuaValue::String(key) => key
-                    .to_str()
-                    .map_err(|error| map_lua_error(error, LuaPhase::InvalidResult))?
-                    .to_owned(),
-                value => {
-                    return Err(LogicError::InvalidResult {
-                        message: format!("state key must be a string, got {}", value.type_name()),
-                        line: None,
-                    });
-                }
-            };
-            let value = convert_state_value(&key, value)?;
-            if state_patch.insert(key.clone(), value).is_some() {
-                return Err(LogicError::InvalidResult {
-                    message: format!("state key {key:?} was returned more than once"),
-                    line: None,
-                });
-            }
-        }
+    let state_patch = convert_state_map(state, "state")?;
+    let persistent_patch = convert_persistent_patch(persistent)?;
+    let persistent_entries = persistent_patch.set.len() + persistent_patch.delete.len();
+    if !persistent_state_enabled && persistent_entries > 0 {
+        return Err(LogicError::InvalidResult {
+            message: "persistent state effects are disabled for this runtime".to_owned(),
+            line: None,
+        });
     }
-    if state_patch.len() > limits.max_state_patch_entries_per_execution {
+    let state_entries = state_patch.len().saturating_add(persistent_entries);
+    if state_entries > limits.max_state_patch_entries_per_execution {
         return Err(LogicError::InvalidResult {
             message: format!(
-                "state patch has {}; maximum is {}",
-                state_patch.len(),
+                "state and persistent patch has {}; maximum is {}",
+                state_entries,
                 limits.max_state_patch_entries_per_execution
             ),
             line: None,
         });
     }
-    merge_state_with_limits(current_state, &state_patch, limits).map_err(|error| LogicError::InvalidResult {
+    merge_combined_state_with_limits(
+        current_state,
+        &state_patch,
+        current_persistent_state,
+        &persistent_patch,
+        limits,
+    )
+    .map_err(|error| LogicError::InvalidResult {
         message: error.to_string(),
         line: None,
     })?;
 
     let Some(outputs_table) = outputs else {
         let timers = convert_timers(timers, pending_timers, now, limits)?;
-        check_combined_effects(state_patch.len(), 0, timers.len(), limits)?;
+        check_combined_effects(state_entries, 0, timers.len(), limits)?;
         return Ok(Transition {
             state: state_patch,
+            persistent: persistent_patch,
             outputs: Vec::new(),
             timers,
         });
@@ -227,9 +369,10 @@ fn convert_result(
         })
         .collect::<Vec<_>>();
     let timers = convert_timers(timers, pending_timers, now, limits)?;
-    check_combined_effects(state_patch.len(), outputs.len(), timers.len(), limits)?;
+    check_combined_effects(state_entries, outputs.len(), timers.len(), limits)?;
     Ok(Transition {
         state: state_patch,
+        persistent: persistent_patch,
         outputs,
         timers,
     })

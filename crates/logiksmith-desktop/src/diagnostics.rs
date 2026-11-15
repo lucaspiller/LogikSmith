@@ -3,6 +3,7 @@
 include!("diagnostics_model.rs");
 include!("diagnostics_helpers.rs");
 include!("diagnostics_store.rs");
+include!("diagnostics_store_persistent.rs");
 include!("diagnostics_clock.rs");
 include!("diagnostics_external.rs");
 include!("diagnostics_snapshot.rs");

@@ -11,6 +11,7 @@ pub struct BlockSnapshot {
     pub inputs: Vec<InputSnapshot>,
     pub known_inputs: Vec<(EndpointName, TypedValue)>,
     pub state: TransientState,
+    pub persistent_state: PersistentState,
     pub pending_timers: Vec<PendingTimer>,
 }
 

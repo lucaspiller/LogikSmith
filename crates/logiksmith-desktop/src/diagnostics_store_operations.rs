@@ -67,3 +67,28 @@ fn core_usage_snapshot(
         pending_timers: counter(usage.pending_timers, limits.max_pending_timers_total),
     }
 }
+
+impl DiagnosticStore {
+    pub fn record_queue_admitted(&self, lane: &str, depth: usize) {
+        self.update_operations(|operations| {
+            if let Some(queue) = operations.queues.get_mut(lane) {
+                queue.depth = depth;
+                queue.high_water = queue.high_water.max(depth);
+                queue.accepted = queue.accepted.saturating_add(1);
+            }
+        });
+    }
+
+    pub fn record_queue_rejected(&self, lane: &str, depth: usize, fatal: bool) {
+        self.update_operations(|operations| {
+            if let Some(queue) = operations.queues.get_mut(lane) {
+                queue.depth = depth;
+                queue.high_water = queue.high_water.max(depth);
+                queue.rejected = queue.rejected.saturating_add(1);
+            }
+            if fatal {
+                operations.status = "overloaded".to_owned();
+            }
+        });
+    }
+}
