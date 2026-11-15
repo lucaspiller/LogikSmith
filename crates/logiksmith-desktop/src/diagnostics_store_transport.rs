@@ -1,9 +1,18 @@
 impl DiagnosticStore {
-pub fn record_telegram(&self, mut telegram: TelegramRecord) {
+pub fn record_telegram(&self, telegram: TelegramRecord) {
+    self.record_telegram_at(telegram, self.now());
+}
+
+pub fn record_telegram_at(
+    &self,
+    mut telegram: TelegramRecord,
+    now: logiksmith_core::MonotonicMs,
+) {
     let mut inner = self
         .inner
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    telegram.time_ms = now.0;
     if telegram.endpoint.is_none() {
         let address = telegram.address;
         telegram.endpoint = inner

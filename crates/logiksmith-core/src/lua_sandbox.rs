@@ -2,11 +2,13 @@ use std::{cell::Cell, collections::BTreeMap, rc::Rc};
 use std::sync::Arc;
 
 use mlua::{
-    Function, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Value as LuaValue, VmState,
+    DebugEvent, Function, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table,
+    Value as LuaValue, VmState,
 };
 
 use crate::state::validate_state_entry;
 use crate::*;
+use crate::trace::TraceCapture;
 
 enum LuaPhase {
     Syntax,
@@ -198,16 +200,32 @@ fn install_instruction_hook(
     lua: &Lua,
     limits: &RuntimeLimits,
     budget_probe: Option<Arc<dyn BudgetProbe>>,
+    trace: Option<TraceCapture>,
 ) {
     let count = Rc::new(Cell::new(0_u32));
     let maximum = limits.max_logic_instructions;
     let time_limit = limits.logic_handler_time_budget_ms;
     lua.set_hook(
-        HookTriggers::new().every_nth_instruction(1),
-        move |_lua, _debug| {
-            let next = count.get().saturating_add(1);
-            count.set(next);
-            if next >= maximum {
+        HookTriggers::new()
+            .every_nth_instruction(1)
+            .every_line(),
+        move |lua, debug| {
+            if debug.event() == DebugEvent::Line {
+                if let Some(trace) = trace.as_ref() {
+                    let line = debug.curr_line();
+                    if line > 0 {
+                        trace.capture_line(lua, line as u32);
+                    }
+                }
+            }
+            let next = if debug.event() == DebugEvent::Count {
+                let next = count.get().saturating_add(1);
+                count.set(next);
+                next
+            } else {
+                count.get()
+            };
+            if debug.event() == DebugEvent::Count && next >= maximum {
                 Err(mlua::Error::RuntimeError(
                     INSTRUCTION_LIMIT_MARKER.to_owned(),
                 ))
@@ -233,7 +251,7 @@ pub(crate) fn validate_logic_source_with_limits(
     let lua = new_lua(limits).map_err(|error| map_lua_error(error, LuaPhase::Load))?;
     let environment =
         restricted_environment(&lua).map_err(|error| map_lua_error(error, LuaPhase::Load))?;
-    install_instruction_hook(&lua, limits, budget_probe);
+    install_instruction_hook(&lua, limits, budget_probe, None);
 
     let chunk = lua
         .load(source)

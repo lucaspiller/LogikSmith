@@ -4,8 +4,7 @@
   import { sourceFingerprint, type BlockDraft, type DraftValidation } from './block-workbench';
   import type { DisplayBlock } from './dashboard-types';
   import LuaEditor from './LuaEditor.svelte';
-  import ExecutionSignalDetail from './ExecutionSignalDetail.svelte';
-  import { formatValue, triggerLabel } from './format';
+  import { formatValue } from './format';
 
   export let block: DisplayBlock;
   export let draft: BlockDraft;
@@ -19,7 +18,6 @@
     activated: { revision: string | number; cancelledTimers: string[] };
     enabled: { enabled: boolean; revision: string | number; cancelledTimers: string[] };
     discard: void;
-    selectExecution: number;
   }>();
   let validationBusy = false;
   let operationBusy = false;
@@ -139,5 +137,4 @@ end</pre></article>
     <article><h3>Selected block contract</h3><dl class="reference-grid"><dt>Inputs</dt><dd>{block.inputs.map((item) => `${item.name} (${item.dpt})`).join(', ') || 'none'}</dd><dt>Outputs</dt><dd>{block.outputs.map((item) => `${item.name} (${item.dpt})`).join(', ') || 'none'}</dd><dt>State</dt><dd>bool, integer, number, or string scalar keys</dd><dt>Time</dt><dd><code>ctx.now</code> and <code>ctx.sun</code> values when available</dd><dt>Effects</dt><dd>Outputs and named timer operations are proposed atomically</dd></dl></article>
   </div>
   <section class="author-endpoints"><h3>Endpoints and bindings</h3><div class="table-wrap"><table><thead><tr><th>Endpoint</th><th>Direction</th><th>DPT</th><th>Binding</th><th>Current</th></tr></thead><tbody>{#each [...block.inputs.map((item) => ({ ...item, direction: 'input' as const })), ...block.outputs.map((item) => ({ ...item, direction: 'output' as const }))] as endpoint}<tr><td><code>{endpoint.name}</code></td><td>{endpoint.direction}</td><td>{endpoint.dpt}</td><td><span class="status-pill {endpoint.bindingKind === 'signal' || endpoint.bindingKind === 'knx' || endpoint.bindingKind === 'http' || endpoint.bindingKind === 'webhook' ? 'good' : 'muted'}">{endpoint.bindingKind ?? 'unbound'}</span>{#if endpoint.signal} · <code>{endpoint.signal}</code>{/if}{#if endpoint.source} · <code>{endpoint.source}</code>{/if}{#if endpoint.address} · <code>{endpoint.address}</code>{/if}</td><td>{formatValue(endpoint.observed ?? null)}</td></tr>{/each}</tbody></table></div></section>
-  {#if block.executions.length}<section class="author-history"><h3>Recent executions</h3><div class="table-wrap"><table class="execution-history"><thead><tr><th>ID</th><th>Trigger</th><th>Time</th><th>Status</th></tr></thead><tbody>{#each block.executions as execution}<tr tabindex="0" role="button" on:click={() => dispatch('selectExecution', execution.executionId)} on:keydown={(event) => { if (event.key === 'Enter' || event.key === ' ') dispatch('selectExecution', execution.executionId); }}><td>{execution.executionId}</td><td>{triggerLabel(execution.trigger)}</td><td>{execution.timeMs} ms</td><td>{execution.status}</td></tr>{/each}</tbody></table></div></section><ExecutionSignalDetail execution={block.executions[0]} />{/if}
 </section>
